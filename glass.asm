@@ -3472,7 +3472,7 @@ vt_process:
     mov [alt_cursor_row], rax
     mov rax, [cursor_col]
     mov [alt_cursor_col], rax
-    ; Copy main grid to alt_grid (save it)
+    ; Copy main grid to alt_grid (save it) - 8 bytes at a time
     push r12
     push r13
     xor r12, r12
@@ -3480,9 +3480,9 @@ vt_process:
 .vtp_alt_save:
     cmp r12, r13
     jge .vtp_alt_save_done
-    movzx eax, byte [grid + r12]
-    mov [alt_grid + r12], al
-    inc r12
+    mov rax, [grid + r12]
+    mov [alt_grid + r12], rax
+    add r12, 8
     jmp .vtp_alt_save
 .vtp_alt_save_done:
     pop r13
@@ -3497,7 +3497,7 @@ vt_process:
 .vtp_alt_screen_off:
     cmp qword [alt_screen_active], 0
     je .vtp_loop                ; already on main screen
-    ; Copy alt_grid back to grid (restore main)
+    ; Copy alt_grid back to grid (restore main) - 8 bytes at a time
     push r12
     push r13
     xor r12, r12
@@ -3505,9 +3505,9 @@ vt_process:
 .vtp_alt_restore:
     cmp r12, r13
     jge .vtp_alt_restore_done
-    movzx eax, byte [alt_grid + r12]
-    mov [grid + r12], al
-    inc r12
+    mov rax, [alt_grid + r12]
+    mov [grid + r12], rax
+    add r12, 8
     jmp .vtp_alt_restore
 .vtp_alt_restore_done:
     pop r13
@@ -3518,13 +3518,17 @@ vt_process:
     mov rax, [alt_cursor_col]
     mov [cursor_col], rax
     mov qword [alt_screen_active], 0
-    ; Reset scroll region and modes
+    ; Reset scroll region, modes, and attributes
     mov qword [scroll_top], 0
     mov qword [scroll_bottom], 0
     mov qword [cursor_visible], 1
     mov qword [mouse_tracking], 0
     mov qword [mouse_sgr], 0
     mov qword [bracketed_paste], 0
+    mov byte [cur_fg], 7
+    mov byte [cur_bg], 0
+    mov byte [cur_attrs], 0
+    mov qword [cursor_style], 0
     jmp .vtp_loop
 
 .vtp_cursor_show:
