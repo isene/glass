@@ -357,6 +357,8 @@ mouse_tracking:     resq 1          ; 0=off, 1=normal, 2=button, 3=any
 mouse_sgr:          resq 1          ; 1 = SGR mouse encoding
 bracketed_paste:    resq 1          ; 1 = bracketed paste mode
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
+scroll_top:         resq 1          ; scroll region top (0-based, default 0)
+scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
 
 ; OSC title
 osc_buf:            resb 256
@@ -408,6 +410,8 @@ _start:
     mov qword [alt_screen_active], 0
     mov qword [mouse_tracking], 0
     mov qword [mouse_sgr], 0
+    mov qword [scroll_top], 0
+    mov qword [scroll_bottom], 0      ; 0 = use grid_rows-1
     mov qword [bracketed_paste], 0
     mov qword [cursor_style], 0
     mov qword [cfg_font_size], 0
@@ -3009,10 +3013,20 @@ vt_process:
 .vtp_lf:
     mov rax, [cursor_row]
     inc rax
-    cmp rax, [grid_rows]
-    jl .vtp_lf_ok
-    ; Scroll up
-    call grid_scroll_up
+    ; Check scroll region bottom (use scroll_bottom if set, else grid_rows-1)
+    mov rcx, [scroll_bottom]
+    test rcx, rcx
+    jnz .vtp_lf_check
+    mov rcx, [grid_rows]
+    dec rcx
+.vtp_lf_check:
+    cmp rax, rcx
+    jle .vtp_lf_ok
+    ; Scroll up within scroll region
+    call grid_scroll_region_up
+    mov rax, [scroll_bottom]
+    test rax, rax
+    jnz .vtp_lf_ok
     mov rax, [grid_rows]
     dec rax
 .vtp_lf_ok:
@@ -3321,8 +3335,16 @@ vt_process:
     je .vtp_csi_restore_cursor
     cmp al, 'P'
     je .vtp_csi_dch
+    cmp al, '@'
+    je .vtp_csi_ich
+    cmp al, 'L'
+    je .vtp_csi_il
+    cmp al, 'M'
+    je .vtp_csi_dl
+    cmp al, 'X'
+    je .vtp_csi_ech
     cmp al, 'r'
-    je .vtp_loop            ; ignore DECSTBM for now
+    je .vtp_csi_decstbm
     cmp al, 'h'
     je .vtp_csi_set_mode
     cmp al, 'l'
@@ -3757,6 +3779,269 @@ vt_process:
     pop rbx
     jmp .vtp_loop
 
+; CSI r - Set Scrolling Region (DECSTBM)
+.vtp_csi_decstbm:
+    mov eax, [vt_params]
+    test eax, eax
+    jnz .vtp_stbm_top
+    mov eax, 1
+.vtp_stbm_top:
+    dec eax                  ; 0-based
+    mov [scroll_top], rax
+    cmp qword [vt_param_count], 2
+    jl .vtp_stbm_default_bot
+    mov eax, [vt_params + 4]
+    test eax, eax
+    jnz .vtp_stbm_bot
+.vtp_stbm_default_bot:
+    mov rax, [grid_rows]
+.vtp_stbm_bot:
+    dec eax                  ; 0-based
+    mov [scroll_bottom], rax
+    ; Move cursor to home
+    mov qword [cursor_row], 0
+    mov qword [cursor_col], 0
+    jmp .vtp_loop
+
+; CSI @ - Insert Characters (ICH)
+.vtp_csi_ich:
+    mov eax, [vt_params]
+    test eax, eax
+    jnz .vtp_ich_go
+    mov eax, 1
+.vtp_ich_go:
+    push rbx
+    mov ecx, eax              ; count to insert
+    mov rbx, [cursor_row]
+    imul rbx, MAX_COLS
+    ; Shift cells right from end of line
+    mov rax, [grid_cols]
+    dec rax
+.vtp_ich_shift:
+    mov rdx, rax
+    sub rdx, rcx
+    cmp rdx, [cursor_col]
+    jl .vtp_ich_clear
+    ; Copy cell at col-n to col (8 bytes)
+    mov rdx, rbx
+    add rdx, rax
+    sub rdx, rcx
+    imul rdx, CELL_SIZE
+    mov r8, [grid + rdx]
+    mov rdx, rbx
+    add rdx, rax
+    imul rdx, CELL_SIZE
+    mov [grid + rdx], r8
+    dec rax
+    jmp .vtp_ich_shift
+.vtp_ich_clear:
+    ; Clear inserted cells
+    mov rax, [cursor_col]
+    mov rdx, rax
+    add rdx, rcx
+.vtp_ich_clear_loop:
+    cmp rax, rdx
+    jge .vtp_ich_done
+    cmp rax, [grid_cols]
+    jge .vtp_ich_done
+    push rdx
+    mov rdx, rbx
+    add rdx, rax
+    imul rdx, CELL_SIZE
+    mov qword [grid + rdx], 0x0000000000070020
+    pop rdx
+    inc rax
+    jmp .vtp_ich_clear_loop
+.vtp_ich_done:
+    pop rbx
+    jmp .vtp_loop
+
+; CSI L - Insert Lines (IL)
+.vtp_csi_il:
+    mov eax, [vt_params]
+    test eax, eax
+    jnz .vtp_il_go
+    mov eax, 1
+.vtp_il_go:
+    push rbx
+    push r12
+    mov ecx, eax              ; count
+    mov r12, [scroll_bottom]
+    test r12, r12
+    jnz .vtp_il_have_bot
+    mov r12, [grid_rows]
+    dec r12
+.vtp_il_have_bot:
+    ; Shift rows down from scroll_bottom to cursor_row+count
+    mov rax, r12
+.vtp_il_shift:
+    mov rdx, rax
+    sub rdx, rcx
+    cmp rdx, [cursor_row]
+    jl .vtp_il_clear
+    ; Copy row rdx to row rax
+    push rcx
+    push rax
+    mov rsi, rdx
+    imul rsi, MAX_COLS
+    imul rsi, CELL_SIZE
+    lea rsi, [grid + rsi]
+    mov rdi, rax
+    imul rdi, MAX_COLS
+    imul rdi, CELL_SIZE
+    lea rdi, [grid + rdi]
+    mov rcx, MAX_COLS
+.vtp_il_cp:
+    mov r8, [rsi]
+    mov [rdi], r8
+    add rsi, CELL_SIZE
+    add rdi, CELL_SIZE
+    dec rcx
+    jnz .vtp_il_cp
+    pop rax
+    pop rcx
+    dec rax
+    jmp .vtp_il_shift
+.vtp_il_clear:
+    ; Clear inserted rows at cursor_row
+    mov rax, [cursor_row]
+    mov rdx, rax
+    add rdx, rcx
+.vtp_il_clear_loop:
+    cmp rax, rdx
+    jge .vtp_il_done
+    cmp rax, r12
+    jg .vtp_il_done
+    push rdx
+    mov rbx, rax
+    imul rbx, MAX_COLS
+    xor edx, edx
+.vtp_il_clear_row:
+    cmp rdx, [grid_cols]
+    jge .vtp_il_clear_next
+    mov rdi, rbx
+    add rdi, rdx
+    imul rdi, CELL_SIZE
+    mov qword [grid + rdi], 0x0000000000070020
+    inc rdx
+    jmp .vtp_il_clear_row
+.vtp_il_clear_next:
+    pop rdx
+    inc rax
+    jmp .vtp_il_clear_loop
+.vtp_il_done:
+    pop r12
+    pop rbx
+    jmp .vtp_loop
+
+; CSI M - Delete Lines (DL)
+.vtp_csi_dl:
+    mov eax, [vt_params]
+    test eax, eax
+    jnz .vtp_dl_go
+    mov eax, 1
+.vtp_dl_go:
+    push rbx
+    push r12
+    mov ecx, eax              ; count
+    mov r12, [scroll_bottom]
+    test r12, r12
+    jnz .vtp_dl_have_bot
+    mov r12, [grid_rows]
+    dec r12
+.vtp_dl_have_bot:
+    ; Shift rows up from cursor_row+count to scroll_bottom
+    mov rax, [cursor_row]
+.vtp_dl_shift:
+    mov rdx, rax
+    add rdx, rcx
+    cmp rdx, r12
+    jg .vtp_dl_clear
+    ; Copy row rax+count to row rax
+    push rcx
+    push rax
+    mov rsi, rdx
+    imul rsi, MAX_COLS
+    imul rsi, CELL_SIZE
+    lea rsi, [grid + rsi]
+    mov rdi, rax
+    imul rdi, MAX_COLS
+    imul rdi, CELL_SIZE
+    lea rdi, [grid + rdi]
+    mov rcx, MAX_COLS
+.vtp_dl_cp:
+    mov r8, [rsi]
+    mov [rdi], r8
+    add rsi, CELL_SIZE
+    add rdi, CELL_SIZE
+    dec rcx
+    jnz .vtp_dl_cp
+    pop rax
+    pop rcx
+    inc rax
+    jmp .vtp_dl_shift
+.vtp_dl_clear:
+    ; Clear bottom rows
+    mov rax, r12
+    sub rax, rcx
+    inc rax
+    cmp rax, [cursor_row]
+    jge .vtp_dl_clear_start
+    mov rax, [cursor_row]
+.vtp_dl_clear_start:
+.vtp_dl_clear_loop:
+    cmp rax, r12
+    jg .vtp_dl_done
+    push rax
+    mov rbx, rax
+    imul rbx, MAX_COLS
+    xor edx, edx
+.vtp_dl_clear_row:
+    cmp rdx, [grid_cols]
+    jge .vtp_dl_clear_rnext
+    mov rdi, rbx
+    add rdi, rdx
+    imul rdi, CELL_SIZE
+    mov qword [grid + rdi], 0x0000000000070020
+    inc rdx
+    jmp .vtp_dl_clear_row
+.vtp_dl_clear_rnext:
+    pop rax
+    inc rax
+    jmp .vtp_dl_clear_loop
+.vtp_dl_done:
+    pop r12
+    pop rbx
+    jmp .vtp_loop
+
+; CSI X - Erase Characters (ECH)
+.vtp_csi_ech:
+    mov eax, [vt_params]
+    test eax, eax
+    jnz .vtp_ech_go
+    mov eax, 1
+.vtp_ech_go:
+    push rbx
+    mov ecx, eax
+    mov rbx, [cursor_row]
+    imul rbx, MAX_COLS
+    mov rax, [cursor_col]
+.vtp_ech_loop:
+    test ecx, ecx
+    jz .vtp_ech_done
+    cmp rax, [grid_cols]
+    jge .vtp_ech_done
+    mov rdx, rbx
+    add rdx, rax
+    imul rdx, CELL_SIZE
+    mov qword [grid + rdx], 0x0000000000070020
+    inc rax
+    dec ecx
+    jmp .vtp_ech_loop
+.vtp_ech_done:
+    pop rbx
+    jmp .vtp_loop
+
 ; CSI m - Select Graphic Rendition (SGR)
 .vtp_csi_sgr:
     xor ebx, ebx            ; param index
@@ -4036,10 +4321,72 @@ grid_clear_line:
     ret
 
 ; Scroll grid up by one line (saves top row to scrollback)
+; Scroll up within scroll region (scroll_top..scroll_bottom)
+grid_scroll_region_up:
+    push rbx
+    push r12
+    push r13
+    mov r12, [scroll_top]
+    mov r13, [scroll_bottom]
+    test r13, r13
+    jnz .gsru_have_region
+    ; No scroll region set, use full grid
+    jmp grid_scroll_up.gsu_entry
+.gsru_have_region:
+    ; Move rows scroll_top+1..scroll_bottom to scroll_top..scroll_bottom-1
+    mov rbx, r12
+    imul rbx, MAX_COLS
+.gsru_loop:
+    mov rax, r12
+    cmp rax, r13
+    jge .gsru_clear
+    mov rax, rbx
+    add rax, MAX_COLS
+    imul rax, CELL_SIZE
+    mov rcx, rbx
+    imul rcx, CELL_SIZE
+    ; Copy one row
+    push rbx
+    xor edx, edx
+.gsru_cp:
+    cmp rdx, MAX_COLS
+    jge .gsru_cp_done
+    mov r8, [grid + rax]
+    mov [grid + rcx], r8
+    add rax, CELL_SIZE
+    add rcx, CELL_SIZE
+    inc rdx
+    jmp .gsru_cp
+.gsru_cp_done:
+    pop rbx
+    add rbx, MAX_COLS
+    inc r12
+    jmp .gsru_loop
+.gsru_clear:
+    ; Clear the bottom row of the scroll region
+    mov rbx, r13
+    imul rbx, MAX_COLS
+    xor edx, edx
+.gsru_cl:
+    cmp rdx, [grid_cols]
+    jge .gsru_done
+    mov rax, rbx
+    add rax, rdx
+    imul rax, CELL_SIZE
+    mov qword [grid + rax], 0x0000000000070020
+    inc rdx
+    jmp .gsru_cl
+.gsru_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 grid_scroll_up:
     push rbx
     push r12
     push r13
+.gsu_entry:
 
     ; Save top row to scrollback circular buffer before scrolling
     mov rax, [scroll_write_pos]
