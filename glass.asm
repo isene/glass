@@ -3296,6 +3296,10 @@ vt_process:
     ; Build parameters
     cmp al, '?'
     je .vtp_csi_private
+    cmp al, '>'
+    je .vtp_csi_private_gt
+    cmp al, '='
+    je .vtp_csi_private_eq
     cmp al, '0'
     jb .vtp_csi_final
     cmp al, '9'
@@ -3325,6 +3329,12 @@ vt_process:
 
 .vtp_csi_private:
     mov byte [vt_private], '?'
+    jmp .vtp_loop
+.vtp_csi_private_gt:
+    mov byte [vt_private], '>'
+    jmp .vtp_loop
+.vtp_csi_private_eq:
+    mov byte [vt_private], '='
     jmp .vtp_loop
 
 .vtp_csi_final:
