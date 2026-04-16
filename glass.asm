@@ -207,6 +207,8 @@ child_pid:          resq 1
 grid:               resb MAX_COLS * MAX_ROWS * CELL_SIZE
 grid_cols:          resq 1
 grid_rows:          resq 1
+prev_grid_cols:     resq 1
+prev_grid_rows:     resq 1
 
 ; Cursor
 cursor_row:         resq 1
@@ -239,7 +241,7 @@ pty_read_buf:       resb 4096
 xauth_buf:          resb 4096
 xauth_data:         resb 16
 xauth_len:          resq 1
-conn_setup_buf:     resb 8192
+conn_setup_buf:     resb 16384
 sockaddr_buf:       resb 112
 
 ; Poll
@@ -311,11 +313,11 @@ _start:
     ; Create GC
     call x11_create_gc
 
+    ; Set WM hints (before map to avoid event/reply mixing)
+    call x11_set_wm_hints
+
     ; Map window
     call x11_map_window
-
-    ; Set WM hints
-    call x11_set_wm_hints
 
     ; Flush all pending X11 requests
     call x11_flush
@@ -659,14 +661,30 @@ x11_connect:
     mov rdi, [x11_fd]
     syscall
 
-    ; Read reply
+    ; Read full setup reply (may need multiple reads)
+    xor r12, r12              ; total bytes read
+.xc_read_loop:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [conn_setup_buf]
-    mov rdx, 8192
+    add rsi, r12
+    mov rdx, 16384
+    sub rdx, r12
+    jle .xc_read_done         ; buffer full
     syscall
     test rax, rax
     jle .xc_fail
+    add r12, rax
+    ; Need at least 8 bytes to check reply size
+    cmp r12, 8
+    jl .xc_read_loop
+    ; Check total reply size: 8 + additional_data*4
+    movzx eax, word [conn_setup_buf + 6]
+    shl eax, 2
+    add eax, 8
+    cmp r12d, eax
+    jl .xc_read_loop          ; need more data
+.xc_read_done:
 
     ; Check success (first byte = 1)
     cmp byte [conn_setup_buf], 1
@@ -916,12 +934,12 @@ x11_query_font:
     movzx eax, word [rsi + 28]
     mov [char_width], ax
 
-    ; font-ascent at offset 46
-    movzx eax, word [rsi + 46]
+    ; font-ascent at offset 52
+    movzx eax, word [rsi + 52]
     mov [font_ascent], ax
 
-    ; font-descent at offset 48
-    movzx eax, word [rsi + 48]
+    ; font-descent at offset 54
+    movzx eax, word [rsi + 54]
     mov [font_descent], ax
 
     ; char_height = ascent + descent
@@ -1537,7 +1555,38 @@ handle_x11_events:
     mov rax, MAX_ROWS
 .hxe_cfg_rows_ok:
     mov [grid_rows], rax
-    ; TODO: resize PTY, reflow grid
+    ; Only resize PTY if dimensions actually changed
+    mov rax, [grid_cols]
+    cmp rax, [prev_grid_cols]
+    jne .hxe_cfg_resize
+    mov rax, [grid_rows]
+    cmp rax, [prev_grid_rows]
+    je .hxe_cfg_done
+.hxe_cfg_resize:
+    mov rax, [grid_cols]
+    mov [prev_grid_cols], rax
+    mov rax, [grid_rows]
+    mov [prev_grid_rows], rax
+    ; Resize PTY
+    sub rsp, 8
+    movzx eax, word [grid_rows]
+    mov word [rsp], ax        ; ws_row
+    movzx eax, word [grid_cols]
+    mov word [rsp+2], ax      ; ws_col
+    mov word [rsp+4], 0
+    mov word [rsp+6], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [pty_master]
+    mov rsi, TIOCSWINSZ
+    mov rdx, rsp
+    syscall
+    add rsp, 8
+    ; Send SIGWINCH to child process group
+    mov rax, SYS_KILL
+    mov rdi, [child_pid]
+    neg rdi                   ; negative pid = process group
+    mov rsi, SIGWINCH
+    syscall
 .hxe_cfg_done:
     pop r12
     pop rbx
@@ -1818,6 +1867,15 @@ vt_process:
     cmp al, 0x20
     jb .vtp_loop             ; ignore other control chars
 
+    ; UTF-8 handling: skip continuation bytes (0x80-0xBF)
+    ; so multi-byte chars occupy one grid cell (matching terminal width)
+    cmp al, 0x80
+    jb .vtp_ascii
+    cmp al, 0xBF
+    jbe .vtp_loop            ; skip continuation bytes
+    ; UTF-8 lead byte (0xC0+): show placeholder
+    mov al, '?'
+.vtp_ascii:
     ; Printable character
     call grid_put_char
     jmp .vtp_loop
@@ -2007,12 +2065,18 @@ vt_process:
     je .vtp_csi_su
     cmp al, 'T'
     je .vtp_csi_sd
+    cmp al, 's'
+    je .vtp_csi_save_cursor
+    cmp al, 'u'
+    je .vtp_csi_restore_cursor
+    cmp al, 'P'
+    je .vtp_csi_dch
     cmp al, 'r'
-    je .vtp_loop            ; ignore DECSTBM for Phase 1
+    je .vtp_loop            ; ignore DECSTBM for now
     cmp al, 'h'
-    je .vtp_loop            ; ignore set mode for Phase 1
+    je .vtp_loop            ; ignore set mode for now
     cmp al, 'l'
-    je .vtp_loop            ; ignore reset mode for Phase 1
+    je .vtp_loop            ; ignore reset mode for now
     jmp .vtp_loop
 
 ; CSI A - Cursor Up
@@ -2196,6 +2260,69 @@ vt_process:
     pop rcx
     dec ecx
     jmp .vtp_sd_loop
+
+; CSI s - Save Cursor Position
+.vtp_csi_save_cursor:
+    mov rax, [cursor_row]
+    mov [cursor_saved_row], rax
+    mov rax, [cursor_col]
+    mov [cursor_saved_col], rax
+    jmp .vtp_loop
+
+; CSI u - Restore Cursor Position
+.vtp_csi_restore_cursor:
+    mov rax, [cursor_saved_row]
+    mov [cursor_row], rax
+    mov rax, [cursor_saved_col]
+    mov [cursor_col], rax
+    jmp .vtp_loop
+
+; CSI P - Delete Characters
+.vtp_csi_dch:
+    mov eax, [vt_params]
+    test eax, eax
+    jnz .vtp_dch_go
+    mov eax, 1
+.vtp_dch_go:
+    ; Shift cells left from cursor_col+n to end of line
+    push rbx
+    mov ecx, eax              ; count to delete
+    mov rbx, [cursor_row]
+    imul rbx, MAX_COLS
+    mov rax, [cursor_col]
+.vtp_dch_shift:
+    mov rdx, rax
+    add rdx, rcx
+    cmp rdx, [grid_cols]
+    jge .vtp_dch_clear
+    ; Copy cell at col+n to col
+    mov rdx, rbx
+    add rdx, rax
+    add rdx, rcx
+    imul rdx, CELL_SIZE
+    mov r8d, [grid + rdx]
+    mov rdx, rbx
+    add rdx, rax
+    imul rdx, CELL_SIZE
+    mov [grid + rdx], r8d
+    inc rax
+    jmp .vtp_dch_shift
+.vtp_dch_clear:
+    ; Clear remaining cells
+    cmp rax, [grid_cols]
+    jge .vtp_dch_done
+    mov rdx, rbx
+    add rdx, rax
+    imul rdx, CELL_SIZE
+    mov byte [grid + rdx], ' '
+    mov byte [grid + rdx + 1], 7
+    mov byte [grid + rdx + 2], 0
+    mov byte [grid + rdx + 3], 0
+    inc rax
+    jmp .vtp_dch_clear
+.vtp_dch_done:
+    pop rbx
+    jmp .vtp_loop
 
 ; CSI m - Select Graphic Rendition (SGR)
 .vtp_csi_sgr:
@@ -2589,109 +2716,119 @@ render_screen:
     call x11_buffer
     inc dword [x11_seq]
 
-    ; Draw each row
+    ; Draw each row with per-color-run rendering
     xor r12, r12             ; row
 .rs_row:
     cmp r12, [grid_rows]
     jge .rs_cursor
 
-    ; Find runs of characters and draw them
-    xor r13, r13             ; col (start of run)
-    movzx r14d, byte [cur_fg] ; will track fg of current run... actually use grid cells
+    ; r12 = row, scan columns for color runs
+    xor r13, r13             ; col = start of current run
 
-    ; For Phase 1: draw entire row in one ImageText8 call (max 255 chars)
-    ; Build text string from grid row
+.rs_run_start:
+    cmp r13, [grid_cols]
+    jge .rs_next_row
+
+    ; Get fg/bg of cell at (row, col)
     mov rax, r12
     imul rax, MAX_COLS
+    add rax, r13
     imul rax, CELL_SIZE
-    lea rsi, [grid + rax]    ; start of row in grid
+    movzx r14d, byte [grid + rax + 1]  ; run fg
+    movzx r15d, byte [grid + rax + 2]  ; run bg
 
-    ; Get the first cell's fg/bg
-    movzx eax, byte [rsi + 1] ; fg of first cell
-    mov r14d, eax
-    movzx eax, byte [rsi + 2] ; bg of first cell
-    mov r15d, eax
+    ; Scan ahead for cells with same fg/bg, build text
+    lea rdi, [tmp_buf + 20]  ; text buffer
+    mov rbx, r13             ; current col
+    xor ecx, ecx             ; text length
+.rs_run_scan:
+    cmp rbx, [grid_cols]
+    jge .rs_run_draw
+    cmp ecx, 255             ; ImageText8 max
+    jge .rs_run_draw
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, rbx
+    imul rax, CELL_SIZE
+    ; Check if fg/bg matches current run
+    movzx edx, byte [grid + rax + 1]
+    cmp edx, r14d
+    jne .rs_run_draw
+    movzx edx, byte [grid + rax + 2]
+    cmp edx, r15d
+    jne .rs_run_draw
+    ; Same color, add to run
+    movzx edx, byte [grid + rax]       ; char
+    mov [rdi + rcx], dl
+    inc ecx
+    inc rbx
+    jmp .rs_run_scan
 
-    ; Set GC colors
-    ; ChangeGC foreground
+.rs_run_draw:
+    ; ecx = run length, r13 = start col, r14 = fg, r15 = bg
+    test ecx, ecx
+    jz .rs_next_row
+
+    ; ChangeGC fg/bg
+    push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
     mov byte [rdi+1], 0
-    mov word [rdi+2], 4      ; length
+    mov word [rdi+2], 5      ; length (3 + 2 values)
     mov eax, [gc_id]
     mov [rdi+4], eax
     mov dword [rdi+8], GC_FOREGROUND | GC_BACKGROUND
-    ; Lookup palette for fg
-    movzx eax, byte [rsi + 1]
-    mov eax, [palette + rax*4]
-    mov [rdi+12], eax        ; foreground pixel
-    movzx eax, byte [rsi + 2]
-    mov eax, [palette + rax*4]
-    mov [rdi+16], eax        ; background pixel
-    push rsi
+    mov eax, [palette + r14*4]
+    mov [rdi+12], eax
+    mov eax, [palette + r15*4]
+    mov [rdi+16], eax
     lea rsi, [tmp_buf]
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
-    pop rsi
+    pop rcx
 
-    ; Build text from row
-    lea rdi, [tmp_buf + 20]  ; use tmp_buf+20 for text
-    mov rcx, [grid_cols]
-    cmp rcx, 255
-    jle .rs_cols_ok
-    mov rcx, 255
-.rs_cols_ok:
-    xor rbx, rbx
-.rs_build_text:
-    cmp rbx, rcx
-    jge .rs_draw_text
-    mov rax, rbx
-    imul rax, CELL_SIZE
-    movzx eax, byte [rsi + rax]
-    mov [rdi + rbx], al
-    inc rbx
-    jmp .rs_build_text
-
-.rs_draw_text:
-    ; ImageText8 request
-    ; opcode=76, string_len, request_length, drawable, gc, x, y, string
+    ; ImageText8
+    push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_IMAGE_TEXT8
-    mov [rdi+1], bl          ; string length (low byte)
-    ; request length = (4 + n + pad) / 4
-    mov eax, ebx
-    add eax, 16              ; 16 bytes header
+    mov byte [rdi+1], cl     ; string length
+    ; request length = (16 + n + 3) / 4
+    mov eax, ecx
+    add eax, 16
     add eax, 3
-    shr eax, 2               ; / 4
+    shr eax, 2
     mov word [rdi+2], ax
     mov eax, [win_id]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
-    ; x = 0
-    mov word [rdi+12], 0
+    ; x = start_col * char_width
+    mov rax, r13
+    movzx edx, word [char_width]
+    imul eax, edx
+    mov word [rdi+12], ax
     ; y = row * char_height + font_ascent
     movzx eax, word [char_height]
     imul eax, r12d
-    movzx ecx, word [font_ascent]
-    add eax, ecx
+    movzx edx, word [font_ascent]
+    add eax, edx
     mov word [rdi+14], ax
-    ; Copy text
-    lea rdi, [tmp_buf + 16]
-    lea rsi, [tmp_buf + 20]
-    xor ecx, ecx
-.rs_cp_text:
-    cmp ecx, ebx
-    jge .rs_send_text
-    movzx eax, byte [rsi + rcx]
-    mov [rdi + rcx], al
-    inc ecx
-    jmp .rs_cp_text
-
-.rs_send_text:
-    ; Calculate padded length
-    mov eax, ebx
+    ; Copy text from tmp_buf+20 to tmp_buf+16
+    pop rcx
+    push rcx
+    xor edx, edx
+.rs_cp_run:
+    cmp edx, ecx
+    jge .rs_send_run
+    movzx eax, byte [tmp_buf + 20 + rdx]
+    mov [tmp_buf + 16 + rdx], al
+    inc edx
+    jmp .rs_cp_run
+.rs_send_run:
+    pop rcx
+    ; Send padded request
+    mov eax, ecx
     add eax, 16
     add eax, 3
     and eax, ~3
@@ -2700,6 +2837,11 @@ render_screen:
     call x11_buffer
     inc dword [x11_seq]
 
+    ; Advance to next run
+    mov r13, rbx
+    jmp .rs_run_start
+
+.rs_next_row:
     inc r12
     jmp .rs_row
 
@@ -2735,17 +2877,19 @@ render_screen:
     movzx ecx, word [char_width]
     imul eax, ecx
     mov word [rdi+12], ax
-    ; y = cursor_row * char_height
+    ; y = cursor_row * char_height + char_height - 2 (underline)
     mov rax, [cursor_row]
     movzx ecx, word [char_height]
     imul eax, ecx
+    movzx ecx, word [char_height]
+    add eax, ecx
+    sub eax, 2
     mov word [rdi+14], ax
     ; width = char_width
     movzx eax, word [char_width]
     mov word [rdi+16], ax
-    ; height = char_height
-    movzx eax, word [char_height]
-    mov word [rdi+18], ax
+    ; height = 2 (thin underline)
+    mov word [rdi+18], 2
 
     lea rsi, [tmp_buf]
     mov rdx, 20
@@ -2797,25 +2941,16 @@ init_palette:
     ; Calculate pixel: 0x00RRGGBB
     push rcx
     push rdx
-    ; R component
     lea rdi, [.ip_vals]
+    ; R component
     movzx eax, byte [rdi + r12]
     shl eax, 16
     mov esi, eax
-    ; G component
-    pop rdx
-    push rdx
-    pop rcx
-    push rcx
-    ; Actually this is getting confused. Let me use a simpler approach.
-    pop rdx
-    pop rcx
-    push rcx
-    push rdx
+    ; G component (rcx = g index, preserved on stack)
     movzx eax, byte [rdi + rcx]
     shl eax, 8
     or esi, eax
-    ; B component
+    ; B component (rdx = b index, preserved on stack)
     movzx eax, byte [rdi + rdx]
     or esi, eax
     mov [palette + rbx*4], esi
