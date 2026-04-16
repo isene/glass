@@ -54,6 +54,11 @@
 %define X11_POLY_FILL_RECT    70
 %define X11_IMAGE_TEXT8       76
 %define X11_GET_KEYBOARD_MAPPING 101
+%define X11_SET_SELECTION_OWNER 22
+%define X11_CONVERT_SELECTION 24
+%define X11_SEND_EVENT        25
+%define X11_CHANGE_WINDOW_ATTRS2 2
+%define X11_GET_PROPERTY      20
 
 ; X11 event types
 %define EV_KEY_PRESS        2
@@ -61,15 +66,22 @@
 %define EV_EXPOSE           12
 %define EV_CONFIGURE_NOTIFY 22
 %define EV_CLIENT_MESSAGE   33
+%define EV_BUTTON_PRESS     4
+%define EV_BUTTON_RELEASE   5
+%define EV_MOTION_NOTIFY    6
 %define EV_FOCUS_IN         9
 %define EV_FOCUS_OUT        10
+%define EV_SELECTION_REQUEST 30
+%define EV_SELECTION_NOTIFY  31
 
 ; X11 masks
 %define KEY_PRESS_MASK      0x00000001
 %define EXPOSURE_MASK       0x00008000
 %define STRUCTURE_NOTIFY_MASK 0x00020000
 %define FOCUS_CHANGE_MASK   0x00200000
-%define EVENT_MASK_ALL      0x00228001
+; BUTTON_PRESS(0x4) | BUTTON_RELEASE(0x8) | BUTTON_MOTION(0x2000)
+; | KEY_PRESS(0x1) | EXPOSURE(0x8000) | STRUCTURE(0x20000) | FOCUS(0x200000)
+%define EVENT_MASK_ALL      0x0022A00D
 
 ; CreateWindow value mask bits
 %define CW_BACK_PIXEL       0x00000002
@@ -106,15 +118,25 @@ auth_name_len   equ 18
 ; X11 socket path template
 x11_sock_pre:   db "/tmp/.X11-unix/X", 0
 
-; Font name
-font_name:      db "fixed", 0
-font_name_len   equ 5
+; Font name (Unicode BMP fixed font)
+font_name:      db "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1", 0
+font_name_len   equ 64
 
 ; WM atom names
 wm_protocols_str: db "WM_PROTOCOLS", 0
 wm_protocols_len  equ 12
 wm_delete_str:  db "WM_DELETE_WINDOW", 0
 wm_delete_len   equ 16
+
+; Selection atom names
+clipboard_str:    db "CLIPBOARD", 0
+clipboard_len     equ 9
+utf8_string_str:  db "UTF8_STRING", 0
+utf8_string_len   equ 11
+targets_str:      db "TARGETS", 0
+targets_len       equ 7
+glass_sel_str:    db "GLASS_SEL", 0
+glass_sel_len     equ 9
 
 ; Window title
 win_title:      db "glass", 0
@@ -194,9 +216,32 @@ font_descent:       resw 1
 char_width:         resw 1
 char_height:        resw 1
 
-; Keyboard
-keymap:             resd 512
-keysyms_per_code:   resd 1
+; Keyboard (proper X11 keysym mapping)
+keysym_map:         resd 2048       ; 256 keycodes × 8 keysyms each
+keysyms_per_kc:     resd 1
+
+; Scrollback
+scroll_buf:         resb MAX_COLS * 1000 * CELL_SIZE  ; 1000 lines
+scroll_lines:       resq 1          ; number of lines stored
+scroll_write_pos:   resq 1          ; circular write position
+scroll_offset:      resq 1          ; current view offset (0 = live)
+
+; Selection
+sel_active:         resq 1          ; 1 = selection in progress
+sel_start_row:      resq 1
+sel_start_col:      resq 1
+sel_end_row:        resq 1
+sel_end_col:        resq 1
+sel_buf:            resb 16384      ; selection text buffer
+sel_len:            resq 1
+sel_button_held:    resq 1          ; 1 = mouse button is held
+
+; Selection atoms
+clipboard_atom:     resd 1
+utf8_string_atom:   resd 1
+targets_atom:       resd 1
+glass_sel_atom:     resd 1
+primary_atom:       resd 1          ; XA_PRIMARY = 1 (built-in)
 
 ; PTY
 pty_master:         resq 1
@@ -258,6 +303,7 @@ palette:            resd 256
 tmp_buf:            resb 4096
 num_buf:            resb 32
 key_out_buf:        resb 32
+rs_row_base:        resq 1          ; pointer to current row's cell data
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Text section
@@ -301,6 +347,9 @@ _start:
     ; Parse X11 setup reply
     call x11_parse_setup
 
+    ; Get keyboard mapping from server
+    call x11_get_keymap
+
     ; Open font
     call x11_open_font
 
@@ -315,6 +364,9 @@ _start:
 
     ; Set WM hints (before map to avoid event/reply mixing)
     call x11_set_wm_hints
+
+    ; Intern selection atoms
+    call x11_intern_sel_atoms
 
     ; Map window
     call x11_map_window
@@ -790,6 +842,121 @@ x11_parse_setup:
     pop rbx
     ret
 
+; Get keyboard mapping from X11 server
+x11_get_keymap:
+    push rbx
+    push r12
+    push r13
+
+    ; Calculate count = max_keycode - min_keycode + 1
+    movzx eax, byte [x11_min_keycode]
+    mov r12d, eax                     ; save min_keycode
+    movzx ecx, byte [x11_max_keycode]
+    sub ecx, eax
+    inc ecx
+    mov r13d, ecx                     ; count
+
+    ; Build GetKeyboardMapping request
+    ; opcode=101, pad=0, length=2, first_keycode, count, pad(2)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_KEYBOARD_MAPPING
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2              ; request length = 2 words
+    mov [rdi+4], r12b                ; first_keycode
+    mov [rdi+5], r13b                ; count
+    mov word [rdi+6], 0              ; pad
+
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Flush and read reply
+    call x11_flush
+
+    ; Read reply header (32 bytes minimum)
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .xgk_done
+
+    ; Reply byte 1 = keysyms_per_keycode
+    movzx eax, byte [x11_buf + 1]
+    mov [keysyms_per_kc], eax
+    mov ebx, eax                     ; keysyms_per_kc
+
+    ; Reply bytes 4-7 = reply length in 4-byte units (number of keysyms)
+    mov eax, [x11_buf + 4]
+    shl eax, 2                       ; total data bytes
+    mov r13d, eax                    ; total bytes to read
+
+    ; Read keysym data in chunks
+    xor r12d, r12d                   ; bytes read so far
+.xgk_read_loop:
+    cmp r12d, r13d
+    jge .xgk_parse
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    add rsi, r12
+    mov edx, r13d
+    sub edx, r12d
+    cmp edx, 65536
+    jle .xgk_read_ok
+    mov edx, 65536
+.xgk_read_ok:
+    syscall
+    test eax, eax
+    jle .xgk_done
+    add r12d, eax
+    jmp .xgk_read_loop
+
+.xgk_parse:
+    ; Parse keysym data into keysym_map
+    ; Data is: for each keycode, keysyms_per_kc CARD32 keysyms
+    ; Store indexed by keycode (not keycode - min_keycode)
+    movzx eax, byte [x11_min_keycode]
+    mov ecx, eax                     ; current keycode
+    xor edx, edx                     ; source offset in x11_buf
+    mov ebx, [keysyms_per_kc]
+.xgk_store_loop:
+    cmp edx, r12d
+    jge .xgk_done
+    ; For this keycode, copy up to 8 keysyms
+    xor esi, esi                     ; keysym index
+.xgk_sym_loop:
+    cmp esi, ebx
+    jge .xgk_next_kc
+    cmp esi, 8
+    jge .xgk_skip_sym
+    cmp edx, r12d
+    jge .xgk_done
+    ; Store: keysym_map[keycode * 8 + sym_index]
+    mov eax, ecx
+    shl eax, 3                       ; keycode * 8
+    add eax, esi
+    mov r8d, [x11_buf + rdx]
+    mov [keysym_map + rax*4], r8d
+    add edx, 4
+    inc esi
+    jmp .xgk_sym_loop
+.xgk_skip_sym:
+    add edx, 4
+    inc esi
+    jmp .xgk_sym_loop
+.xgk_next_kc:
+    inc ecx
+    jmp .xgk_store_loop
+
+.xgk_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; Allocate X11 resource ID
 alloc_xid:
     mov eax, [x11_rid_next]
@@ -1206,6 +1373,163 @@ x11_set_wm_hints:
     pop rbx
     ret
 
+; Intern selection atoms (CLIPBOARD, UTF8_STRING, TARGETS, GLASS_SEL)
+x11_intern_sel_atoms:
+    push rbx
+    push r12
+
+    ; Set PRIMARY atom (built-in, always 1)
+    mov dword [primary_atom], 1
+
+    ; Intern CLIPBOARD
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (clipboard_len + 3) / 4
+    mov word [rdi+4], clipboard_len
+    mov word [rdi+6], 0
+    lea rsi, [clipboard_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xia_cp1:
+    cmp ecx, clipboard_len
+    jge .xia_send1
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xia_cp1
+.xia_send1:
+    mov eax, clipboard_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_buf + 8]
+    mov [clipboard_atom], eax
+
+    ; Intern UTF8_STRING
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (utf8_string_len + 3) / 4
+    mov word [rdi+4], utf8_string_len
+    mov word [rdi+6], 0
+    lea rsi, [utf8_string_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xia_cp2:
+    cmp ecx, utf8_string_len
+    jge .xia_send2
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xia_cp2
+.xia_send2:
+    mov eax, utf8_string_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_buf + 8]
+    mov [utf8_string_atom], eax
+
+    ; Intern TARGETS
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (targets_len + 3) / 4
+    mov word [rdi+4], targets_len
+    mov word [rdi+6], 0
+    lea rsi, [targets_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xia_cp3:
+    cmp ecx, targets_len
+    jge .xia_send3
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xia_cp3
+.xia_send3:
+    mov eax, targets_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_buf + 8]
+    mov [targets_atom], eax
+
+    ; Intern GLASS_SEL
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (glass_sel_len + 3) / 4
+    mov word [rdi+4], glass_sel_len
+    mov word [rdi+6], 0
+    lea rsi, [glass_sel_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xia_cp4:
+    cmp ecx, glass_sel_len
+    jge .xia_send4
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xia_cp4
+.xia_send4:
+    mov eax, glass_sel_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_buf + 8]
+    mov [glass_sel_atom], eax
+
+    pop r12
+    pop rbx
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
 ; PTY management
 ; ══════════════════════════════════════════════════════════════════════
@@ -1446,6 +1770,9 @@ event_loop:
     test rax, rax
     jle .ev_child_died
 
+    ; Snap to live view on new PTY output
+    mov qword [scroll_offset], 0
+
     ; Process VT sequences
     mov rcx, rax
     lea rsi, [pty_read_buf]
@@ -1491,12 +1818,22 @@ handle_x11_events:
 
     cmp al, EV_KEY_PRESS
     je .hxe_key_press
+    cmp al, EV_BUTTON_PRESS
+    je .hxe_button_press
+    cmp al, EV_BUTTON_RELEASE
+    je .hxe_button_release
+    cmp al, EV_MOTION_NOTIFY
+    je .hxe_motion
     cmp al, EV_EXPOSE
     je .hxe_expose
     cmp al, EV_CONFIGURE_NOTIFY
     je .hxe_configure
     cmp al, EV_CLIENT_MESSAGE
     je .hxe_client_msg
+    cmp al, EV_SELECTION_REQUEST
+    je .hxe_sel_request
+    cmp al, EV_SELECTION_NOTIFY
+    je .hxe_sel_notify
 
 .hxe_skip:
     add rbx, 32              ; each event is 32 bytes
@@ -1593,6 +1930,301 @@ handle_x11_events:
     add rbx, 32
     jmp .hxe_loop
 
+.hxe_button_press:
+    ; ButtonPress event: start selection
+    ; event detail (button number) at offset 1; only handle button 1
+    movzx eax, byte [x11_buf + rbx + 1]
+    cmp al, 1
+    jne .hxe_skip
+    push rbx
+    push r12
+    ; event_x at offset 24 (INT16), event_y at offset 26 (INT16)
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_bp_done
+    xor edx, edx
+    div ecx
+    mov [sel_start_col], rax
+    mov [sel_end_col], rax
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_bp_done
+    xor edx, edx
+    div ecx
+    mov [sel_start_row], rax
+    mov [sel_end_row], rax
+    mov qword [sel_active], 1
+    mov qword [sel_button_held], 1
+.hxe_bp_done:
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_motion:
+    ; MotionNotify: update selection end if button held
+    cmp qword [sel_button_held], 1
+    jne .hxe_skip
+    push rbx
+    push r12
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_mn_done
+    xor edx, edx
+    div ecx
+    mov [sel_end_col], rax
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_mn_done
+    xor edx, edx
+    div ecx
+    mov [sel_end_row], rax
+.hxe_mn_done:
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_button_release:
+    ; ButtonRelease: end selection, copy text, claim PRIMARY
+    movzx eax, byte [x11_buf + rbx + 1]
+    cmp al, 1
+    jne .hxe_skip
+    mov qword [sel_button_held], 0
+    cmp qword [sel_active], 1
+    jne .hxe_skip
+    push rbx
+    push r12
+    ; Update final position
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_br_copy
+    xor edx, edx
+    div ecx
+    mov [sel_end_col], rax
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_br_copy
+    xor edx, edx
+    div ecx
+    mov [sel_end_row], rax
+.hxe_br_copy:
+    ; Extract selected text from grid into sel_buf
+    call selection_extract
+    ; Claim PRIMARY selection ownership
+    ; SetSelectionOwner: opcode=22, pad=0, length=4
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax              ; owner
+    mov dword [rdi+8], 1          ; selection = XA_PRIMARY
+    mov dword [rdi+12], 0         ; time = CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_sel_request:
+    ; SelectionRequest event (type 30)
+    ; Format: pad(4), time(4), owner(4), requestor(4), selection(4),
+    ;         target(4), property(4)
+    ; Offsets: 4=time, 8=owner, 12=requestor, 16=selection, 20=target, 24=property
+    push rbx
+    push r12
+    ; Read requestor, target, property from event
+    mov r12d, [x11_buf + rbx + 12]   ; requestor window
+    mov eax, [x11_buf + rbx + 20]    ; target atom
+
+    ; Check if target is TARGETS
+    cmp eax, [targets_atom]
+    je .hxe_sr_targets
+
+    ; Check if target is UTF8_STRING or STRING (31)
+    cmp eax, [utf8_string_atom]
+    je .hxe_sr_string
+    cmp eax, 31                      ; XA_STRING
+    je .hxe_sr_string
+
+    ; Unsupported target: send SelectionNotify with property=None
+    mov ecx, 0                       ; property = None
+    jmp .hxe_sr_notify
+
+.hxe_sr_targets:
+    ; ChangeProperty on requestor: list supported targets
+    ; We support TARGETS and UTF8_STRING
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0              ; mode = Replace
+    mov word [rdi+2], 8              ; length (6 + 2 atoms)
+    mov [rdi+4], r12d                ; window = requestor
+    mov eax, [x11_buf + rbx + 24]    ; property from request
+    mov [rdi+8], eax
+    mov dword [rdi+12], 4            ; type = ATOM
+    mov byte [rdi+16], 32            ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 2            ; 2 atoms
+    mov eax, [targets_atom]
+    mov [rdi+24], eax
+    mov eax, [utf8_string_atom]
+    mov [rdi+28], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 32
+    call x11_buffer
+    inc dword [x11_seq]
+    mov ecx, [x11_buf + rbx + 24]    ; property = as requested
+    jmp .hxe_sr_notify
+
+.hxe_sr_string:
+    ; ChangeProperty on requestor: set selection text
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0              ; mode = Replace
+    mov rax, [sel_len]
+    ; length = (24 + data_len + 3) / 4
+    mov edx, eax
+    add edx, 24
+    add edx, 3
+    shr edx, 2
+    mov word [rdi+2], dx             ; request length
+    mov [rdi+4], r12d                ; window = requestor
+    mov ecx, [x11_buf + rbx + 24]    ; property from request
+    mov [rdi+8], ecx
+    push rcx                         ; save property for notify
+    mov eax, [utf8_string_atom]
+    mov [rdi+12], eax                ; type = UTF8_STRING
+    mov byte [rdi+16], 8             ; format = 8 (bytes)
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov eax, [sel_len]
+    mov [rdi+20], eax                ; data length
+    ; Copy selection text
+    xor ecx, ecx
+    mov eax, [sel_len]
+.hxe_sr_cp:
+    cmp ecx, eax
+    jge .hxe_sr_cp_done
+    movzx edx, byte [sel_buf + rcx]
+    mov [tmp_buf + 24 + rcx], dl
+    inc ecx
+    jmp .hxe_sr_cp
+.hxe_sr_cp_done:
+    ; Pad to 4 bytes
+    mov eax, [sel_len]
+    add eax, 24
+    add eax, 3
+    and eax, ~3
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rcx                          ; restore property
+    jmp .hxe_sr_notify
+
+.hxe_sr_notify:
+    ; Send SelectionNotify event to requestor
+    ; SendEvent: opcode=25, propagate=0, length=11
+    ; Event to send is SelectionNotify (31), 32 bytes
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SEND_EVENT
+    mov byte [rdi+1], 0              ; propagate = false
+    mov word [rdi+2], 11             ; length
+    mov [rdi+4], r12d                ; destination = requestor
+    mov dword [rdi+8], 0             ; event-mask = 0
+    ; SelectionNotify event (32 bytes) at offset 12
+    mov byte [rdi+12], 31            ; type = SelectionNotify
+    mov byte [rdi+13], 0
+    mov word [rdi+14], 0             ; sequence (ignored)
+    mov eax, [x11_buf + rbx + 4]     ; time from request
+    mov [rdi+16], eax
+    mov [rdi+20], r12d               ; requestor
+    mov eax, [x11_buf + rbx + 16]    ; selection
+    mov [rdi+24], eax
+    mov eax, [x11_buf + rbx + 20]    ; target
+    mov [rdi+28], eax
+    mov [rdi+32], ecx                ; property (or 0=None)
+    ; Pad remaining bytes
+    mov dword [rdi+36], 0
+    mov dword [rdi+40], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_sel_notify:
+    ; SelectionNotify event (type 31): paste data arrived
+    ; property at offset 20 (CARD32)
+    push rbx
+    push r12
+    mov eax, [x11_buf + rbx + 20]
+    test eax, eax
+    jz .hxe_sn_done                  ; property = None, paste failed
+    ; GetProperty to read the pasted data
+    ; opcode=20, delete=1, length=6
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 1              ; delete = true
+    mov word [rdi+2], 6              ; length
+    mov eax, [win_id]
+    mov [rdi+4], eax                 ; window
+    mov eax, [glass_sel_atom]
+    mov [rdi+8], eax                 ; property = GLASS_SEL
+    mov dword [rdi+12], 0            ; type = AnyPropertyType
+    mov dword [rdi+16], 0            ; long-offset
+    mov dword [rdi+20], 4096         ; long-length (max words to read)
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    call x11_buffer
+    inc dword [x11_seq]
+    ; Flush and read reply
+    call x11_flush
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 65536
+    syscall
+    cmp rax, 32
+    jl .hxe_sn_done
+    ; Reply: type at offset 8, bytes-after at offset 16, value-length at offset 16
+    ; Format at offset 1, length at offset 4 (in 4-byte units)
+    ; Data at offset 32, data length = value_length (at offset 16)
+    mov r12d, [x11_buf + 16]        ; value_length (number of items)
+    movzx eax, byte [x11_buf + 1]   ; format (8, 16, or 32 bits)
+    cmp al, 8
+    jne .hxe_sn_done                 ; we only handle 8-bit format
+    ; r12d = number of bytes of paste data
+    test r12d, r12d
+    jz .hxe_sn_done
+    ; Write paste data to PTY
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [x11_buf + 32]
+    mov edx, r12d
+    syscall
+.hxe_sn_done:
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
 .hxe_client_msg:
     ; Check for WM_DELETE_WINDOW
     mov eax, [x11_buf + rbx + 8]  ; message type
@@ -1611,87 +2243,66 @@ handle_x11_events:
     pop rbx
     ret
 
-; Handle keypress
+; Handle keypress using X11 keysym map
 ; eax = keycode, ecx = state (modifiers)
 handle_keypress:
     push rbx
     push r12
+    push r13
     mov r12d, eax            ; keycode
-    mov ebx, ecx             ; state
+    mov ebx, ecx             ; state (modifier mask)
 
-    ; Simple keycode to ASCII mapping
-    ; For Phase 1: handle basic ASCII keys via direct mapping
-    ; keycodes 10-19 = 1-9,0
-    ; keycodes 24-33 = q-p
-    ; keycodes 38-46 = a-l
-    ; keycodes 52-58 = z-m
-    ; keycode 65 = space
-    ; keycode 36 = Return
-    ; keycode 22 = BackSpace
-    ; keycode 23 = Tab
-    ; keycode 9 = Escape
+    ; Determine shift_index: 0 = unshifted, 1 = shifted
+    xor r13d, r13d           ; shift_index = 0
+    test ebx, 1              ; ShiftMask = bit 0
+    jz .hkp_lookup
+    mov r13d, 1
 
-    ; Check for Ctrl modifier (bit 2 of state)
-    mov edx, ebx
-    and edx, 4               ; ControlMask
-
-    cmp r12d, 9
-    je .hkp_escape
-    cmp r12d, 22
-    je .hkp_backspace
-    cmp r12d, 23
-    je .hkp_tab
-    cmp r12d, 36
-    je .hkp_return
-    cmp r12d, 65
-    je .hkp_space
-    cmp r12d, 111
-    je .hkp_up
-    cmp r12d, 116
-    je .hkp_down
-    cmp r12d, 113
-    je .hkp_left
-    cmp r12d, 114
-    je .hkp_right
-
-    ; Map keycode to ASCII using simple table
-    ; This is a simplified qwerty mapping
-    lea rsi, [.hkp_keymap]
-    cmp r12d, 128
+.hkp_lookup:
+    ; Look up keysym: keysym_map[(keycode * 8 + shift_index) * 4]
+    mov eax, r12d
+    shl eax, 3               ; keycode * 8
+    add eax, r13d            ; + shift_index
+    cmp eax, 2048
     jge .hkp_done
-    movzx eax, byte [rsi + r12]
-    test al, al
-    jz .hkp_done
+    mov eax, [keysym_map + rax*4]  ; keysym (CARD32)
 
-    ; Check shift (bit 0 of state)
-    test ebx, 1
-    jz .hkp_no_shift
-    ; Uppercase for letters
-    cmp al, 'a'
-    jb .hkp_shift_sym
-    cmp al, 'z'
-    ja .hkp_no_shift
-    sub al, 32               ; to uppercase
-    jmp .hkp_no_shift
-.hkp_shift_sym:
-    ; Shift symbols
-    cmp al, '1'
-    jb .hkp_no_shift
-    cmp al, '='
-    ja .hkp_no_shift
-    lea rsi, [.hkp_shift_table]
-    sub al, '!'
-    movzx ecx, al
-    movzx eax, byte [rsi + rcx]
-    test al, al
-    jz .hkp_done
+    ; Check for Ctrl+Shift+V (paste from clipboard)
+    ; Ctrl = bit 2, Shift = bit 0
+    mov ecx, ebx
+    and ecx, 5               ; ControlMask | ShiftMask
+    cmp ecx, 5
+    jne .hkp_no_paste
+    ; Check if keysym is 'v' or 'V' (0x76 or 0x56)
+    cmp eax, 0x76
+    je .hkp_paste
+    cmp eax, 0x56
+    je .hkp_paste
+.hkp_no_paste:
 
-.hkp_no_shift:
-    ; Apply Ctrl modifier
-    test edx, edx
-    jz .hkp_send_char
-    and al, 0x1F             ; Ctrl mask
-.hkp_send_char:
+    ; Dispatch on keysym ranges
+    ; Special keys (0xFF00-0xFFFF)
+    cmp eax, 0xFF00
+    jge .hkp_special
+
+    ; XK_space (0xFF20 handled below in special, but also 0x0020)
+    cmp eax, 0x20
+    je .hkp_ascii
+
+    ; Printable ASCII range: 0x0020-0x007E
+    cmp eax, 0x0020
+    jb .hkp_done
+    cmp eax, 0x007E
+    ja .hkp_done
+
+.hkp_ascii:
+    ; keysym IS the ASCII value for this range
+    ; Apply Ctrl modifier (bit 2 of state)
+    test ebx, 4              ; ControlMask
+    jz .hkp_send_byte
+    ; Ctrl+letter: keysym & 0x1F
+    and eax, 0x1F
+.hkp_send_byte:
     mov [key_out_buf], al
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
@@ -1700,122 +2311,211 @@ handle_keypress:
     syscall
     jmp .hkp_done
 
-.hkp_escape:
-    mov byte [key_out_buf], 27
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
-    mov rdx, 1
-    syscall
+.hkp_special:
+    ; XK_BackSpace = 0xFF08
+    cmp eax, 0xFF08
+    je .hkp_bs
+    ; XK_Tab = 0xFF09
+    cmp eax, 0xFF09
+    je .hkp_tab
+    ; XK_Return = 0xFF0D
+    cmp eax, 0xFF0D
+    je .hkp_return
+    ; XK_Escape = 0xFF1B
+    cmp eax, 0xFF1B
+    je .hkp_escape
+    ; XK_space = 0xFF20
+    cmp eax, 0xFF20
+    je .hkp_space
+    ; XK_Home = 0xFF50
+    cmp eax, 0xFF50
+    je .hkp_home
+    ; XK_Left = 0xFF51
+    cmp eax, 0xFF51
+    je .hkp_left
+    ; XK_Up = 0xFF52
+    cmp eax, 0xFF52
+    je .hkp_up
+    ; XK_Right = 0xFF53
+    cmp eax, 0xFF53
+    je .hkp_right
+    ; XK_Down = 0xFF54
+    cmp eax, 0xFF54
+    je .hkp_down
+    ; XK_Page_Up = 0xFF55
+    cmp eax, 0xFF55
+    je .hkp_pgup
+    ; XK_Page_Down = 0xFF56
+    cmp eax, 0xFF56
+    je .hkp_pgdn
+    ; XK_End = 0xFF57
+    cmp eax, 0xFF57
+    je .hkp_end
+    ; XK_Insert = 0xFF63 (Shift+Insert = paste)
+    cmp eax, 0xFF63
+    je .hkp_insert
+    ; XK_Delete = 0xFFFF
+    cmp eax, 0xFFFF
+    je .hkp_delete
+    ; Modifier keys (Shift, Ctrl, etc) - ignore
     jmp .hkp_done
 
-.hkp_backspace:
-    mov byte [key_out_buf], 127
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
+.hkp_bs:
+    mov byte [key_out_buf], 0x7F
     mov rdx, 1
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
 
 .hkp_tab:
-    mov byte [key_out_buf], 9
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
+    mov byte [key_out_buf], 0x09
     mov rdx, 1
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
 
 .hkp_return:
-    mov byte [key_out_buf], 13
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
+    mov byte [key_out_buf], 0x0D
     mov rdx, 1
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
+
+.hkp_escape:
+    mov byte [key_out_buf], 0x1B
+    mov rdx, 1
+    jmp .hkp_send_seq
 
 .hkp_space:
-    mov byte [key_out_buf], ' '
-    test edx, edx
-    jz .hkp_send_space
-    mov byte [key_out_buf], 0  ; Ctrl-Space = NUL
-.hkp_send_space:
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
+    test ebx, 4              ; Ctrl?
+    jnz .hkp_ctrl_space
+    mov byte [key_out_buf], 0x20
     mov rdx, 1
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
+.hkp_ctrl_space:
+    mov byte [key_out_buf], 0x00
+    mov rdx, 1
+    jmp .hkp_send_seq
+
+.hkp_home:
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'H'
+    mov rdx, 3
+    jmp .hkp_send_seq
+
+.hkp_end:
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'F'
+    mov rdx, 3
+    jmp .hkp_send_seq
 
 .hkp_up:
-    mov dword [key_out_buf], 0x00415B1B  ; ESC[A
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'A'
     mov rdx, 3
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
 
 .hkp_down:
-    mov dword [key_out_buf], 0x00425B1B  ; ESC[B
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'B'
     mov rdx, 3
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
 
 .hkp_right:
-    mov dword [key_out_buf], 0x00435B1B  ; ESC[C
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'C'
+    mov rdx, 3
+    jmp .hkp_send_seq
+
+.hkp_left:
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'D'
+    mov rdx, 3
+    jmp .hkp_send_seq
+
+.hkp_pgup:
+    ; Shift+PageUp = scroll back
+    test ebx, 1
+    jnz .hkp_scroll_back
+    ; Normal PageUp: send ESC[5~
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], '5'
+    mov byte [key_out_buf+3], '~'
+    mov rdx, 4
+    jmp .hkp_send_seq
+
+.hkp_pgdn:
+    ; Shift+PageDown = scroll forward
+    test ebx, 1
+    jnz .hkp_scroll_fwd
+    ; Normal PageDown: send ESC[6~
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], '6'
+    mov byte [key_out_buf+3], '~'
+    mov rdx, 4
+    jmp .hkp_send_seq
+
+.hkp_insert:
+    ; Shift+Insert = paste
+    test ebx, 1
+    jnz .hkp_paste
+    jmp .hkp_done
+
+.hkp_delete:
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], '3'
+    mov byte [key_out_buf+3], '~'
+    mov rdx, 4
+    jmp .hkp_send_seq
+
+.hkp_send_seq:
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
     lea rsi, [key_out_buf]
-    mov rdx, 3
+    ; rdx already set by caller
     syscall
     jmp .hkp_done
 
-.hkp_left:
-    mov dword [key_out_buf], 0x00445B1B  ; ESC[D
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
-    mov rdx, 3
-    syscall
+.hkp_scroll_back:
+    call scroll_view_up
+    jmp .hkp_done
+
+.hkp_scroll_fwd:
+    call scroll_view_down
+    jmp .hkp_done
+
+.hkp_paste:
+    ; Request CLIPBOARD selection via ConvertSelection
+    ; ConvertSelection: opcode=24, pad, length=6
+    ; requestor, selection, target, property, time
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONVERT_SELECTION
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6              ; length
+    mov eax, [win_id]
+    mov [rdi+4], eax                 ; requestor
+    mov eax, [clipboard_atom]
+    mov [rdi+8], eax                 ; selection = CLIPBOARD
+    mov eax, [utf8_string_atom]
+    mov [rdi+12], eax                ; target = UTF8_STRING
+    mov eax, [glass_sel_atom]
+    mov [rdi+16], eax                ; property = GLASS_SEL
+    mov dword [rdi+20], 0            ; time = CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
     jmp .hkp_done
 
 .hkp_done:
+    pop r13
     pop r12
     pop rbx
     ret
-
-; Keycode to ASCII mapping (simplified US QWERTY)
-; Index = X11 keycode, value = ASCII char (0 = unmapped)
-.hkp_keymap:
-    times 10 db 0             ; 0-9
-    db '1','2','3','4','5','6','7','8','9','0'  ; 10-19
-    db '-','=',0,0            ; 20-23
-    db 'q','w','e','r','t','y','u','i','o','p'  ; 24-33
-    db '[',']',0,0            ; 34-37
-    db 'a','s','d','f','g','h','j','k','l'      ; 38-46
-    db ';',0x27,'`'           ; 47-49 (semicolon, quote, backtick)
-    db 0,'\'                  ; 50-51 (shift, backslash)
-    db 'z','x','c','v','b','n','m'              ; 52-58
-    db ',','.','/'            ; 59-61
-    times 66 db 0             ; 62-127
-
-; Shift symbol mapping (indexed by ASCII code - '!')
-.hkp_shift_table:
-    db '!','@','#',0x24,'%','^','&','*','(',')'   ; !-) (shift 1-0)
-    db 0,0,0,'_','+'          ; shift -,=
-    times 20 db 0
-    db '{','|','}'            ; shift [,\,]
-    times 10 db 0
-    db ':','"','~'            ; shift ;,',`
-    times 10 db 0
-    db '<','>','?'            ; shift ,./
-    times 30 db 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; VT100 escape sequence parser
@@ -2603,10 +3303,70 @@ grid_clear_line:
     pop rbx
     ret
 
-; Scroll grid up by one line
+; Scroll grid up by one line (saves top row to scrollback)
 grid_scroll_up:
     push rbx
     push r12
+    push r13
+
+    ; Save top row to scrollback circular buffer before scrolling
+    mov rax, [scroll_write_pos]
+    imul r13, rax, MAX_COLS * CELL_SIZE  ; byte offset in scroll_buf
+    ; Copy grid row 0 to scroll_buf[write_pos]
+    xor ecx, ecx
+    mov rdx, [grid_cols]
+.gsu_save:
+    cmp rcx, rdx
+    jge .gsu_save_done
+    mov rax, rcx
+    imul rax, CELL_SIZE
+    mov r8d, [grid + rax]            ; read cell (4 bytes)
+    lea rbx, [r13 + rcx * CELL_SIZE]
+    mov [scroll_buf + rbx], r8d      ; write to scroll_buf
+    inc rcx
+    jmp .gsu_save
+.gsu_save_done:
+    ; Fill remaining cols with spaces (if grid_cols < MAX_COLS)
+    mov rdx, [grid_cols]
+.gsu_save_pad:
+    cmp rdx, MAX_COLS
+    jge .gsu_save_advance
+    lea rbx, [r13 + rdx * CELL_SIZE]
+    mov dword [scroll_buf + rbx], 0x00000720  ; space, fg=7, bg=0, attrs=0
+    inc rdx
+    jmp .gsu_save_pad
+.gsu_save_advance:
+    ; Advance write position (circular, wraps at 1000)
+    mov rax, [scroll_write_pos]
+    inc rax
+    cmp rax, 1000
+    jl .gsu_no_wrap
+    xor eax, eax
+.gsu_no_wrap:
+    mov [scroll_write_pos], rax
+    ; Track total lines (cap at 1000)
+    mov rax, [scroll_lines]
+    cmp rax, 1000
+    jge .gsu_lines_ok
+    inc rax
+    mov [scroll_lines], rax
+.gsu_lines_ok:
+    ; If user was scrolled back, adjust offset to keep view stable
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .gsu_do_scroll
+    inc rax
+    ; Cap at scroll_lines
+    mov rcx, [scroll_lines]
+    cmp rax, rcx
+    jle .gsu_offset_ok
+    mov rax, rcx
+.gsu_offset_ok:
+    mov [scroll_offset], rax
+
+.gsu_do_scroll:
+    pop r13
+
     ; Move rows 1..N-1 to 0..N-2
     xor rbx, rbx
     mov r12, [grid_rows]
@@ -2688,6 +3448,157 @@ grid_scroll_down:
     pop rbx
     ret
 
+; Scroll view backward (into scrollback history)
+scroll_view_up:
+    push rbx
+    mov rax, [scroll_offset]
+    mov rbx, [grid_rows]
+    shr rbx, 1                       ; scroll by half a screen
+    cmp rbx, 1
+    jge .svu_ok
+    mov rbx, 1
+.svu_ok:
+    add rax, rbx
+    ; Cap at scroll_lines
+    mov rcx, [scroll_lines]
+    cmp rax, rcx
+    jle .svu_set
+    mov rax, rcx
+.svu_set:
+    mov [scroll_offset], rax
+    call render_screen
+    call x11_flush
+    pop rbx
+    ret
+
+; Scroll view forward (toward live terminal)
+scroll_view_down:
+    push rbx
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .svd_done                     ; already at live view
+    mov rbx, [grid_rows]
+    shr rbx, 1
+    cmp rbx, 1
+    jge .svd_ok
+    mov rbx, 1
+.svd_ok:
+    sub rax, rbx
+    test rax, rax
+    jns .svd_set
+    xor eax, eax
+.svd_set:
+    mov [scroll_offset], rax
+    call render_screen
+    call x11_flush
+.svd_done:
+    pop rbx
+    ret
+
+; Extract selected text from grid into sel_buf
+; Walks from sel_start to sel_end, extracting characters
+selection_extract:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Normalize selection: ensure start <= end
+    mov rax, [sel_start_row]
+    mov rcx, [sel_end_row]
+    cmp rax, rcx
+    jl .se_order_ok
+    jg .se_swap
+    ; Same row: check columns
+    mov rax, [sel_start_col]
+    cmp rax, [sel_end_col]
+    jle .se_order_ok
+.se_swap:
+    ; Swap start and end
+    mov rax, [sel_start_row]
+    mov rcx, [sel_end_row]
+    mov [sel_start_row], rcx
+    mov [sel_end_row], rax
+    mov rax, [sel_start_col]
+    mov rcx, [sel_end_col]
+    mov [sel_start_col], rcx
+    mov [sel_end_col], rax
+.se_order_ok:
+
+    xor r15d, r15d              ; output index in sel_buf
+    mov r12, [sel_start_row]    ; current row
+
+.se_row_loop:
+    cmp r12, [sel_end_row]
+    jg .se_done
+
+    ; Determine col range for this row
+    xor r13d, r13d              ; start col
+    cmp r12, [sel_start_row]
+    jne .se_col_start_ok
+    mov r13, [sel_start_col]
+.se_col_start_ok:
+    mov r14, [grid_cols]        ; end col (exclusive)
+    cmp r12, [sel_end_row]
+    jne .se_col_end_ok
+    mov r14, [sel_end_col]
+    inc r14                     ; inclusive end
+    cmp r14, [grid_cols]
+    jle .se_col_end_ok
+    mov r14, [grid_cols]
+.se_col_end_ok:
+
+    ; Extract characters for this row
+.se_col_loop:
+    cmp r13, r14
+    jge .se_row_end
+    cmp r15, 16380
+    jge .se_done                ; buffer limit
+
+    ; Get cell character from grid
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx eax, byte [grid + rax]
+    mov [sel_buf + r15], al
+    inc r15
+    inc r13
+    jmp .se_col_loop
+
+.se_row_end:
+    ; Add newline at end of each row (except last)
+    cmp r12, [sel_end_row]
+    je .se_row_next
+    ; Trim trailing spaces before adding newline
+.se_trim:
+    test r15d, r15d
+    jz .se_add_nl
+    cmp byte [sel_buf + r15 - 1], ' '
+    jne .se_add_nl
+    dec r15
+    jmp .se_trim
+.se_add_nl:
+    cmp r15, 16380
+    jge .se_done
+    mov byte [sel_buf + r15], 10
+    inc r15
+
+.se_row_next:
+    inc r12
+    jmp .se_row_loop
+
+.se_done:
+    mov [sel_len], r15
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Screen rendering
 ; ══════════════════════════════════════════════════════════════════════
@@ -2717,25 +3628,80 @@ render_screen:
     inc dword [x11_seq]
 
     ; Draw each row with per-color-run rendering
-    xor r12, r12             ; row
+    ; When scroll_offset > 0, top rows come from scrollback buffer
+    xor r12, r12             ; display row
 .rs_row:
     cmp r12, [grid_rows]
     jge .rs_cursor
 
-    ; r12 = row, scan columns for color runs
+    ; Compute row base pointer accounting for scrollback
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .rs_row_live
+
+    ; Scrolled back: which source row?
+    ; scroll_offset = N means show N lines of history above
+    ; display_row < grid_rows is mapped to:
+    ;   if display_row < scroll_offset: read from scrollback
+    ;   else: read from grid row (display_row - scroll_offset)
+    mov rax, [scroll_offset]
+    cmp r12, rax
+    jge .rs_row_grid_shifted
+
+    ; This row comes from scrollback
+    ; scrollback line index = scroll_lines - scroll_offset + display_row
+    ; position in circular buffer = (write_pos - scroll_offset + display_row) mod 1000
+    mov rax, [scroll_write_pos]
+    sub rax, [scroll_offset]
+    add rax, r12
+    ; Make positive (mod 1000)
+    test rax, rax
+    jns .rs_sb_pos
+    add rax, 1000
+.rs_sb_pos:
+    ; rax might still be >= 1000 if write_pos wrapped around
+    cmp rax, 1000
+    jl .rs_sb_ok
+    sub rax, 1000
+.rs_sb_ok:
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rax, [scroll_buf + rax]
+    mov [rs_row_base], rax
+    jmp .rs_row_ready
+
+.rs_row_grid_shifted:
+    ; This row comes from grid, shifted
+    mov rax, r12
+    sub rax, [scroll_offset]
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rax, [grid + rax]
+    mov [rs_row_base], rax
+    jmp .rs_row_ready
+
+.rs_row_live:
+    ; Normal (live view): row directly from grid
+    mov rax, r12
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rax, [grid + rax]
+    mov [rs_row_base], rax
+
+.rs_row_ready:
+    ; r12 = display row, scan columns for color runs
     xor r13, r13             ; col = start of current run
 
 .rs_run_start:
     cmp r13, [grid_cols]
     jge .rs_next_row
 
-    ; Get fg/bg of cell at (row, col)
-    mov rax, r12
-    imul rax, MAX_COLS
-    add rax, r13
-    imul rax, CELL_SIZE
-    movzx r14d, byte [grid + rax + 1]  ; run fg
-    movzx r15d, byte [grid + rax + 2]  ; run bg
+    ; Get fg/bg of cell at col using row base pointer
+    mov rax, [rs_row_base]
+    mov rdx, r13
+    imul rdx, CELL_SIZE
+    add rax, rdx
+    movzx r14d, byte [rax + 1]  ; run fg
+    movzx r15d, byte [rax + 2]  ; run bg
 
     ; Scan ahead for cells with same fg/bg, build text
     lea rdi, [tmp_buf + 20]  ; text buffer
@@ -2746,19 +3712,19 @@ render_screen:
     jge .rs_run_draw
     cmp ecx, 255             ; ImageText8 max
     jge .rs_run_draw
-    mov rax, r12
-    imul rax, MAX_COLS
-    add rax, rbx
-    imul rax, CELL_SIZE
+    mov rax, [rs_row_base]
+    mov rdx, rbx
+    imul rdx, CELL_SIZE
+    add rax, rdx
     ; Check if fg/bg matches current run
-    movzx edx, byte [grid + rax + 1]
+    movzx edx, byte [rax + 1]
     cmp edx, r14d
     jne .rs_run_draw
-    movzx edx, byte [grid + rax + 2]
+    movzx edx, byte [rax + 2]
     cmp edx, r15d
     jne .rs_run_draw
     ; Same color, add to run
-    movzx edx, byte [grid + rax]       ; char
+    movzx edx, byte [rax]           ; char
     mov [rdi + rcx], dl
     inc ecx
     inc rbx
