@@ -96,7 +96,7 @@
 ; Terminal defaults
 %define DEFAULT_COLS    80
 %define DEFAULT_ROWS    24
-%define MAX_COLS        256
+%define MAX_COLS        400
 %define MAX_ROWS        128
 %define CELL_SIZE       8
 
