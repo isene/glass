@@ -173,6 +173,7 @@ pts_prefix:     db "/dev/pts/", 0
 ; Shell to launch
 shell_name:     db "bare", 0
 shell_flag:     db "-l", 0
+term_env:       db "TERM=xterm-256color", 0
 
 ; Error messages
 err_x11:        db "glass: cannot connect to X11", 10
@@ -339,6 +340,7 @@ poll_fds:           resb 16
 
 ; Environment
 envp:               resq 1
+child_envp:         resq 512        ; modified env with TERM set
 display_num:        resq 1
 
 ; 256-color palette
@@ -1807,9 +1809,39 @@ pty_fork:
     mov rdi, [x11_fd]
     syscall
 
+    ; Build child env: copy envp, replace/add TERM=xterm-256color
+    mov rsi, [envp]
+    lea rdi, [child_envp]
+    xor ecx, ecx             ; dest index
+    xor r8d, r8d             ; found TERM flag
+.ptf_env_copy:
+    mov rax, [rsi]
+    test rax, rax
+    jz .ptf_env_add_term
+    ; Check if this is TERM=
+    cmp dword [rax], 'TERM'
+    jne .ptf_env_keep
+    cmp byte [rax+4], '='
+    jne .ptf_env_keep
+    ; Replace TERM with our value
+    lea rax, [term_env]
+    mov r8d, 1
+.ptf_env_keep:
+    mov [rdi + rcx*8], rax
+    inc ecx
+    add rsi, 8
+    jmp .ptf_env_copy
+.ptf_env_add_term:
+    test r8d, r8d
+    jnz .ptf_env_done
+    ; TERM wasn't in env, add it
+    lea rax, [term_env]
+    mov [rdi + rcx*8], rax
+    inc ecx
+.ptf_env_done:
+    mov qword [rdi + rcx*8], 0  ; null terminate
+
     ; Find shell in PATH
-    ; For now, try common locations
-    ; Try /home/geir/bin/bare first, then /usr/local/bin/bare, then /bin/sh
     sub rsp, 32
     lea rax, [.ptf_shell1]
     mov [rsp], rax
@@ -1818,7 +1850,7 @@ pty_fork:
     mov qword [rsp+16], 0
     mov rdi, [rsp]
     mov rsi, rsp
-    mov rdx, [envp]
+    lea rdx, [child_envp]
     mov rax, SYS_EXECVE
     syscall
     ; Try fallback
@@ -1826,7 +1858,7 @@ pty_fork:
     mov [rsp], rax
     mov rdi, [rsp]
     mov rsi, rsp
-    mov rdx, [envp]
+    lea rdx, [child_envp]
     mov rax, SYS_EXECVE
     syscall
     ; Last resort: /bin/sh
@@ -1835,7 +1867,7 @@ pty_fork:
     mov qword [rsp+8], 0
     mov rdi, [rsp]
     mov rsi, rsp
-    mov rdx, [envp]
+    lea rdx, [child_envp]
     mov rax, SYS_EXECVE
     syscall
 
@@ -3486,6 +3518,13 @@ vt_process:
     mov rax, [alt_cursor_col]
     mov [cursor_col], rax
     mov qword [alt_screen_active], 0
+    ; Reset scroll region and modes
+    mov qword [scroll_top], 0
+    mov qword [scroll_bottom], 0
+    mov qword [cursor_visible], 1
+    mov qword [mouse_tracking], 0
+    mov qword [mouse_sgr], 0
+    mov qword [bracketed_paste], 0
     jmp .vtp_loop
 
 .vtp_cursor_show:
@@ -4118,30 +4157,152 @@ vt_process:
     jmp .vtp_sgr_next
 
 .vtp_sgr_fg256:
-    ; Next param should be 5, then color
+    ; Next param: 5 = 256-color, 2 = truecolor
     inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     cmp dword [vt_params + rbx*4], 5
-    jne .vtp_sgr_next
+    je .vtp_sgr_fg256_idx
+    cmp dword [vt_params + rbx*4], 2
+    je .vtp_sgr_fg_true
+    jmp .vtp_sgr_next
+.vtp_sgr_fg256_idx:
     inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov eax, [vt_params + rbx*4]
     mov [cur_fg], al
     jmp .vtp_sgr_next
+.vtp_sgr_fg_true:
+    ; 38;2;R;G;B - find closest palette color
+    ; Skip R, G, B params (consume them so they don't get misinterpreted)
+    inc rbx              ; R
+    cmp rbx, [vt_param_count]
+    jge .vtp_loop
+    mov ecx, [vt_params + rbx*4]   ; R
+    inc rbx              ; G
+    cmp rbx, [vt_param_count]
+    jge .vtp_loop
+    mov edx, [vt_params + rbx*4]   ; G
+    inc rbx              ; B
+    cmp rbx, [vt_param_count]
+    jge .vtp_loop
+    mov esi, [vt_params + rbx*4]   ; B
+    ; Simple mapping: use 256-color cube (16 + 36*r/51 + 6*g/51 + b/51)
+    push rbx
+    mov eax, ecx
+    mov ebx, 51
+    xor edx, edx
+    div ebx              ; r = R/51
+    imul eax, 36
+    mov ecx, eax
+    mov eax, [vt_params + (rbx-1)*4]  ; reload G (edx was clobbered)
+    ; Actually, let's simplify: map to nearest 16 color
+    ; If all components < 64: use 0 (black)
+    ; Use weighted average to pick closest of 16 colors
+    pop rbx
+    push rbx
+    ; Simple approach: map R,G,B to 6x6x6 cube index
+    mov eax, [vt_params + (rbx-2)*4]  ; R
+    mov ecx, 42                        ; 255/6 ≈ 42
+    xor edx, edx
+    div ecx
+    cmp eax, 5
+    jle .vtp_fg_r_ok
+    mov eax, 5
+.vtp_fg_r_ok:
+    imul eax, 36
+    mov ecx, eax                       ; r_idx * 36
+    mov eax, [vt_params + (rbx-1)*4]  ; G
+    push rcx
+    mov ecx, 42
+    xor edx, edx
+    div ecx
+    cmp eax, 5
+    jle .vtp_fg_g_ok
+    mov eax, 5
+.vtp_fg_g_ok:
+    imul eax, 6
+    pop rcx
+    add ecx, eax                       ; + g_idx * 6
+    mov eax, [vt_params + rbx*4]      ; B
+    push rcx
+    mov ecx, 42
+    xor edx, edx
+    div ecx
+    cmp eax, 5
+    jle .vtp_fg_b_ok
+    mov eax, 5
+.vtp_fg_b_ok:
+    pop rcx
+    add ecx, eax                       ; + b_idx
+    add ecx, 16                        ; offset into 256-color palette
+    mov [cur_fg], cl
+    pop rbx
+    jmp .vtp_sgr_next
 
 .vtp_sgr_bg256:
+    ; Next param: 5 = 256-color, 2 = truecolor
     inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     cmp dword [vt_params + rbx*4], 5
-    jne .vtp_sgr_next
+    je .vtp_sgr_bg256_idx
+    cmp dword [vt_params + rbx*4], 2
+    je .vtp_sgr_bg_true
+    jmp .vtp_sgr_next
+.vtp_sgr_bg256_idx:
     inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov eax, [vt_params + rbx*4]
     mov [cur_bg], al
+    jmp .vtp_sgr_next
+.vtp_sgr_bg_true:
+    ; 48;2;R;G;B - consume R,G,B and map to nearest palette
+    inc rbx
+    inc rbx
+    inc rbx
+    cmp rbx, [vt_param_count]
+    jge .vtp_loop
+    ; Map to 256-color cube (same as fg)
+    push rbx
+    mov eax, [vt_params + (rbx-2)*4]  ; R
+    mov ecx, 42
+    xor edx, edx
+    div ecx
+    cmp eax, 5
+    jle .vtp_bg_r_ok
+    mov eax, 5
+.vtp_bg_r_ok:
+    imul eax, 36
+    mov ecx, eax
+    mov eax, [vt_params + (rbx-1)*4]  ; G
+    push rcx
+    mov ecx, 42
+    xor edx, edx
+    div ecx
+    cmp eax, 5
+    jle .vtp_bg_g_ok
+    mov eax, 5
+.vtp_bg_g_ok:
+    imul eax, 6
+    pop rcx
+    add ecx, eax
+    mov eax, [vt_params + rbx*4]      ; B
+    push rcx
+    mov ecx, 42
+    xor edx, edx
+    div ecx
+    cmp eax, 5
+    jle .vtp_bg_b_ok
+    mov eax, 5
+.vtp_bg_b_ok:
+    pop rcx
+    add ecx, eax
+    add ecx, 16
+    mov [cur_bg], cl
+    pop rbx
     jmp .vtp_sgr_next
 
 .vtp_sgr_reset:
