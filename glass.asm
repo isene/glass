@@ -147,6 +147,25 @@ win_title_len   equ 5
 wm_class:       db "glass", 0, "Glass", 0
 wm_class_len    equ 12
 
+; Bracketed paste sequences
+bracket_paste_start: db 27, "[200~"
+bracket_paste_start_len equ 6
+bracket_paste_end:   db 27, "[201~"
+bracket_paste_end_len equ 6
+
+; Font size lookup table: size, dpi_size, width, name string
+; Format: each entry = font name string (null-terminated)
+font_10: db "-misc-fixed-medium-r-normal--10-100-75-75-c-60-iso10646-1", 0
+font_10_len equ $ - font_10 - 1
+font_13: db "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1", 0
+font_13_len equ $ - font_13 - 1
+font_15: db "-misc-fixed-medium-r-normal--15-140-75-75-c-90-iso10646-1", 0
+font_15_len equ $ - font_15 - 1
+font_18: db "-misc-fixed-medium-r-normal--18-120-100-100-c-90-iso10646-1", 0
+font_18_len equ $ - font_18 - 1
+font_20: db "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso10646-1", 0
+font_20_len equ $ - font_20 - 1
+
 ; PTY paths
 ptmx_path:      db "/dev/ptmx", 0
 pts_prefix:     db "/dev/pts/", 0
@@ -325,6 +344,35 @@ display_num:        resq 1
 ; 256-color palette
 palette:            resd 256
 
+; Alt screen buffer
+alt_grid:           resb MAX_COLS * MAX_ROWS * CELL_SIZE
+alt_cursor_row:     resq 1
+alt_cursor_col:     resq 1
+alt_screen_active:  resq 1          ; 0 = main, 1 = alt
+
+; DECSET mode flags
+cursor_visible:     resq 1          ; 1 = visible (default)
+autowrap:           resq 1          ; 1 = autowrap on (default)
+mouse_tracking:     resq 1          ; 0=off, 1=normal, 2=button, 3=any
+mouse_sgr:          resq 1          ; 1 = SGR mouse encoding
+bracketed_paste:    resq 1          ; 1 = bracketed paste mode
+cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
+
+; OSC title
+osc_buf:            resb 256
+osc_pos:            resq 1
+osc_num:            resq 1          ; OSC number (0, 2, etc.)
+osc_collecting:     resq 1          ; 1 = collecting title text
+osc_in_num:         resq 1          ; 1 = still parsing OSC number
+
+; Font configuration
+cfg_font_size:      resq 1          ; 0 = default, else pixel size
+dyn_font_name:      resb 128
+dyn_font_name_len:  resq 1
+
+; Mouse escape sequence buffer
+mouse_seq_buf:      resb 32
+
 ; Misc
 tmp_buf:            resb 4096
 num_buf:            resb 32
@@ -355,6 +403,14 @@ _start:
     mov byte [cur_bg], 0
     mov qword [grid_cols], DEFAULT_COLS
     mov qword [grid_rows], DEFAULT_ROWS
+    mov qword [cursor_visible], 1
+    mov qword [autowrap], 1
+    mov qword [alt_screen_active], 0
+    mov qword [mouse_tracking], 0
+    mov qword [mouse_sgr], 0
+    mov qword [bracketed_paste], 0
+    mov qword [cursor_style], 0
+    mov qword [cfg_font_size], 0
 
     ; Initialize grid with spaces
     call grid_clear
@@ -378,6 +434,9 @@ _start:
 
     ; Get keyboard mapping from server
     call x11_get_keymap
+
+    ; Build dynamic font name if font_size configured
+    call setup_font_name
 
     ; Open font
     call x11_open_font
@@ -1050,16 +1109,30 @@ x11_send_recv:
 ; Open font
 x11_open_font:
     push rbx
+    push r12
+    push r13
     call alloc_xid
     mov [font_id], eax
 
+    ; Determine which font name and length to use
+    mov rax, [dyn_font_name_len]
+    test rax, rax
+    jz .xof_use_default
+    ; Use dynamic font name
+    lea r12, [dyn_font_name]
+    mov r13, rax
+    jmp .xof_build
+.xof_use_default:
+    lea r12, [font_name]
+    mov r13, font_name_len
+.xof_build:
     ; Build OpenFont request
     ; opcode=45, pad, length, fid, name_len, pad, name...
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_OPEN_FONT
     mov byte [rdi+1], 0
     ; length = (3 + pad4(name_len)/4) words
-    mov ecx, font_name_len
+    mov ecx, r13d
     add ecx, 3
     and ecx, ~3
     shr ecx, 2
@@ -1067,22 +1140,21 @@ x11_open_font:
     mov word [rdi+2], cx
     mov eax, [font_id]
     mov [rdi+4], eax
-    mov word [rdi+8], font_name_len
+    mov word [rdi+8], r13w
     mov word [rdi+10], 0
     ; Copy font name
-    lea rsi, [font_name]
     lea rbx, [rdi + 12]
     xor ecx, ecx
 .xof_cp:
-    cmp ecx, font_name_len
+    cmp ecx, r13d
     jge .xof_pad
-    movzx eax, byte [rsi + rcx]
+    movzx eax, byte [r12 + rcx]
     mov [rbx + rcx], al
     inc ecx
     jmp .xof_cp
 .xof_pad:
     ; Pad to 4
-    mov eax, font_name_len
+    mov eax, r13d
     add eax, 3
     and eax, ~3
     add eax, 12
@@ -1092,6 +1164,8 @@ x11_open_font:
     call x11_buffer
     inc dword [x11_seq]
 
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -1988,57 +2062,219 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_button_press:
-    ; ButtonPress event: start selection or Ctrl+click URL
-    ; event detail (button number) at offset 1; only handle button 1
+    ; ButtonPress event: mouse reporting, selection, scroll, or Ctrl+click URL
+    ; event detail (button number) at offset 1
     movzx eax, byte [x11_buf + rbx + 1]
-    cmp al, 1
-    jne .hxe_skip
     push rbx
     push r12
+    push r13
+    mov r13d, eax            ; button number
+
+    ; Handle scroll wheel (buttons 4/5) first
+    cmp r13d, 4
+    je .hxe_bp_scroll_up
+    cmp r13d, 5
+    je .hxe_bp_scroll_down
+
+    ; Only handle buttons 1-3 for click/selection
+    cmp r13d, 1
+    jb .hxe_bp_done2
+    cmp r13d, 3
+    ja .hxe_bp_done2
+
     ; Calculate row/col from pixel coordinates
     movzx eax, word [x11_buf + rbx + 24]
     movzx ecx, word [char_width]
     test ecx, ecx
-    jz .hxe_bp_done
+    jz .hxe_bp_done2
     xor edx, edx
     div ecx
     mov r12, rax             ; col
     movzx eax, word [x11_buf + rbx + 26]
     movzx ecx, word [char_height]
     test ecx, ecx
-    jz .hxe_bp_done
+    jz .hxe_bp_done2
     xor edx, edx
     div ecx
     ; rax = row, r12 = col
-    ; Check for Ctrl+click (state bit 2)
+
+    ; Check for Ctrl held (state bit 2) - Ctrl always overrides mouse reporting
     movzx ecx, word [x11_buf + rbx + 28]
     test ecx, 4
-    jz .hxe_bp_selection
-    ; Ctrl+click: try to open URL
-    mov rdi, rax             ; row
-    mov rsi, r12             ; col
-    call url_open_at
-    jmp .hxe_bp_done
+    jnz .hxe_bp_ctrl
+
+    ; Check if mouse tracking is active
+    cmp qword [mouse_tracking], 0
+    jne .hxe_bp_mouse_report
+
+    ; Normal click: start selection (button 1 only)
+    cmp r13d, 1
+    jne .hxe_bp_done2
 .hxe_bp_selection:
-    ; Normal click: start selection
     mov [sel_start_col], r12
     mov [sel_end_col], r12
     mov [sel_start_row], rax
     mov [sel_end_row], rax
     mov qword [sel_active], 1
     mov qword [sel_button_held], 1
-.hxe_bp_done:
+    jmp .hxe_bp_done2
+
+.hxe_bp_ctrl:
+    ; Ctrl+click: try to open URL (button 1 only)
+    cmp r13d, 1
+    jne .hxe_bp_done2
+    mov rdi, rax             ; row
+    mov rsi, r12             ; col
+    call url_open_at
+    jmp .hxe_bp_done2
+
+.hxe_bp_mouse_report:
+    ; Send mouse press event to PTY
+    ; SGR format: ESC[<button;col;row M
+    ; button: 0=left, 1=middle, 2=right
+    mov edi, r13d
+    dec edi                  ; X11 button 1-3 to 0-2
+    ; col and row are 1-based
+    mov esi, r12d
+    inc esi                  ; 1-based col
+    mov edx, eax
+    inc edx                  ; 1-based row
+    mov ecx, 'M'             ; press
+    call send_mouse_sgr
+    jmp .hxe_bp_done2
+
+.hxe_bp_scroll_up:
+    ; Button 4 = scroll up
+    ; Check mouse tracking for scroll report
+    cmp qword [mouse_tracking], 0
+    je .hxe_bp_scroll_up_view
+    ; Report scroll as button 64 in SGR
+    ; Calculate row/col
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_bp_done2
+    xor edx, edx
+    div ecx
+    mov r12, rax             ; col
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_bp_done2
+    xor edx, edx
+    div ecx
+    mov edi, 64              ; scroll up button
+    mov esi, r12d
+    inc esi
+    mov edx, eax
+    inc edx
+    mov ecx, 'M'
+    call send_mouse_sgr
+    jmp .hxe_bp_done2
+.hxe_bp_scroll_up_view:
+    call scroll_view_up
+    jmp .hxe_bp_done2
+
+.hxe_bp_scroll_down:
+    ; Button 5 = scroll down
+    cmp qword [mouse_tracking], 0
+    je .hxe_bp_scroll_down_view
+    ; Report scroll as button 65 in SGR
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_bp_done2
+    xor edx, edx
+    div ecx
+    mov r12, rax
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_bp_done2
+    xor edx, edx
+    div ecx
+    mov edi, 65              ; scroll down button
+    mov esi, r12d
+    inc esi
+    mov edx, eax
+    inc edx
+    mov ecx, 'M'
+    call send_mouse_sgr
+    jmp .hxe_bp_done2
+.hxe_bp_scroll_down_view:
+    call scroll_view_down
+
+.hxe_bp_done2:
+    pop r13
     pop r12
     pop rbx
     add rbx, 32
     jmp .hxe_loop
 
 .hxe_motion:
-    ; MotionNotify: update selection end if button held
-    cmp qword [sel_button_held], 1
-    jne .hxe_skip
+    ; MotionNotify: mouse motion reporting or update selection
     push rbx
     push r12
+
+    ; Check if mouse tracking wants motion events
+    ; mode 2 (button) reports motion only while button held
+    ; mode 3 (any) reports all motion
+    cmp qword [mouse_tracking], 3
+    je .hxe_mn_mouse_report
+    cmp qword [mouse_tracking], 2
+    jne .hxe_mn_selection
+
+    ; Mode 2: only report motion if button is held (state has button mask)
+    movzx eax, word [x11_buf + rbx + 28]
+    test eax, 0x700          ; Button1-3 mask (bits 8-10)
+    jz .hxe_mn_selection
+
+.hxe_mn_mouse_report:
+    ; Check Ctrl override
+    movzx eax, word [x11_buf + rbx + 28]
+    test eax, 4
+    jnz .hxe_mn_selection    ; Ctrl held, do selection instead
+
+    ; Calculate col/row
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_mn_done
+    xor edx, edx
+    div ecx
+    mov r12, rax             ; col
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_mn_done
+    xor edx, edx
+    div ecx
+    ; Determine which button is held for motion encoding
+    ; button 32 + 0/1/2 for motion with button 1/2/3
+    movzx ecx, word [x11_buf + rbx + 28]
+    mov edi, 32              ; motion flag
+    test ecx, 0x100          ; Button1Mask
+    jnz .hxe_mn_send
+    inc edi                   ; 33 = motion + middle
+    test ecx, 0x200          ; Button2Mask
+    jnz .hxe_mn_send
+    inc edi                   ; 34 = motion + right
+    test ecx, 0x400          ; Button3Mask
+    jnz .hxe_mn_send
+    mov edi, 35              ; motion with no button (mode 3)
+.hxe_mn_send:
+    mov esi, r12d
+    inc esi                  ; 1-based col
+    mov edx, eax
+    inc edx                  ; 1-based row
+    mov ecx, 'M'             ; motion
+    call send_mouse_sgr
+    jmp .hxe_mn_done
+
+.hxe_mn_selection:
+    ; Update selection end if button held
+    cmp qword [sel_button_held], 1
+    jne .hxe_mn_done
     movzx eax, word [x11_buf + rbx + 24]
     movzx ecx, word [char_width]
     test ecx, ecx
@@ -2060,15 +2296,59 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_button_release:
-    ; ButtonRelease: end selection, copy text, claim PRIMARY
+    ; ButtonRelease: mouse release reporting, or end selection
     movzx eax, byte [x11_buf + rbx + 1]
-    cmp al, 1
-    jne .hxe_skip
-    mov qword [sel_button_held], 0
-    cmp qword [sel_active], 1
-    jne .hxe_skip
     push rbx
     push r12
+    push r13
+    mov r13d, eax            ; button number
+
+    ; Only handle buttons 1-3
+    cmp r13d, 1
+    jb .hxe_br_done2
+    cmp r13d, 3
+    ja .hxe_br_done2
+
+    ; Check mouse tracking for release reporting
+    cmp qword [mouse_tracking], 0
+    je .hxe_br_selection
+
+    ; Check Ctrl override
+    movzx ecx, word [x11_buf + rbx + 28]
+    test ecx, 4
+    jnz .hxe_br_selection    ; Ctrl held, do selection
+
+    ; Send mouse release to PTY
+    movzx eax, word [x11_buf + rbx + 24]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .hxe_br_done2
+    xor edx, edx
+    div ecx
+    mov r12, rax             ; col
+    movzx eax, word [x11_buf + rbx + 26]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .hxe_br_done2
+    xor edx, edx
+    div ecx
+    ; SGR release: ESC[<button;col;row m (lowercase m for release)
+    mov edi, r13d
+    dec edi                  ; button 0-2
+    mov esi, r12d
+    inc esi                  ; 1-based col
+    mov edx, eax
+    inc edx                  ; 1-based row
+    mov ecx, 'm'             ; release
+    call send_mouse_sgr
+    jmp .hxe_br_done2
+
+.hxe_br_selection:
+    cmp r13d, 1
+    jne .hxe_br_done2
+    mov qword [sel_button_held], 0
+    cmp qword [sel_active], 1
+    jne .hxe_br_done2
     ; Update final position
     movzx eax, word [x11_buf + rbx + 24]
     movzx ecx, word [char_width]
@@ -2102,6 +2382,8 @@ handle_x11_events:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
+.hxe_br_done2:
+    pop r13
     pop r12
     pop rbx
     add rbx, 32
@@ -2283,11 +2565,29 @@ handle_x11_events:
     ; r12d = number of bytes of paste data
     test r12d, r12d
     jz .hxe_sn_done
-    ; Write paste data to PTY
+    ; Write paste data to PTY (with optional bracketed paste)
+    ; Send bracket start if bracketed paste mode is on
+    cmp qword [bracketed_paste], 1
+    jne .hxe_sn_no_bracket_start
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [bracket_paste_start]
+    mov rdx, bracket_paste_start_len
+    syscall
+.hxe_sn_no_bracket_start:
+    ; Write the actual paste data
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
     lea rsi, [x11_buf + 32]
     mov edx, r12d
+    syscall
+    ; Send bracket end if bracketed paste mode is on
+    cmp qword [bracketed_paste], 1
+    jne .hxe_sn_done
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [bracket_paste_end]
+    mov rdx, bracket_paste_end_len
     syscall
 .hxe_sn_done:
     pop r12
@@ -2787,22 +3087,123 @@ vt_process:
 
 .vtp_start_osc:
     mov qword [vt_state], VT_OSC
+    mov qword [osc_pos], 0
+    mov qword [osc_num], 0
+    mov qword [osc_collecting], 0
+    mov qword [osc_in_num], 1    ; start by parsing the number
     jmp .vtp_loop
 
 .vtp_osc:
-    ; Consume until BEL (7) or ST (ESC \)
+    ; Parse OSC: number ; text BEL/ST
     cmp al, 7
     je .vtp_osc_end
     cmp al, 27               ; might be ESC \ (ST)
-    jne .vtp_loop
+    jne .vtp_osc_collect
     ; Check next byte for backslash
     cmp r14, r13
     jge .vtp_loop
     cmp byte [r12 + r14], '\'
     jne .vtp_loop
     inc r14
+    jmp .vtp_osc_end
+
+.vtp_osc_collect:
+    ; Still parsing OSC number?
+    cmp qword [osc_in_num], 1
+    jne .vtp_osc_text
+    ; Semicolon ends the number, starts text
+    cmp al, ';'
+    je .vtp_osc_start_text
+    ; Digit: build number
+    cmp al, '0'
+    jb .vtp_loop
+    cmp al, '9'
+    ja .vtp_loop
+    mov rcx, [osc_num]
+    imul ecx, 10
+    movzx edx, al
+    sub edx, '0'
+    add ecx, edx
+    mov [osc_num], rcx
+    jmp .vtp_loop
+
+.vtp_osc_start_text:
+    mov qword [osc_in_num], 0
+    mov qword [osc_collecting], 1
+    jmp .vtp_loop
+
+.vtp_osc_text:
+    ; Collecting title text
+    cmp qword [osc_collecting], 1
+    jne .vtp_loop
+    mov rcx, [osc_pos]
+    cmp rcx, 254
+    jge .vtp_loop            ; buffer full
+    mov [osc_buf + rcx], al
+    inc rcx
+    mov [osc_pos], rcx
+    jmp .vtp_loop
+
 .vtp_osc_end:
     mov qword [vt_state], VT_NORMAL
+    ; Null-terminate the captured text
+    mov rcx, [osc_pos]
+    mov byte [osc_buf + rcx], 0
+    ; Check if this is OSC 0 or 2 (set window title)
+    mov rax, [osc_num]
+    cmp rax, 0
+    je .vtp_osc_set_title
+    cmp rax, 2
+    je .vtp_osc_set_title
+    jmp .vtp_loop
+
+.vtp_osc_set_title:
+    ; Set X11 window title via ChangeProperty WM_NAME
+    mov rcx, [osc_pos]
+    test rcx, rcx
+    jz .vtp_loop             ; empty title, skip
+    push r14
+    push r13
+    push r12
+    mov r13, rcx             ; title length
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0      ; mode = Replace
+    ; length = (6 + (title_len + 3) / 4) words
+    mov eax, r13d
+    add eax, 3
+    shr eax, 2
+    add eax, 6
+    mov word [rdi+2], ax
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 39    ; WM_NAME atom
+    mov dword [rdi+12], 31   ; STRING type
+    mov byte [rdi+16], 8     ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov [rdi+20], r13d       ; data length
+    ; Copy title text
+    xor ecx, ecx
+.vtp_osc_cp_title:
+    cmp ecx, r13d
+    jge .vtp_osc_send_title
+    movzx eax, byte [osc_buf + rcx]
+    mov [tmp_buf + 24 + rcx], al
+    inc ecx
+    jmp .vtp_osc_cp_title
+.vtp_osc_send_title:
+    mov eax, r13d
+    add eax, 3
+    and eax, ~3
+    add eax, 24
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r12
+    pop r13
+    pop r14
     jmp .vtp_loop
 
 .vtp_full_reset:
@@ -2812,6 +3213,37 @@ vt_process:
     mov byte [cur_fg], 7
     mov byte [cur_bg], 0
     mov byte [cur_attrs], 0
+    ; Reset DECSET modes
+    mov qword [cursor_visible], 1
+    mov qword [autowrap], 1
+    mov qword [cursor_style], 0
+    mov qword [mouse_tracking], 0
+    mov qword [mouse_sgr], 0
+    mov qword [bracketed_paste], 0
+    ; If on alt screen, switch back to main
+    cmp qword [alt_screen_active], 0
+    je .vtp_full_reset_done
+    ; Restore main screen from alt_grid
+    push r12
+    push r13
+    xor r12, r12
+    mov r13, MAX_COLS * MAX_ROWS * CELL_SIZE
+.vtp_fr_restore:
+    cmp r12, r13
+    jge .vtp_fr_restore_done
+    movzx eax, byte [alt_grid + r12]
+    mov [grid + r12], al
+    inc r12
+    jmp .vtp_fr_restore
+.vtp_fr_restore_done:
+    pop r13
+    pop r12
+    mov rax, [alt_cursor_row]
+    mov [cursor_row], rax
+    mov rax, [alt_cursor_col]
+    mov [cursor_col], rax
+    mov qword [alt_screen_active], 0
+.vtp_full_reset_done:
     jmp .vtp_loop
 
 .vtp_csi:
@@ -2892,9 +3324,195 @@ vt_process:
     cmp al, 'r'
     je .vtp_loop            ; ignore DECSTBM for now
     cmp al, 'h'
-    je .vtp_loop            ; ignore set mode for now
+    je .vtp_csi_set_mode
     cmp al, 'l'
-    je .vtp_loop            ; ignore reset mode for now
+    je .vtp_csi_reset_mode
+    cmp al, ' '
+    je .vtp_csi_space       ; intermediate byte for CSI Ps SP q
+    ; Check for 'q' with space intermediate (cursor style)
+    cmp al, 'q'
+    je .vtp_csi_check_q
+    jmp .vtp_loop
+
+; CSI SP: intermediate byte; stay in CSI state for next char
+.vtp_csi_space:
+    mov byte [vt_private], ' '
+    mov qword [vt_state], VT_CSI_PARAM
+    jmp .vtp_loop
+
+; CSI q: check if preceded by space (cursor style)
+.vtp_csi_check_q:
+    cmp byte [vt_private], ' '
+    jne .vtp_loop           ; not SP q, ignore
+    ; CSI Ps SP q - Set cursor style
+    mov eax, [vt_params]
+    cmp eax, 2
+    jle .vtp_cs_block
+    cmp eax, 4
+    jle .vtp_cs_underline
+    cmp eax, 6
+    jle .vtp_cs_bar
+    jmp .vtp_loop
+.vtp_cs_block:
+    mov qword [cursor_style], 0
+    jmp .vtp_loop
+.vtp_cs_underline:
+    mov qword [cursor_style], 1
+    jmp .vtp_loop
+.vtp_cs_bar:
+    mov qword [cursor_style], 2
+    jmp .vtp_loop
+
+; CSI ? N h - DECSET (set mode)
+.vtp_csi_set_mode:
+    cmp byte [vt_private], '?'
+    jne .vtp_loop               ; non-DEC modes: ignore
+    mov eax, [vt_params]
+    cmp eax, 1049
+    je .vtp_alt_screen_on
+    cmp eax, 25
+    je .vtp_cursor_show
+    cmp eax, 7
+    je .vtp_autowrap_on
+    cmp eax, 1000
+    je .vtp_mouse_normal_on
+    cmp eax, 1002
+    je .vtp_mouse_button_on
+    cmp eax, 1003
+    je .vtp_mouse_any_on
+    cmp eax, 1006
+    je .vtp_mouse_sgr_on
+    cmp eax, 2004
+    je .vtp_bracketed_paste_on
+    jmp .vtp_loop
+
+; CSI ? N l - DECRST (reset mode)
+.vtp_csi_reset_mode:
+    cmp byte [vt_private], '?'
+    jne .vtp_loop
+    mov eax, [vt_params]
+    cmp eax, 1049
+    je .vtp_alt_screen_off
+    cmp eax, 25
+    je .vtp_cursor_hide
+    cmp eax, 7
+    je .vtp_autowrap_off
+    cmp eax, 1000
+    je .vtp_mouse_off
+    cmp eax, 1002
+    je .vtp_mouse_off
+    cmp eax, 1003
+    je .vtp_mouse_off
+    cmp eax, 1006
+    je .vtp_mouse_sgr_off
+    cmp eax, 2004
+    je .vtp_bracketed_paste_off
+    jmp .vtp_loop
+
+; DECSET/DECRST handlers
+.vtp_alt_screen_on:
+    cmp qword [alt_screen_active], 1
+    je .vtp_loop                ; already on alt screen
+    ; Save cursor position
+    mov rax, [cursor_row]
+    mov [alt_cursor_row], rax
+    mov rax, [cursor_col]
+    mov [alt_cursor_col], rax
+    ; Copy main grid to alt_grid (save it)
+    push r12
+    push r13
+    xor r12, r12
+    mov r13, MAX_COLS * MAX_ROWS * CELL_SIZE
+.vtp_alt_save:
+    cmp r12, r13
+    jge .vtp_alt_save_done
+    movzx eax, byte [grid + r12]
+    mov [alt_grid + r12], al
+    inc r12
+    jmp .vtp_alt_save
+.vtp_alt_save_done:
+    pop r13
+    pop r12
+    ; Clear the grid for alt screen use
+    call grid_clear
+    mov qword [cursor_row], 0
+    mov qword [cursor_col], 0
+    mov qword [alt_screen_active], 1
+    jmp .vtp_loop
+
+.vtp_alt_screen_off:
+    cmp qword [alt_screen_active], 0
+    je .vtp_loop                ; already on main screen
+    ; Copy alt_grid back to grid (restore main)
+    push r12
+    push r13
+    xor r12, r12
+    mov r13, MAX_COLS * MAX_ROWS * CELL_SIZE
+.vtp_alt_restore:
+    cmp r12, r13
+    jge .vtp_alt_restore_done
+    movzx eax, byte [alt_grid + r12]
+    mov [grid + r12], al
+    inc r12
+    jmp .vtp_alt_restore
+.vtp_alt_restore_done:
+    pop r13
+    pop r12
+    ; Restore cursor position
+    mov rax, [alt_cursor_row]
+    mov [cursor_row], rax
+    mov rax, [alt_cursor_col]
+    mov [cursor_col], rax
+    mov qword [alt_screen_active], 0
+    jmp .vtp_loop
+
+.vtp_cursor_show:
+    mov qword [cursor_visible], 1
+    jmp .vtp_loop
+
+.vtp_cursor_hide:
+    mov qword [cursor_visible], 0
+    jmp .vtp_loop
+
+.vtp_autowrap_on:
+    mov qword [autowrap], 1
+    jmp .vtp_loop
+
+.vtp_autowrap_off:
+    mov qword [autowrap], 0
+    jmp .vtp_loop
+
+.vtp_mouse_normal_on:
+    mov qword [mouse_tracking], 1
+    jmp .vtp_loop
+
+.vtp_mouse_button_on:
+    mov qword [mouse_tracking], 2
+    jmp .vtp_loop
+
+.vtp_mouse_any_on:
+    mov qword [mouse_tracking], 3
+    jmp .vtp_loop
+
+.vtp_mouse_off:
+    mov qword [mouse_tracking], 0
+    mov qword [mouse_sgr], 0
+    jmp .vtp_loop
+
+.vtp_mouse_sgr_on:
+    mov qword [mouse_sgr], 1
+    jmp .vtp_loop
+
+.vtp_mouse_sgr_off:
+    mov qword [mouse_sgr], 0
+    jmp .vtp_loop
+
+.vtp_bracketed_paste_on:
+    mov qword [bracketed_paste], 1
+    jmp .vtp_loop
+
+.vtp_bracketed_paste_off:
+    mov qword [bracketed_paste], 0
     jmp .vtp_loop
 
 ; CSI A - Cursor Up
@@ -3307,6 +3925,9 @@ grid_put_char:
     inc rax
     cmp rax, [grid_cols]
     jl .gpc_ok
+    ; Check autowrap
+    cmp qword [autowrap], 0
+    je .gpc_clamp             ; no wrap: stay at last column
     ; Wrap to next line
     xor eax, eax
     mov [cursor_col], rax
@@ -3321,6 +3942,13 @@ grid_put_char:
     dec rax
 .gpc_row_ok:
     mov [cursor_row], rax
+    pop rbx
+    ret
+.gpc_clamp:
+    ; Stay at last column
+    mov rax, [grid_cols]
+    dec rax
+    mov [cursor_col], rax
     pop rbx
     ret
 .gpc_ok:
@@ -3797,15 +4425,19 @@ render_screen:
     cmp r13, [grid_cols]
     jge .rs_next_row
 
-    ; Get fg/bg of cell at col using row base pointer (offsets +2, +3 for 8-byte cells)
+    ; Get effective fg/bg of cell (apply inverse attr)
     mov rax, [rs_row_base]
     mov rdx, r13
     imul rdx, CELL_SIZE
     add rax, rdx
-    movzx r14d, byte [rax + 2]  ; run fg (offset +2)
-    movzx r15d, byte [rax + 3]  ; run bg (offset +3)
+    movzx r14d, byte [rax + 2]  ; fg (offset +2)
+    movzx r15d, byte [rax + 3]  ; bg (offset +3)
+    test byte [rax + 4], 4      ; inverse bit in attrs?
+    jz .rs_no_inv_start
+    xchg r14d, r15d             ; swap fg/bg for inverse
+.rs_no_inv_start:
 
-    ; Scan ahead for cells with same fg/bg, build CHAR2B text
+    ; Scan ahead for cells with same effective fg/bg, build CHAR2B text
     lea rdi, [tmp_buf + 20]  ; text buffer (2 bytes per char)
     mov rbx, r13             ; current col
     xor ecx, ecx             ; character count
@@ -3818,12 +4450,17 @@ render_screen:
     mov rdx, rbx
     imul rdx, CELL_SIZE
     add rax, rdx
-    ; Check if fg/bg matches current run
-    movzx edx, byte [rax + 2]
+    ; Compute effective fg/bg for this cell
+    movzx edx, byte [rax + 2]  ; cell fg
+    movzx esi, byte [rax + 3]  ; cell bg
+    test byte [rax + 4], 4     ; inverse?
+    jz .rs_no_inv_scan
+    xchg edx, esi
+.rs_no_inv_scan:
+    ; Check if effective fg/bg matches current run
     cmp edx, r14d
     jne .rs_run_draw
-    movzx edx, byte [rax + 3]
-    cmp edx, r15d
+    cmp esi, r15d
     jne .rs_run_draw
     ; Same color, add to run as CHAR2B (big-endian: byte1=high, byte2=low)
     movzx edx, word [rax]           ; UCS-2 char (little-endian)
@@ -3920,7 +4557,11 @@ render_screen:
     jmp .rs_row
 
 .rs_cursor:
-    ; Draw cursor as inverse block at cursor position
+    ; Skip cursor drawing if cursor_visible == 0
+    cmp qword [cursor_visible], 0
+    je .rs_cursor_done
+
+    ; Draw cursor at cursor position
     lea rdi, [tmp_buf]
     ; Set GC foreground for cursor (config or white)
     mov byte [rdi], X11_CHANGE_GC
@@ -3932,17 +4573,17 @@ render_screen:
     cmp byte [cfg_cursor_set], 1
     jne .rs_cursor_default
     mov eax, [cfg_cursor_pixel]
-    jmp .rs_cursor_set
+    jmp .rs_cursor_color_set
 .rs_cursor_default:
     mov eax, [x11_white_pixel]
-.rs_cursor_set:
+.rs_cursor_color_set:
     mov [rdi+12], eax
     lea rsi, [tmp_buf]
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
 
-    ; PolyFillRectangle
+    ; PolyFillRectangle with shape based on cursor_style
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
@@ -3951,12 +4592,35 @@ render_screen:
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
-    ; x = cursor_col * char_width
+
+    ; Dispatch on cursor_style: 0=block, 1=underline, 2=bar
+    mov rax, [cursor_style]
+    cmp rax, 2
+    je .rs_cursor_bar
+    cmp rax, 1
+    je .rs_cursor_underline
+
+    ; Block cursor (0): full cell
     mov rax, [cursor_col]
     movzx ecx, word [char_width]
     imul eax, ecx
     mov word [rdi+12], ax
-    ; y = cursor_row * char_height + char_height - 2 (underline)
+    mov rax, [cursor_row]
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+14], ax
+    movzx eax, word [char_width]
+    mov word [rdi+16], ax
+    movzx eax, word [char_height]
+    mov word [rdi+18], ax
+    jmp .rs_cursor_draw
+
+.rs_cursor_underline:
+    ; Underline cursor (1): bottom 2px
+    mov rax, [cursor_col]
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+12], ax
     mov rax, [cursor_row]
     movzx ecx, word [char_height]
     imul eax, ecx
@@ -3964,17 +4628,32 @@ render_screen:
     add eax, ecx
     sub eax, 2
     mov word [rdi+14], ax
-    ; width = char_width
     movzx eax, word [char_width]
     mov word [rdi+16], ax
-    ; height = 2 (thin underline)
     mov word [rdi+18], 2
+    jmp .rs_cursor_draw
 
+.rs_cursor_bar:
+    ; Bar cursor (2): left 2px
+    mov rax, [cursor_col]
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+12], ax
+    mov rax, [cursor_row]
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+14], ax
+    mov word [rdi+16], 2
+    movzx eax, word [char_height]
+    mov word [rdi+18], ax
+
+.rs_cursor_draw:
     lea rsi, [tmp_buf]
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
 
+.rs_cursor_done:
     pop r15
     pop r14
     pop r13
@@ -4219,9 +4898,9 @@ load_config:
 .lc_try_cursor:
     ; Match "cursor"
     cmp dword [rsi], 'curs'
-    jne .lc_skip_line
+    jne .lc_try_font_size
     cmp word [rsi+4], 'or'
-    jne .lc_skip_line
+    jne .lc_try_font_size
     add rsi, 6
     call lc_skip_to_value
     cmp byte [rsi], '#'
@@ -4230,6 +4909,33 @@ load_config:
     call hex_to_pixel
     mov [cfg_cursor_pixel], eax
     mov byte [cfg_cursor_set], 1
+    jmp .lc_skip_line
+
+.lc_try_font_size:
+    ; Match "font_size"
+    cmp dword [rsi], 'font'
+    jne .lc_skip_line
+    cmp dword [rsi+4], '_siz'
+    jne .lc_skip_line
+    cmp byte [rsi+8], 'e'
+    jne .lc_skip_line
+    add rsi, 9
+    call lc_skip_to_value
+    ; Parse decimal number
+    xor eax, eax
+.lc_fs_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_fs_done
+    cmp cl, '9'
+    ja .lc_fs_done
+    imul eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .lc_fs_digit
+.lc_fs_done:
+    mov [cfg_font_size], rax
     jmp .lc_skip_line
 
 .lc_skip_line:
@@ -4641,5 +5347,175 @@ itoa:
     jnz .itoa_pop
     mov byte [rbx + rax], 0
     pop rcx
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Mouse SGR reporting
+; ══════════════════════════════════════════════════════════════════════
+
+; Send mouse event in SGR format: ESC[<button;col;row(M|m)
+; edi = button (0-2 for click, 32+ for motion, 64+ for scroll)
+; esi = col (1-based)
+; edx = row (1-based)
+; ecx = final char ('M' for press/motion, 'm' for release)
+send_mouse_sgr:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi            ; button
+    mov r13d, esi            ; col
+    mov r14d, edx            ; row
+    mov ebx, ecx             ; final char
+
+    ; Build ESC[< prefix
+    lea rdi, [mouse_seq_buf]
+    mov byte [rdi], 27       ; ESC
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '<'
+    add rdi, 3
+
+    ; Append button number
+    mov eax, r12d
+    call write_decimal
+
+    ; Semicolon
+    mov byte [rdi], ';'
+    inc rdi
+
+    ; Append col
+    mov eax, r13d
+    call write_decimal
+
+    ; Semicolon
+    mov byte [rdi], ';'
+    inc rdi
+
+    ; Append row
+    mov eax, r14d
+    call write_decimal
+
+    ; Final char (M or m)
+    mov [rdi], bl
+    inc rdi
+
+    ; Calculate length
+    lea rax, [mouse_seq_buf]
+    sub rdi, rax
+    mov rdx, rdi             ; length
+
+    ; Write to PTY
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [mouse_seq_buf]
+    syscall
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Write decimal number to [rdi], advance rdi
+; eax = number to write
+write_decimal:
+    push rbx
+    push rcx
+    ; Handle 0 specially
+    test eax, eax
+    jnz .wd_nonzero
+    mov byte [rdi], '0'
+    inc rdi
+    pop rcx
+    pop rbx
+    ret
+.wd_nonzero:
+    ; Push digits in reverse
+    xor ecx, ecx
+    mov ebx, 10
+.wd_div:
+    xor edx, edx
+    div ebx
+    add dl, '0'
+    push rdx
+    inc ecx
+    test eax, eax
+    jnz .wd_div
+    ; Pop digits in order
+.wd_pop:
+    pop rax
+    mov [rdi], al
+    inc rdi
+    dec ecx
+    jnz .wd_pop
+    pop rcx
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Font name setup
+; ══════════════════════════════════════════════════════════════════════
+
+; Build dynamic font name based on cfg_font_size
+; Called after load_config, before x11_open_font
+setup_font_name:
+    push rbx
+    push r12
+
+    mov rax, [cfg_font_size]
+    test rax, rax
+    jz .sfn_done             ; no font_size configured, use default
+
+    ; Find matching font entry
+    cmp rax, 10
+    je .sfn_10
+    cmp rax, 13
+    je .sfn_13
+    cmp rax, 15
+    je .sfn_15
+    cmp rax, 18
+    je .sfn_18
+    cmp rax, 20
+    je .sfn_20
+    jmp .sfn_done            ; unsupported size, use default
+
+.sfn_10:
+    lea rsi, [font_10]
+    mov r12, font_10_len
+    jmp .sfn_copy
+.sfn_13:
+    lea rsi, [font_13]
+    mov r12, font_13_len
+    jmp .sfn_copy
+.sfn_15:
+    lea rsi, [font_15]
+    mov r12, font_15_len
+    jmp .sfn_copy
+.sfn_18:
+    lea rsi, [font_18]
+    mov r12, font_18_len
+    jmp .sfn_copy
+.sfn_20:
+    lea rsi, [font_20]
+    mov r12, font_20_len
+
+.sfn_copy:
+    ; Copy font name to dyn_font_name
+    lea rdi, [dyn_font_name]
+    xor ecx, ecx
+.sfn_cp:
+    cmp rcx, r12
+    jge .sfn_set_len
+    movzx eax, byte [rsi + rcx]
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .sfn_cp
+.sfn_set_len:
+    mov byte [rdi + rcx], 0  ; null-terminate
+    mov [dyn_font_name_len], r12
+
+.sfn_done:
+    pop r12
     pop rbx
     ret
