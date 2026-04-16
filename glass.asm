@@ -53,6 +53,7 @@
 %define X11_CLEAR_AREA        61
 %define X11_POLY_FILL_RECT    70
 %define X11_IMAGE_TEXT8       76
+%define X11_IMAGE_TEXT16      77
 %define X11_GET_KEYBOARD_MAPPING 101
 %define X11_SET_SELECTION_OWNER 22
 %define X11_CONVERT_SELECTION 24
@@ -97,7 +98,7 @@
 %define DEFAULT_ROWS    24
 %define MAX_COLS        256
 %define MAX_ROWS        128
-%define CELL_SIZE       4
+%define CELL_SIZE       8
 
 ; VT parser states
 %define VT_NORMAL       0
@@ -163,6 +164,12 @@ err_pty:        db "glass: cannot open PTY", 10
 err_pty_len     equ $ - err_pty
 err_fork:       db "glass: fork failed", 10
 err_fork_len    equ $ - err_fork
+
+; URL opener
+xdg_open:       db "/usr/bin/xdg-open", 0
+
+; Config file suffix
+glassrc_suffix: db "/.glassrc", 0
 
 ; Standard 16-color palette (0x00RRGGBB)
 std_colors:
@@ -235,6 +242,25 @@ sel_end_col:        resq 1
 sel_buf:            resb 16384      ; selection text buffer
 sel_len:            resq 1
 sel_button_held:    resq 1          ; 1 = mouse button is held
+
+; UTF-8 decoder state
+utf8_char:          resd 1
+utf8_remaining:     resd 1
+
+; URL detection
+url_list:           resb 768        ; 32 URLs, each 24 bytes
+url_count:          resq 1
+url_strings:        resb 8192       ; extracted URL text
+url_str_pos:        resq 1
+
+; Config (.glassrc)
+cfg_bg_pixel:       resd 1
+cfg_fg_pixel:       resd 1
+cfg_cursor_pixel:   resd 1
+cfg_bg_set:         resb 1
+cfg_fg_set:         resb 1
+cfg_cursor_set:     resb 1
+cfg_buf:            resb 4096
 
 ; Selection atoms
 clipboard_atom:     resd 1
@@ -335,6 +361,9 @@ _start:
 
     ; Parse DISPLAY number
     call parse_display
+
+    ; Load config from ~/.glassrc (before X11 connect)
+    call load_config
 
     ; Read Xauthority
     call read_xauthority
@@ -1154,7 +1183,13 @@ x11_create_window:
     mov eax, [x11_root_visual]
     mov [rdi+24], eax                     ; visual
     mov dword [rdi+28], CW_BACK_PIXEL | CW_EVENT_MASK  ; value-mask
+    cmp byte [cfg_bg_set], 1
+    jne .xcw_default_bg
+    mov eax, [cfg_bg_pixel]
+    jmp .xcw_set_bg
+.xcw_default_bg:
     mov eax, [x11_black_pixel]
+.xcw_set_bg:
     mov [rdi+32], eax                     ; back-pixel
     mov dword [rdi+36], EVENT_MASK_ALL    ; event-mask
 
@@ -1183,9 +1218,23 @@ x11_create_gc:
     mov eax, [win_id]
     mov [rdi+8], eax         ; drawable
     mov dword [rdi+12], GC_FOREGROUND | GC_BACKGROUND | GC_FONT
+    ; GC foreground: use cfg_fg_pixel or white
+    cmp byte [cfg_fg_set], 1
+    jne .xgc_def_fg
+    mov eax, [cfg_fg_pixel]
+    jmp .xgc_set_fg
+.xgc_def_fg:
     mov eax, [x11_white_pixel]
+.xgc_set_fg:
     mov [rdi+16], eax        ; foreground
+    ; GC background: use cfg_bg_pixel or black
+    cmp byte [cfg_bg_set], 1
+    jne .xgc_def_bg
+    mov eax, [cfg_bg_pixel]
+    jmp .xgc_set_bg
+.xgc_def_bg:
     mov eax, [x11_black_pixel]
+.xgc_set_bg:
     mov [rdi+20], eax        ; background
     mov eax, [font_id]
     mov [rdi+24], eax        ; font
@@ -1208,7 +1257,14 @@ x11_create_gc:
     mov eax, [win_id]
     mov [rdi+8], eax
     mov dword [rdi+12], GC_FOREGROUND
+    ; bg fill GC: use cfg_bg_pixel or black
+    cmp byte [cfg_bg_set], 1
+    jne .xgcbg_def
+    mov eax, [cfg_bg_pixel]
+    jmp .xgcbg_set
+.xgcbg_def:
     mov eax, [x11_black_pixel]
+.xgcbg_set:
     mov [rdi+16], eax
 
     lea rsi, [tmp_buf]
@@ -1780,6 +1836,7 @@ event_loop:
 
     ; Render screen
     call render_screen
+    call scan_urls
     call x11_flush
 
     jmp .ev_loop
@@ -1931,28 +1988,41 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_button_press:
-    ; ButtonPress event: start selection
+    ; ButtonPress event: start selection or Ctrl+click URL
     ; event detail (button number) at offset 1; only handle button 1
     movzx eax, byte [x11_buf + rbx + 1]
     cmp al, 1
     jne .hxe_skip
     push rbx
     push r12
-    ; event_x at offset 24 (INT16), event_y at offset 26 (INT16)
+    ; Calculate row/col from pixel coordinates
     movzx eax, word [x11_buf + rbx + 24]
     movzx ecx, word [char_width]
     test ecx, ecx
     jz .hxe_bp_done
     xor edx, edx
     div ecx
-    mov [sel_start_col], rax
-    mov [sel_end_col], rax
+    mov r12, rax             ; col
     movzx eax, word [x11_buf + rbx + 26]
     movzx ecx, word [char_height]
     test ecx, ecx
     jz .hxe_bp_done
     xor edx, edx
     div ecx
+    ; rax = row, r12 = col
+    ; Check for Ctrl+click (state bit 2)
+    movzx ecx, word [x11_buf + rbx + 28]
+    test ecx, 4
+    jz .hxe_bp_selection
+    ; Ctrl+click: try to open URL
+    mov rdi, rax             ; row
+    mov rsi, r12             ; col
+    call url_open_at
+    jmp .hxe_bp_done
+.hxe_bp_selection:
+    ; Normal click: start selection
+    mov [sel_start_col], r12
+    mov [sel_end_col], r12
     mov [sel_start_row], rax
     mov [sel_end_row], rax
     mov qword [sel_active], 1
@@ -2567,16 +2637,64 @@ vt_process:
     cmp al, 0x20
     jb .vtp_loop             ; ignore other control chars
 
-    ; UTF-8 handling: skip continuation bytes (0x80-0xBF)
-    ; so multi-byte chars occupy one grid cell (matching terminal width)
+    ; UTF-8 decoder
     cmp al, 0x80
-    jb .vtp_ascii
+    jb .vtp_put_char         ; ASCII: put directly
+
+    ; Check if continuation byte (10xxxxxx)
     cmp al, 0xBF
-    jbe .vtp_loop            ; skip continuation bytes
-    ; UTF-8 lead byte (0xC0+): show placeholder
-    mov al, '?'
-.vtp_ascii:
-    ; Printable character
+    ja .vtp_utf8_lead
+
+    ; Continuation byte
+    cmp dword [utf8_remaining], 0
+    je .vtp_loop             ; unexpected continuation, skip
+    movzx eax, al
+    and eax, 0x3F
+    mov ecx, [utf8_char]
+    shl ecx, 6
+    or ecx, eax
+    mov [utf8_char], ecx
+    dec dword [utf8_remaining]
+    cmp dword [utf8_remaining], 0
+    jne .vtp_loop            ; more bytes coming
+    ; Complete: put the codepoint
+    movzx eax, word [utf8_char]  ; clamp to BMP (16-bit)
+    cmp eax, 0xFFFF
+    jle .vtp_put_char
+    mov eax, 0xFFFD              ; replacement char for non-BMP
+    jmp .vtp_put_char
+
+.vtp_utf8_lead:
+    ; Lead byte
+    cmp al, 0xDF
+    jbe .vtp_utf8_2          ; 110xxxxx = 2-byte
+    cmp al, 0xEF
+    jbe .vtp_utf8_3          ; 1110xxxx = 3-byte
+    cmp al, 0xF7
+    jbe .vtp_utf8_4          ; 11110xxx = 4-byte
+    jmp .vtp_loop            ; invalid, skip
+
+.vtp_utf8_2:
+    movzx eax, al
+    and eax, 0x1F
+    mov [utf8_char], eax
+    mov dword [utf8_remaining], 1
+    jmp .vtp_loop
+.vtp_utf8_3:
+    movzx eax, al
+    and eax, 0x0F
+    mov [utf8_char], eax
+    mov dword [utf8_remaining], 2
+    jmp .vtp_loop
+.vtp_utf8_4:
+    movzx eax, al
+    and eax, 0x07
+    mov [utf8_char], eax
+    mov dword [utf8_remaining], 3
+    jmp .vtp_loop
+
+.vtp_put_char:
+    ; ax = UCS-2 character
     call grid_put_char
     jmp .vtp_loop
 
@@ -2995,16 +3113,16 @@ vt_process:
     add rdx, rcx
     cmp rdx, [grid_cols]
     jge .vtp_dch_clear
-    ; Copy cell at col+n to col
+    ; Copy cell at col+n to col (8 bytes)
     mov rdx, rbx
     add rdx, rax
     add rdx, rcx
     imul rdx, CELL_SIZE
-    mov r8d, [grid + rdx]
+    mov r8, [grid + rdx]
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
-    mov [grid + rdx], r8d
+    mov [grid + rdx], r8
     inc rax
     jmp .vtp_dch_shift
 .vtp_dch_clear:
@@ -3014,10 +3132,7 @@ vt_process:
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
-    mov byte [grid + rdx], ' '
-    mov byte [grid + rdx + 1], 7
-    mov byte [grid + rdx + 2], 0
-    mov byte [grid + rdx + 3], 0
+    mov qword [grid + rdx], 0x0000000000070020
     inc rax
     jmp .vtp_dch_clear
 .vtp_dch_done:
@@ -3172,19 +3287,20 @@ vt_process:
 ; ══════════════════════════════════════════════════════════════════════
 
 ; Put character at cursor position
+; ax = UCS-2 character (16-bit)
 grid_put_char:
     push rbx
     mov rbx, [cursor_row]
     imul rbx, MAX_COLS
     add rbx, [cursor_col]
     imul rbx, CELL_SIZE
-    mov [grid + rbx], al             ; char
+    mov [grid + rbx], ax             ; char (16-bit)
     movzx ecx, byte [cur_fg]
-    mov [grid + rbx + 1], cl         ; fg
+    mov [grid + rbx + 2], cl         ; fg
     movzx ecx, byte [cur_bg]
-    mov [grid + rbx + 2], cl         ; bg
+    mov [grid + rbx + 3], cl         ; bg
     movzx ecx, byte [cur_attrs]
-    mov [grid + rbx + 3], cl         ; attrs
+    mov [grid + rbx + 4], cl         ; attrs
 
     ; Advance cursor
     mov rax, [cursor_col]
@@ -3223,10 +3339,7 @@ grid_clear:
     jge .gc_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov byte [grid + rax], ' '
-    mov byte [grid + rax + 1], 7     ; default fg
-    mov byte [grid + rax + 2], 0     ; default bg
-    mov byte [grid + rax + 3], 0     ; no attrs
+    mov qword [grid + rax], 0x0000000000070020  ; space=0x0020, fg=7, bg=0, attrs=0
     inc rbx
     jmp .gc_loop
 .gc_done:
@@ -3248,10 +3361,7 @@ grid_clear_below:
     jge .gcb_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov byte [grid + rax], ' '
-    mov byte [grid + rax + 1], 7
-    mov byte [grid + rax + 2], 0
-    mov byte [grid + rax + 3], 0
+    mov qword [grid + rax], 0x0000000000070020
     inc rbx
     jmp .gcb_loop
 .gcb_done:
@@ -3271,10 +3381,7 @@ grid_clear_right:
     mov rax, rcx
     add rax, rbx
     imul rax, CELL_SIZE
-    mov byte [grid + rax], ' '
-    mov byte [grid + rax + 1], 7
-    mov byte [grid + rax + 2], 0
-    mov byte [grid + rax + 3], 0
+    mov qword [grid + rax], 0x0000000000070020
     inc rbx
     jmp .gcr_loop
 .gcr_done:
@@ -3293,10 +3400,7 @@ grid_clear_line:
     mov rax, rcx
     add rax, rbx
     imul rax, CELL_SIZE
-    mov byte [grid + rax], ' '
-    mov byte [grid + rax + 1], 7
-    mov byte [grid + rax + 2], 0
-    mov byte [grid + rax + 3], 0
+    mov qword [grid + rax], 0x0000000000070020
     inc rbx
     jmp .gcl_loop
 .gcl_done:
@@ -3320,9 +3424,9 @@ grid_scroll_up:
     jge .gsu_save_done
     mov rax, rcx
     imul rax, CELL_SIZE
-    mov r8d, [grid + rax]            ; read cell (4 bytes)
+    mov r8, [grid + rax]             ; read cell (8 bytes)
     lea rbx, [r13 + rcx * CELL_SIZE]
-    mov [scroll_buf + rbx], r8d      ; write to scroll_buf
+    mov [scroll_buf + rbx], r8       ; write to scroll_buf
     inc rcx
     jmp .gsu_save
 .gsu_save_done:
@@ -3332,7 +3436,7 @@ grid_scroll_up:
     cmp rdx, MAX_COLS
     jge .gsu_save_advance
     lea rbx, [r13 + rdx * CELL_SIZE]
-    mov dword [scroll_buf + rbx], 0x00000720  ; space, fg=7, bg=0, attrs=0
+    mov qword [scroll_buf + rbx], 0x0000000000070020  ; space, fg=7, bg=0, attrs=0
     inc rdx
     jmp .gsu_save_pad
 .gsu_save_advance:
@@ -3380,9 +3484,9 @@ grid_scroll_up:
     imul rax, CELL_SIZE
     mov rcx, rbx
     imul rcx, CELL_SIZE
-    ; Copy 4 bytes (one cell)
-    mov edx, [grid + rax]
-    mov [grid + rcx], edx
+    ; Copy 8 bytes (one cell)
+    mov rdx, [grid + rax]
+    mov [grid + rcx], rdx
     inc rbx
     jmp .gsu_loop
 .gsu_clear_last:
@@ -3397,10 +3501,7 @@ grid_scroll_up:
     jge .gsu_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov byte [grid + rax], ' '
-    mov byte [grid + rax + 1], 7
-    mov byte [grid + rax + 2], 0
-    mov byte [grid + rax + 3], 0
+    mov qword [grid + rax], 0x0000000000070020
     inc rbx
     jmp .gsu_clear
 .gsu_done:
@@ -3425,8 +3526,8 @@ grid_scroll_down:
     mov rcx, rbx
     add rcx, MAX_COLS
     imul rcx, CELL_SIZE
-    mov edx, [grid + rax]
-    mov [grid + rcx], edx
+    mov rdx, [grid + rax]
+    mov [grid + rcx], rdx
     dec rbx
     jmp .gsd_loop
 .gsd_clear_first:
@@ -3437,10 +3538,7 @@ grid_scroll_down:
     jge .gsd_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov byte [grid + rax], ' '
-    mov byte [grid + rax + 1], 7
-    mov byte [grid + rax + 2], 0
-    mov byte [grid + rax + 3], 0
+    mov qword [grid + rax], 0x0000000000070020
     inc rbx
     jmp .gsd_clear
 .gsd_done:
@@ -3556,12 +3654,16 @@ selection_extract:
     cmp r15, 16380
     jge .se_done                ; buffer limit
 
-    ; Get cell character from grid
+    ; Get cell character from grid (16-bit UCS-2, use low byte for ASCII)
     mov rax, r12
     imul rax, MAX_COLS
     add rax, r13
     imul rax, CELL_SIZE
-    movzx eax, byte [grid + rax]
+    movzx eax, word [grid + rax]
+    cmp eax, 0x7F
+    jbe .se_ascii_char
+    mov al, '?'              ; non-ASCII: placeholder in selection
+.se_ascii_char:
     mov [sel_buf + r15], al
     inc r15
     inc r13
@@ -3695,37 +3797,39 @@ render_screen:
     cmp r13, [grid_cols]
     jge .rs_next_row
 
-    ; Get fg/bg of cell at col using row base pointer
+    ; Get fg/bg of cell at col using row base pointer (offsets +2, +3 for 8-byte cells)
     mov rax, [rs_row_base]
     mov rdx, r13
     imul rdx, CELL_SIZE
     add rax, rdx
-    movzx r14d, byte [rax + 1]  ; run fg
-    movzx r15d, byte [rax + 2]  ; run bg
+    movzx r14d, byte [rax + 2]  ; run fg (offset +2)
+    movzx r15d, byte [rax + 3]  ; run bg (offset +3)
 
-    ; Scan ahead for cells with same fg/bg, build text
-    lea rdi, [tmp_buf + 20]  ; text buffer
+    ; Scan ahead for cells with same fg/bg, build CHAR2B text
+    lea rdi, [tmp_buf + 20]  ; text buffer (2 bytes per char)
     mov rbx, r13             ; current col
-    xor ecx, ecx             ; text length
+    xor ecx, ecx             ; character count
 .rs_run_scan:
     cmp rbx, [grid_cols]
     jge .rs_run_draw
-    cmp ecx, 255             ; ImageText8 max
+    cmp ecx, 255             ; ImageText16 max
     jge .rs_run_draw
     mov rax, [rs_row_base]
     mov rdx, rbx
     imul rdx, CELL_SIZE
     add rax, rdx
     ; Check if fg/bg matches current run
-    movzx edx, byte [rax + 1]
+    movzx edx, byte [rax + 2]
     cmp edx, r14d
     jne .rs_run_draw
-    movzx edx, byte [rax + 2]
+    movzx edx, byte [rax + 3]
     cmp edx, r15d
     jne .rs_run_draw
-    ; Same color, add to run
-    movzx edx, byte [rax]           ; char
-    mov [rdi + rcx], dl
+    ; Same color, add to run as CHAR2B (big-endian: byte1=high, byte2=low)
+    movzx edx, word [rax]           ; UCS-2 char (little-endian)
+    mov [rdi + rcx*2 + 1], dl       ; low byte (byte2)
+    shr edx, 8
+    mov [rdi + rcx*2], dl           ; high byte (byte1)
     inc ecx
     inc rbx
     jmp .rs_run_scan
@@ -3754,13 +3858,14 @@ render_screen:
     inc dword [x11_seq]
     pop rcx
 
-    ; ImageText8
+    ; ImageText16
     push rcx
     lea rdi, [tmp_buf]
-    mov byte [rdi], X11_IMAGE_TEXT8
-    mov byte [rdi+1], cl     ; string length
-    ; request length = (16 + n + 3) / 4
+    mov byte [rdi], X11_IMAGE_TEXT16
+    mov byte [rdi+1], cl     ; string length (CHAR2B count)
+    ; request length = (16 + 2*n + 3) / 4
     mov eax, ecx
+    shl eax, 1               ; 2*n bytes of text
     add eax, 16
     add eax, 3
     shr eax, 2
@@ -3780,21 +3885,24 @@ render_screen:
     movzx edx, word [font_ascent]
     add eax, edx
     mov word [rdi+14], ax
-    ; Copy text from tmp_buf+20 to tmp_buf+16
+    ; Copy CHAR2B text from tmp_buf+20 to tmp_buf+16 (2*n bytes)
     pop rcx
     push rcx
+    mov eax, ecx
+    shl eax, 1               ; 2*n bytes to copy
     xor edx, edx
 .rs_cp_run:
-    cmp edx, ecx
+    cmp edx, eax
     jge .rs_send_run
-    movzx eax, byte [tmp_buf + 20 + rdx]
-    mov [tmp_buf + 16 + rdx], al
+    movzx esi, byte [tmp_buf + 20 + rdx]
+    mov [tmp_buf + 16 + rdx], sil
     inc edx
     jmp .rs_cp_run
 .rs_send_run:
     pop rcx
-    ; Send padded request
+    ; Send padded request: (16 + 2*n + 3) & ~3
     mov eax, ecx
+    shl eax, 1
     add eax, 16
     add eax, 3
     and eax, ~3
@@ -3813,16 +3921,21 @@ render_screen:
 
 .rs_cursor:
     ; Draw cursor as inverse block at cursor position
-    ; For Phase 1: just a filled rectangle
     lea rdi, [tmp_buf]
-    ; Set GC foreground to white for cursor
+    ; Set GC foreground for cursor (config or white)
     mov byte [rdi], X11_CHANGE_GC
     mov byte [rdi+1], 0
     mov word [rdi+2], 4
     mov eax, [gc_id]
     mov [rdi+4], eax
     mov dword [rdi+8], GC_FOREGROUND
+    cmp byte [cfg_cursor_set], 1
+    jne .rs_cursor_default
+    mov eax, [cfg_cursor_pixel]
+    jmp .rs_cursor_set
+.rs_cursor_default:
     mov eax, [x11_white_pixel]
+.rs_cursor_set:
     mov [rdi+12], eax
     lea rsi, [tmp_buf]
     mov rdx, 16
@@ -3957,6 +4070,536 @@ init_palette:
     ret
 
 .ip_vals: db 0, 0x5F, 0x87, 0xAF, 0xD7, 0xFF
+
+; ══════════════════════════════════════════════════════════════════════
+; Configuration loading (~/.glassrc)
+; ══════════════════════════════════════════════════════════════════════
+
+; Load configuration from ~/.glassrc
+; Format: key = #RRGGBB or key = number, one per line
+load_config:
+    push rbx
+    push r12
+    push r13
+
+    ; Find $HOME
+    mov rdi, [envp]
+.lc_env_loop:
+    mov rax, [rdi]
+    test rax, rax
+    jz .lc_done
+    cmp dword [rax], 'HOME'
+    jne .lc_env_next
+    cmp byte [rax+4], '='
+    jne .lc_env_next
+    lea rsi, [rax + 5]
+    jmp .lc_build_path
+.lc_env_next:
+    add rdi, 8
+    jmp .lc_env_loop
+
+.lc_build_path:
+    ; Build $HOME/.glassrc in tmp_buf
+    lea rdi, [tmp_buf]
+.lc_cp_home:
+    mov al, [rsi]
+    test al, al
+    jz .lc_append_suffix
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .lc_cp_home
+.lc_append_suffix:
+    lea rsi, [glassrc_suffix]
+.lc_cp_suffix:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .lc_open
+    inc rsi
+    inc rdi
+    jmp .lc_cp_suffix
+
+.lc_open:
+    mov rax, SYS_OPEN
+    lea rdi, [tmp_buf]
+    xor esi, esi             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .lc_done              ; file doesn't exist, use defaults
+    mov rbx, rax             ; fd
+
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [cfg_buf]
+    mov rdx, 4095
+    syscall
+    mov r12, rax             ; bytes read
+
+    push rbx
+    mov rax, SYS_CLOSE
+    mov rdi, [rsp]
+    syscall
+    pop rbx
+
+    test r12, r12
+    jle .lc_done
+    ; Null-terminate
+    mov byte [cfg_buf + r12], 0
+
+    ; Parse lines
+    lea rsi, [cfg_buf]
+.lc_line_loop:
+    cmp byte [rsi], 0
+    je .lc_done
+    ; Skip leading whitespace
+.lc_skip_ws:
+    cmp byte [rsi], ' '
+    je .lc_skip_ws_next
+    cmp byte [rsi], 9       ; tab
+    je .lc_skip_ws_next
+    jmp .lc_check_comment
+.lc_skip_ws_next:
+    inc rsi
+    jmp .lc_skip_ws
+
+.lc_check_comment:
+    cmp byte [rsi], '#'
+    je .lc_skip_line
+    cmp byte [rsi], 10       ; newline
+    je .lc_next_line
+    cmp byte [rsi], 0
+    je .lc_done
+
+    ; Try to match "bg"
+    cmp word [rsi], 'bg'
+    jne .lc_try_fg
+    cmp byte [rsi+2], ' '
+    je .lc_parse_bg
+    cmp byte [rsi+2], '='
+    je .lc_parse_bg
+    jmp .lc_try_fg
+
+.lc_parse_bg:
+    add rsi, 2
+    call lc_skip_to_value
+    cmp byte [rsi], '#'
+    jne .lc_skip_line
+    inc rsi
+    call hex_to_pixel
+    mov [cfg_bg_pixel], eax
+    mov byte [cfg_bg_set], 1
+    ; Update palette[0] with configured bg
+    mov [palette], eax
+    jmp .lc_skip_line
+
+.lc_try_fg:
+    cmp word [rsi], 'fg'
+    jne .lc_try_cursor
+    cmp byte [rsi+2], ' '
+    je .lc_parse_fg
+    cmp byte [rsi+2], '='
+    je .lc_parse_fg
+    jmp .lc_try_cursor
+
+.lc_parse_fg:
+    add rsi, 2
+    call lc_skip_to_value
+    cmp byte [rsi], '#'
+    jne .lc_skip_line
+    inc rsi
+    call hex_to_pixel
+    mov [cfg_fg_pixel], eax
+    mov byte [cfg_fg_set], 1
+    ; Update palette[7] with configured fg
+    mov [palette + 7*4], eax
+    jmp .lc_skip_line
+
+.lc_try_cursor:
+    ; Match "cursor"
+    cmp dword [rsi], 'curs'
+    jne .lc_skip_line
+    cmp word [rsi+4], 'or'
+    jne .lc_skip_line
+    add rsi, 6
+    call lc_skip_to_value
+    cmp byte [rsi], '#'
+    jne .lc_skip_line
+    inc rsi
+    call hex_to_pixel
+    mov [cfg_cursor_pixel], eax
+    mov byte [cfg_cursor_set], 1
+    jmp .lc_skip_line
+
+.lc_skip_line:
+    cmp byte [rsi], 0
+    je .lc_done
+    cmp byte [rsi], 10
+    je .lc_next_line
+    inc rsi
+    jmp .lc_skip_line
+.lc_next_line:
+    inc rsi
+    jmp .lc_line_loop
+
+.lc_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Helper: skip whitespace and '=' to reach value
+; rsi points past key name, advances to value start
+lc_skip_to_value:
+.lcstv_loop:
+    cmp byte [rsi], ' '
+    je .lcstv_next
+    cmp byte [rsi], 9
+    je .lcstv_next
+    cmp byte [rsi], '='
+    je .lcstv_next
+    ret
+.lcstv_next:
+    inc rsi
+    jmp .lcstv_loop
+
+; Parse "#RRGGBB" hex string to 0x00RRGGBB pixel value
+; rsi = pointer to first hex char (after '#')
+; Returns: eax = pixel value, advances rsi by 6
+hex_to_pixel:
+    push rbx
+    xor eax, eax
+    ; Parse 6 hex digits
+    mov ecx, 6
+.htp_loop:
+    test ecx, ecx
+    jz .htp_done
+    shl eax, 4
+    movzx ebx, byte [rsi]
+    cmp bl, '0'
+    jb .htp_zero
+    cmp bl, '9'
+    jbe .htp_digit
+    cmp bl, 'a'
+    jb .htp_upper
+    cmp bl, 'f'
+    jbe .htp_lower
+    jmp .htp_upper
+.htp_digit:
+    sub ebx, '0'
+    jmp .htp_add
+.htp_lower:
+    sub ebx, 'a'
+    add ebx, 10
+    jmp .htp_add
+.htp_upper:
+    cmp bl, 'A'
+    jb .htp_zero
+    cmp bl, 'F'
+    ja .htp_zero
+    sub ebx, 'A'
+    add ebx, 10
+    jmp .htp_add
+.htp_zero:
+    xor ebx, ebx
+.htp_add:
+    or eax, ebx
+    inc rsi
+    dec ecx
+    jmp .htp_loop
+.htp_done:
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; URL detection and clicking
+; ══════════════════════════════════════════════════════════════════════
+
+; Scan visible grid for URLs (http:// or https://)
+scan_urls:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov qword [url_count], 0
+    mov qword [url_str_pos], 0
+    xor r12, r12             ; current row
+
+.su_row_loop:
+    cmp r12, [grid_rows]
+    jge .su_done
+    xor r13, r13             ; current col
+
+.su_col_loop:
+    cmp r13, [grid_cols]
+    jge .su_next_row
+
+    ; Check for 'h' at this position
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, 'h'
+    jne .su_next_col
+
+    ; Check "http" at positions col, col+1, col+2, col+3
+    mov rax, r13
+    add rax, 3
+    cmp rax, [grid_cols]
+    jge .su_next_col
+
+    ; Check 't'
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    inc rax
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, 't'
+    jne .su_next_col
+
+    ; Check 't'
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    add rax, 2
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, 't'
+    jne .su_next_col
+
+    ; Check 'p'
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    add rax, 3
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, 'p'
+    jne .su_next_col
+
+    ; Check for "://" after "http" or "https"
+    mov r14, r13
+    add r14, 4               ; position after "http"
+    cmp r14, [grid_cols]
+    jge .su_next_col
+
+    ; Check if next char is 's' (https) or ':' (http)
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r14
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, 's'
+    jne .su_check_colon
+    inc r14                  ; skip 's'
+.su_check_colon:
+    ; Need "://" at r14, r14+1, r14+2
+    mov rax, r14
+    add rax, 2
+    cmp rax, [grid_cols]
+    jge .su_next_col
+
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r14
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, ':'
+    jne .su_next_col
+
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r14
+    inc rax
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, '/'
+    jne .su_next_col
+
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r14
+    add rax, 2
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    cmp dl, '/'
+    jne .su_next_col
+
+    ; Found URL start at (r12, r13). Scan to find end.
+    mov r15, r14
+    add r15, 3               ; position after "://"
+
+.su_url_scan:
+    cmp r15, [grid_cols]
+    jge .su_url_found
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r15
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    ; Stop at whitespace or certain delimiters
+    cmp dl, ' '
+    je .su_url_found
+    cmp dl, 0x20             ; space (redundant but clear)
+    jb .su_url_found
+    cmp dl, ')'
+    je .su_url_found
+    cmp dl, ']'
+    je .su_url_found
+    cmp dl, '>'
+    je .su_url_found
+    cmp dl, '"'
+    je .su_url_found
+    cmp dl, 0x27             ; single quote
+    je .su_url_found
+    inc r15
+    jmp .su_url_scan
+
+.su_url_found:
+    ; URL spans from (r12, r13) to (r12, r15-1)
+    ; Store in url_list if room
+    mov rax, [url_count]
+    cmp rax, 32
+    jge .su_next_col
+
+    ; Extract URL text into url_strings
+    mov rbx, [url_str_pos]
+    mov rcx, r13             ; start col
+.su_extract:
+    cmp rcx, r15
+    jge .su_extract_done
+    mov rax, rbx
+    cmp rax, 8190
+    jge .su_extract_done
+    ; Read char from grid
+    push rcx
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, rcx
+    imul rax, CELL_SIZE
+    movzx edx, word [grid + rax]
+    pop rcx
+    cmp dl, 0x7F
+    jbe .su_ext_store
+    mov dl, '?'
+.su_ext_store:
+    mov [url_strings + rbx], dl
+    inc rbx
+    inc rcx
+    jmp .su_extract
+.su_extract_done:
+    mov byte [url_strings + rbx], 0  ; null-terminate
+    mov rcx, rbx
+    sub rcx, [url_str_pos]  ; str_len
+
+    ; Store url_list entry (24 bytes)
+    ; start_row(2), start_col(2), end_row(2), end_col(2),
+    ; str_offset(4), str_len(4), pad(8)
+    mov rax, [url_count]
+    imul rax, 24
+    mov word [url_list + rax], r12w       ; start_row
+    mov word [url_list + rax + 2], r13w   ; start_col
+    mov word [url_list + rax + 4], r12w   ; end_row (same row)
+    mov rdx, r15
+    dec rdx
+    mov word [url_list + rax + 6], dx     ; end_col
+    mov edx, [url_str_pos]
+    mov [url_list + rax + 8], edx         ; str_offset
+    mov [url_list + rax + 12], ecx        ; str_len
+    mov qword [url_list + rax + 16], 0    ; pad
+
+    inc rbx                  ; skip null terminator
+    mov [url_str_pos], rbx
+    inc qword [url_count]
+    ; Skip past URL in column scan
+    mov r13, r15
+    jmp .su_col_loop
+
+.su_next_col:
+    inc r13
+    jmp .su_col_loop
+.su_next_row:
+    inc r12
+    jmp .su_row_loop
+
+.su_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Open URL at grid position (row, col) if one exists
+; rdi = row, rsi = col
+url_open_at:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi             ; row
+    mov r13, rsi             ; col
+
+    xor rbx, rbx             ; url index
+.uoa_loop:
+    cmp rbx, [url_count]
+    jge .uoa_done
+
+    mov rax, rbx
+    imul rax, 24
+    ; Check if (row, col) is within this URL's range
+    movzx ecx, word [url_list + rax]       ; start_row
+    cmp r12d, ecx
+    jl .uoa_next
+    movzx ecx, word [url_list + rax + 4]   ; end_row
+    cmp r12d, ecx
+    jg .uoa_next
+    movzx ecx, word [url_list + rax + 2]   ; start_col
+    cmp r13d, ecx
+    jl .uoa_next
+    movzx ecx, word [url_list + rax + 6]   ; end_col
+    cmp r13d, ecx
+    jg .uoa_next
+
+    ; Match! Fork and exec xdg-open with the URL
+    mov r12d, [url_list + rax + 8]   ; str_offset
+    mov r13d, [url_list + rax + 12]  ; str_len (for reference)
+
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jnz .uoa_done            ; parent: done
+    ; Child process
+    ; Build argv: ["/usr/bin/xdg-open", url_string, NULL]
+    sub rsp, 32
+    lea rax, [xdg_open]
+    mov [rsp], rax
+    lea rax, [url_strings + r12]
+    mov [rsp+8], rax
+    mov qword [rsp+16], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [xdg_open]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+    ; If exec fails, exit child
+    mov rdi, 1
+    mov rax, SYS_EXIT
+    syscall
+
+.uoa_next:
+    inc rbx
+    jmp .uoa_loop
+
+.uoa_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Utility functions
