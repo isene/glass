@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.1-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.2-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 58KB.
 
@@ -32,9 +32,14 @@ bg = #1a1b26
 fg = #c0caf5
 cursor = #f7768e
 font_size = 13
+opacity = 80
 ```
 
 Available font sizes: 10, 13, 15, 18, 20. Colors are hex RGB.
+`opacity` is a 0..100 percentage (100 = opaque, default). Values
+below 100 enable a 32-bit ARGB visual; you need a running
+compositor (picom, compton, KWin, Mutter) for the effect to be
+visible.
 
 ## Features
 
@@ -78,6 +83,8 @@ Available font sizes: 10, 13, 15, 18, 20. Colors are hex RGB.
 ### Interaction
 - Scrollback buffer (1000 lines, Shift+PageUp/Down)
 - Text selection (click and drag, visible inverted highlight)
+- Double-click to select word (alnum + `_-./~+@:%=`)
+- Triple-click to select whole line
 - Selection populates X11 PRIMARY for paste in other apps
 - Glass responds to SelectionRequest (TARGETS, UTF8_STRING, STRING)
 - URL detection (http/https), Ctrl+click to open with xdg-open
@@ -126,7 +133,6 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 - [ ] Cursor blink
 - [ ] OSC 8 hyperlinks
 - [ ] OSC 52 clipboard (program-initiated copy)
-- [ ] Word/line selection (double/triple click)
 
 ## The CHasm Suite
 

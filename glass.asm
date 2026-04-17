@@ -61,6 +61,7 @@
 %define X11_CHANGE_WINDOW_ATTRS2 2
 %define X11_GET_PROPERTY      20
 %define X11_GET_GEOMETRY      14
+%define X11_CREATE_COLORMAP   78
 
 ; X11 event types
 %define EV_KEY_PRESS        2
@@ -87,7 +88,9 @@
 
 ; CreateWindow value mask bits
 %define CW_BACK_PIXEL       0x00000002
+%define CW_BORDER_PIXEL     0x00000008
 %define CW_EVENT_MASK       0x00000800
+%define CW_COLORMAP         0x00002000
 
 ; CreateGC value mask bits
 %define GC_FOREGROUND       0x00000004
@@ -234,6 +237,8 @@ x11_white_pixel:    resd 1
 x11_black_pixel:    resd 1
 x11_min_keycode:    resb 1
 x11_max_keycode:    resb 1
+x11_argb_visual:    resd 1          ; 32-bit TrueColor visual ID (0 if none)
+x11_argb_colormap:  resd 1          ; colormap for ARGB visual (0 if none)
 
 ; Our resources
 win_id:             resd 1
@@ -271,6 +276,14 @@ sel_buf:            resb 16384      ; selection text buffer
 sel_len:            resq 1
 sel_button_held:    resq 1          ; 1 = mouse button is held
 
+; Multi-click detection (double/triple click for word/line selection)
+last_click_time:    resq 1          ; CLOCK_MONOTONIC ms of last button press
+last_click_row:     resq 1
+last_click_col:     resq 1
+click_count:        resq 1          ; 1=single, 2=double, 3=triple
+click_ts_buf:       resq 2          ; scratch for clock_gettime (sec, nsec)
+sel_mode:           resq 1          ; 0=char, 1=word, 2=line (locks drag/release)
+
 ; UTF-8 decoder state
 utf8_char:          resd 1
 utf8_remaining:     resd 1
@@ -288,6 +301,8 @@ cfg_cursor_pixel:   resd 1
 cfg_bg_set:         resb 1
 cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
+cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
+cfg_opacity_set:    resb 1
 cfg_buf:            resb 4096
 
 ; Selection atoms
@@ -945,6 +960,43 @@ x11_parse_setup:
     movzx eax, byte [r12 + 38]
     mov [x11_root_depth], al
 
+    ; Walk DEPTH structures looking for depth=32 TrueColor visual.
+    ; SCREEN header is 40 bytes, then number-of-depths DEPTH structs.
+    ; DEPTH = 8-byte header + N * 24-byte VISUALTYPE.
+    ; VISUALTYPE byte 4 = class (4 = TrueColor); bytes 0-3 = visual-id.
+    movzx ecx, byte [r12 + 39]            ; number of depths
+    lea rbx, [r12 + 40]                   ; rbx = current DEPTH
+.xps_depth_loop:
+    test ecx, ecx
+    jz .xps_done
+    movzx eax, byte [rbx]                 ; depth
+    movzx edx, word [rbx + 2]             ; number of visuals
+    lea r12, [rbx + 8]                    ; r12 = first VISUALTYPE
+    cmp eax, 32
+    jne .xps_advance_depth
+.xps_visual_loop:
+    test edx, edx
+    jz .xps_advance_depth
+    movzx eax, byte [r12 + 4]
+    cmp eax, 4                            ; TrueColor
+    jne .xps_next_visual
+    mov eax, [r12]
+    mov [x11_argb_visual], eax
+    jmp .xps_done
+.xps_next_visual:
+    add r12, 24
+    dec edx
+    jmp .xps_visual_loop
+.xps_advance_depth:
+    ; r12 = first visual; advance past remaining visuals to next DEPTH
+    mov rax, rdx
+    imul rax, 24
+    add r12, rax
+    mov rbx, r12
+    dec ecx
+    jmp .xps_depth_loop
+.xps_done:
+
     pop r12
     pop rbx
     ret
@@ -1330,12 +1382,38 @@ x11_create_window:
     mov [grid_rows], rax
 .xcw_skip_rows:
 
+    ; Decide whether to use the ARGB32 visual for transparency.
+    ; Conditions: opacity configured, opacity < 255, ARGB visual found.
+    ; The transparent flag lives in [x11_argb_colormap] (0 = simple path,
+    ; nonzero = ARGB) so it survives across syscalls in x11_create_colormap.
+    cmp byte [cfg_opacity_set], 1
+    jne .xcw_pick_visual
+    movzx eax, byte [cfg_opacity]
+    cmp eax, 255
+    jae .xcw_pick_visual
+    cmp dword [x11_argb_visual], 0
+    je .xcw_pick_visual
+    call x11_create_colormap
+    call palette_apply_alpha
+.xcw_pick_visual:
+
     ; Build CreateWindow request
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CREATE_WINDOW     ; opcode
+    cmp dword [x11_argb_colormap], 0
+    je .xcw_depth_root
+    mov byte [rdi+1], 32                  ; depth
+    mov word [rdi+2], 12                  ; length (8 + 4 values = 12 words)
+    mov eax, [x11_argb_visual]
+    jmp .xcw_visual_set
+.xcw_depth_root:
     mov al, [x11_root_depth]
-    mov byte [rdi+1], al                  ; depth
+    mov byte [rdi+1], al
     mov word [rdi+2], 10                  ; length (8 + 2 values = 10 words)
+    mov eax, [x11_root_visual]
+.xcw_visual_set:
+    mov [rdi+24], eax                     ; visual
+
     mov eax, [win_id]
     mov [rdi+4], eax                      ; wid
     mov eax, [x11_root_window]
@@ -1348,9 +1426,8 @@ x11_create_window:
     mov word [rdi+18], ax                 ; height
     mov word [rdi+20], 0                  ; border-width
     mov word [rdi+22], 1                  ; class = InputOutput
-    mov eax, [x11_root_visual]
-    mov [rdi+24], eax                     ; visual
-    mov dword [rdi+28], CW_BACK_PIXEL | CW_EVENT_MASK  ; value-mask
+
+    ; Compute background pixel (with alpha if transparent)
     cmp byte [cfg_bg_set], 1
     jne .xcw_default_bg
     mov eax, [cfg_bg_pixel]
@@ -1358,14 +1435,59 @@ x11_create_window:
 .xcw_default_bg:
     mov eax, [x11_black_pixel]
 .xcw_set_bg:
-    mov [rdi+32], eax                     ; back-pixel
-    mov dword [rdi+36], EVENT_MASK_ALL    ; event-mask
+    cmp dword [x11_argb_colormap], 0
+    je .xcw_no_alpha
+    and eax, 0x00FFFFFF
+    movzx ecx, byte [cfg_opacity]
+    shl ecx, 24
+    or eax, ecx
+.xcw_no_alpha:
+    mov r10d, eax                         ; r10 = bg pixel (ARGB or RGB)
 
-    lea rsi, [tmp_buf]
+    ; Value mask + values (ascending CW bit order)
+    cmp dword [x11_argb_colormap], 0
+    je .xcw_mask_simple
+    mov dword [rdi+28], CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_EVENT_MASK | CW_COLORMAP
+    mov [rdi+32], r10d                    ; back-pixel
+    mov [rdi+36], r10d                    ; border-pixel (any valid pixel)
+    mov dword [rdi+40], EVENT_MASK_ALL    ; event-mask
+    mov eax, [x11_argb_colormap]
+    mov [rdi+44], eax                     ; colormap
+    mov rdx, 48
+    jmp .xcw_send
+.xcw_mask_simple:
+    mov dword [rdi+28], CW_BACK_PIXEL | CW_EVENT_MASK
+    mov [rdi+32], r10d                    ; back-pixel
+    mov dword [rdi+36], EVENT_MASK_ALL    ; event-mask
     mov rdx, 40
+.xcw_send:
+    lea rsi, [tmp_buf]
     call x11_buffer
     inc dword [x11_seq]
 
+    pop rbx
+    ret
+
+; CreateColormap (opcode 78) for the ARGB visual.
+; Stores colormap id in x11_argb_colormap.
+x11_create_colormap:
+    push rbx
+    call alloc_xid
+    mov [x11_argb_colormap], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_COLORMAP
+    mov byte [rdi+1], 0                   ; alloc = None
+    mov word [rdi+2], 4                   ; length = 4 words
+    mov eax, [x11_argb_colormap]
+    mov [rdi+4], eax                      ; mid
+    mov eax, [x11_root_window]
+    mov [rdi+8], eax                      ; window (any with same root)
+    mov eax, [x11_argb_visual]
+    mov [rdi+12], eax                     ; visual
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
     pop rbx
     ret
 
@@ -2351,12 +2473,79 @@ handle_x11_events:
     cmp r13d, 1
     jne .hxe_bp_done2
 .hxe_bp_selection:
-    mov [sel_start_col], r12
-    mov [sel_end_col], r12
+    ; Save row/col across click_now_ms call (uses syscall)
+    push rax
+    push r12
+    call click_now_ms        ; rax = ms (monotonic)
+    mov rcx, rax             ; rcx = now
+    pop r12
+    pop rax
+    ; Compare with last click: same row+col and within 400ms?
+    mov rdx, rcx
+    sub rdx, [last_click_time]
+    cmp rdx, 400
+    ja .hxe_bp_sel_single
+    cmp rax, [last_click_row]
+    jne .hxe_bp_sel_single
+    cmp r12, [last_click_col]
+    jne .hxe_bp_sel_single
+    ; Multi-click: bump count (cap at 3)
+    mov rdx, [click_count]
+    inc rdx
+    cmp rdx, 3
+    jbe .hxe_bp_sel_count_ok
+    mov rdx, 1
+.hxe_bp_sel_count_ok:
+    mov [click_count], rdx
+    jmp .hxe_bp_sel_apply
+.hxe_bp_sel_single:
+    mov qword [click_count], 1
+.hxe_bp_sel_apply:
+    mov [last_click_time], rcx
+    mov [last_click_row], rax
+    mov [last_click_col], r12
+    ; Common defaults: anchor at click, no active selection until drag
     mov [sel_start_row], rax
     mov [sel_end_row], rax
-    mov qword [sel_active], 1
+    mov [sel_start_col], r12
+    mov [sel_end_col], r12
     mov qword [sel_button_held], 1
+    mov qword [sel_mode], 0
+    ; Branch on click count
+    mov rdx, [click_count]
+    cmp rdx, 2
+    je .hxe_bp_sel_word
+    cmp rdx, 3
+    je .hxe_bp_sel_line
+    ; Single click: clear any prior selection and redraw
+    cmp qword [sel_active], 0
+    je .hxe_bp_done2
+    mov qword [sel_active], 0
+    call render_screen
+    call x11_flush
+    jmp .hxe_bp_done2
+.hxe_bp_sel_word:
+    mov qword [sel_mode], 1
+    mov qword [sel_button_held], 0
+    mov qword [sel_active], 1
+    mov rdi, rax             ; row
+    mov rsi, r12             ; col
+    call find_word_at
+    call selection_extract
+    call selection_claim_primary
+    call render_screen
+    call x11_flush
+    jmp .hxe_bp_done2
+.hxe_bp_sel_line:
+    mov qword [sel_mode], 2
+    mov qword [sel_button_held], 0
+    mov qword [sel_active], 1
+    mov rdi, rax             ; row
+    call select_line_at
+    call selection_extract
+    call selection_claim_primary
+    call render_screen
+    call x11_flush
     jmp .hxe_bp_done2
 
 .hxe_bp_ctrl:
@@ -2512,9 +2701,13 @@ handle_x11_events:
     jmp .hxe_mn_done
 
 .hxe_mn_selection:
-    ; Update selection end if button held
+    ; Update selection end if button held (and not in word/line lock)
+    cmp qword [sel_mode], 0
+    jne .hxe_mn_done
     cmp qword [sel_button_held], 1
     jne .hxe_mn_done
+    ; Drag in progress: activate selection now (cleared on press)
+    mov qword [sel_active], 1
     movzx eax, word [x11_buf + rbx + 24]
     movzx ecx, word [char_width]
     test ecx, ecx
@@ -2591,6 +2784,9 @@ handle_x11_events:
     jne .hxe_br_done2
     mov qword [sel_button_held], 0
     cmp qword [sel_active], 1
+    jne .hxe_br_done2
+    ; Word/line selections were finalized at button-press; skip release update
+    cmp qword [sel_mode], 0
     jne .hxe_br_done2
     ; Update final position
     movzx eax, word [x11_buf + rbx + 24]
@@ -5180,6 +5376,169 @@ selection_extract:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; Multi-click helpers (word/line selection, monotonic clock)
+; ══════════════════════════════════════════════════════════════════════
+
+; click_now_ms: returns CLOCK_MONOTONIC milliseconds in rax
+click_now_ms:
+    mov rax, SYS_CLOCK_GETTIME
+    mov edi, 1                    ; CLOCK_MONOTONIC
+    lea rsi, [click_ts_buf]
+    syscall
+    mov rax, [click_ts_buf]       ; sec
+    imul rax, 1000                ; → ms
+    push rax
+    mov rax, [click_ts_buf + 8]   ; nsec
+    mov rcx, 1000000
+    xor edx, edx
+    div rcx                       ; rax = ms part of nsec
+    mov rcx, rax
+    pop rax
+    add rax, rcx
+    ret
+
+; is_word_char_al: ZF=1 iff al is a word char (alnum + _-./~+@:%=)
+; May clobber al on negative result (callers don't depend on al after).
+is_word_char_al:
+    cmp al, '0'
+    jb .iwc_punct
+    cmp al, '9'
+    jbe .iwc_y
+    cmp al, 'A'
+    jb .iwc_punct
+    cmp al, 'Z'
+    jbe .iwc_y
+    cmp al, 'a'
+    jb .iwc_punct
+    cmp al, 'z'
+    jbe .iwc_y
+.iwc_punct:
+    cmp al, '_'
+    je .iwc_y
+    cmp al, '-'
+    je .iwc_y
+    cmp al, '.'
+    je .iwc_y
+    cmp al, '/'
+    je .iwc_y
+    cmp al, '~'
+    je .iwc_y
+    cmp al, '+'
+    je .iwc_y
+    cmp al, '@'
+    je .iwc_y
+    cmp al, ':'
+    je .iwc_y
+    cmp al, '%'
+    je .iwc_y
+    cmp al, '='
+    je .iwc_y
+    or al, 1                  ; ZF=0
+    ret
+.iwc_y:
+    cmp al, al                ; ZF=1
+    ret
+
+; cell_char_at: rdi=row, rsi=col → al = ASCII char (or '?' for non-ASCII)
+cell_char_at:
+    mov rax, rdi
+    imul rax, MAX_COLS
+    add rax, rsi
+    imul rax, CELL_SIZE
+    movzx eax, word [grid + rax]
+    cmp eax, 0x7F
+    jbe .cca_done
+    mov al, '?'
+.cca_done:
+    ret
+
+; find_word_at: rdi=row, rsi=col → sets sel_start_col/sel_end_col on row
+; sel_start_row and sel_end_row already = rdi
+find_word_at:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi              ; row
+    mov r13, rsi              ; col (anchor)
+    ; Check if anchor cell is a word char
+    mov rdi, r12
+    mov rsi, r13
+    call cell_char_at
+    call is_word_char_al
+    jne .fwa_single           ; not a word char: single-cell selection
+    ; Scan left
+    mov r14, r13              ; left = col
+.fwa_left:
+    test r14, r14
+    jz .fwa_left_done
+    dec r14
+    mov rdi, r12
+    mov rsi, r14
+    call cell_char_at
+    call is_word_char_al
+    je .fwa_left
+    inc r14                   ; back up to last word char
+.fwa_left_done:
+    mov [sel_start_col], r14
+    ; Scan right
+    mov rbx, r13              ; right = col
+.fwa_right:
+    mov rdi, [grid_cols]
+    dec rdi
+    cmp rbx, rdi
+    jge .fwa_right_done
+    inc rbx
+    mov rdi, r12
+    mov rsi, rbx
+    call cell_char_at
+    call is_word_char_al
+    je .fwa_right
+    dec rbx                   ; back up to last word char
+.fwa_right_done:
+    mov [sel_end_col], rbx
+    jmp .fwa_done
+.fwa_single:
+    mov [sel_start_col], r13
+    mov [sel_end_col], r13
+.fwa_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; select_line_at: rdi=row → sel_*_row=rdi, sel_start_col=0, sel_end_col=last col
+select_line_at:
+    mov [sel_start_row], rdi
+    mov [sel_end_row], rdi
+    mov qword [sel_start_col], 0
+    mov rax, [grid_cols]
+    test rax, rax
+    jz .sla_zero
+    dec rax
+.sla_zero:
+    mov [sel_end_col], rax
+    ret
+
+; selection_claim_primary: SetSelectionOwner on PRIMARY (atom 1)
+selection_claim_primary:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 1          ; XA_PRIMARY
+    mov dword [rdi+12], 0         ; CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
 ; Screen rendering
 ; ══════════════════════════════════════════════════════════════════════
 
@@ -5216,7 +5575,12 @@ render_screen:
     mov eax, [gc_id]
     mov [rdi+4], eax
     mov dword [rdi+8], GC_FOREGROUND
-    mov dword [rdi+12], 0x00666666  ; medium gray flash
+    mov eax, 0x00666666             ; medium gray flash
+    cmp dword [x11_argb_colormap], 0
+    je .rs_bell_no_alpha
+    or eax, 0xFF000000
+.rs_bell_no_alpha:
+    mov [rdi+12], eax
     lea rsi, [tmp_buf]
     mov rdx, 16
     call x11_buffer
@@ -5492,6 +5856,11 @@ render_screen:
 .rs_cursor_default:
     mov eax, [x11_white_pixel]
 .rs_cursor_color_set:
+    ; In ARGB mode the cursor pixel needs alpha=0xFF or it is invisible.
+    cmp dword [x11_argb_colormap], 0
+    je .rs_cursor_no_alpha
+    or eax, 0xFF000000
+.rs_cursor_no_alpha:
     mov [rdi+12], eax
     lea rsi, [tmp_buf]
     mov rdx, 16
@@ -5665,6 +6034,32 @@ init_palette:
 
 .ip_vals: db 0, 0x5F, 0x87, 0xAF, 0xD7, 0xFF
 
+; Apply alpha to the palette for ARGB rendering.
+; palette[0] gets cfg_opacity (the see-through bg).
+; palette[1..255] get 0xFF (fully opaque) so foreground glyphs and
+; non-default cell backgrounds stay solid.
+palette_apply_alpha:
+    push rbx
+    movzx ecx, byte [cfg_opacity]
+    shl ecx, 24
+    mov eax, [palette]
+    and eax, 0x00FFFFFF
+    or eax, ecx
+    mov [palette], eax
+    mov ebx, 1
+.paa_loop:
+    cmp ebx, 256
+    jge .paa_done
+    mov eax, [palette + rbx*4]
+    and eax, 0x00FFFFFF
+    or eax, 0xFF000000
+    mov [palette + rbx*4], eax
+    inc ebx
+    jmp .paa_loop
+.paa_done:
+    pop rbx
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Configuration loading (~/.glassrc)
 ; ══════════════════════════════════════════════════════════════════════
@@ -5829,11 +6224,11 @@ load_config:
 .lc_try_font_size:
     ; Match "font_size"
     cmp dword [rsi], 'font'
-    jne .lc_skip_line
+    jne .lc_try_opacity
     cmp dword [rsi+4], '_siz'
-    jne .lc_skip_line
+    jne .lc_try_opacity
     cmp byte [rsi+8], 'e'
-    jne .lc_skip_line
+    jne .lc_try_opacity
     add rsi, 9
     call lc_skip_to_value
     ; Parse decimal number
@@ -5851,6 +6246,43 @@ load_config:
     jmp .lc_fs_digit
 .lc_fs_done:
     mov [cfg_font_size], rax
+    jmp .lc_skip_line
+
+.lc_try_opacity:
+    ; Match "opacity"
+    cmp dword [rsi], 'opac'
+    jne .lc_skip_line
+    cmp word [rsi+4], 'it'
+    jne .lc_skip_line
+    cmp byte [rsi+6], 'y'
+    jne .lc_skip_line
+    add rsi, 7
+    call lc_skip_to_value
+    ; Parse percentage 0..100
+    xor eax, eax
+.lc_op_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_op_done
+    cmp cl, '9'
+    ja .lc_op_done
+    imul eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .lc_op_digit
+.lc_op_done:
+    cmp eax, 100
+    jbe .lc_op_clamped
+    mov eax, 100
+.lc_op_clamped:
+    ; Convert percent to 0..255: byte = pct * 255 / 100
+    imul eax, 255
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    mov [cfg_opacity], al
+    mov byte [cfg_opacity_set], 1
     jmp .lc_skip_line
 
 .lc_skip_line:
