@@ -1116,13 +1116,55 @@ x11_buffer:
 
 ; Send and receive (synchronous request)
 x11_send_recv:
+    push rbx
+    push r12
+    push r13
+    push r14
     call x11_flush
-    ; Read reply
+    ; Read first chunk
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [x11_buf]
-    mov rdx, 8192
+    mov rdx, 65536
     syscall
+    test rax, rax
+    jle .xsr_done
+    mov r12, rax              ; bytes read so far in x11_buf
+    ; If reply (type 1), drain any remaining data
+    cmp byte [x11_buf], 1
+    jne .xsr_done
+    cmp r12, 8
+    jl .xsr_done
+    mov eax, [x11_buf + 4]   ; reply length in 4-byte units
+    shl eax, 2
+    add eax, 32
+    mov r13d, eax             ; total reply size
+    cmp r12, r13              ; have all data?
+    jge .xsr_done
+    ; Drain rest of reply into the END of x11_buf (cyclic), discarding
+    mov r14, r13
+    sub r14, r12              ; bytes still to drain
+.xsr_drain:
+    test r14, r14
+    jz .xsr_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf + 60000]   ; scratch area (overwrites ok)
+    mov rdx, 4096
+    cmp rdx, r14
+    jle .xsr_drain_ok
+    mov rdx, r14
+.xsr_drain_ok:
+    syscall
+    test rax, rax
+    jle .xsr_done
+    sub r14, rax
+    jmp .xsr_drain
+.xsr_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; Open font
