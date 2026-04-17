@@ -249,6 +249,7 @@ char_height:        resw 1
 ; Keyboard (proper X11 keysym mapping)
 keysym_map:         resd 2048       ; 256 keycodes × 8 keysyms each
 keysyms_per_kc:     resd 1
+hkp_unshifted_ksym: resd 1          ; saved unshifted keysym for special checks
 
 ; Scrollback
 scroll_buf:         resb MAX_COLS * 1000 * CELL_SIZE  ; 1000 lines
@@ -2809,24 +2810,48 @@ handle_keypress:
     mov r13d, 1
 
 .hkp_lookup:
-    ; Look up keysym: keysym_map[(keycode * 8 + shift_index) * 4]
+    ; First, get unshifted keysym (index 0) for special-key checks
     mov eax, r12d
     shl eax, 3               ; keycode * 8
-    add eax, r13d            ; + shift_index
     cmp eax, 2048
     jge .hkp_done
-    mov eax, [keysym_map + rax*4]  ; keysym (CARD32)
+    mov ecx, [keysym_map + rax*4]  ; ecx = unshifted keysym
+    mov [hkp_unshifted_ksym], ecx
+
+    ; Check for Shift+Insert (XK_Insert = 0xFF63) on unshifted keysym
+    test ebx, 1                    ; Shift held?
+    jz .hkp_no_shift_insert
+    cmp ecx, 0xFF63                ; XK_Insert
+    je .hkp_paste
+.hkp_no_shift_insert:
+
+    ; Now look up the shifted/Mode_switch keysym based on modifiers
+    ; X11 state: bit 0 = Shift, bit 7 = Mod5 (AltGr/ISO_Level3_Shift)
+    mov eax, r12d
+    shl eax, 3                     ; keycode * 8
+    ; If AltGr (Mod5, bit 7) held, use group 1 (indices 4-5)
+    test ebx, 0x80
+    jz .hkp_grp0
+    add eax, 4                     ; AltGr group base
+.hkp_grp0:
+    add eax, r13d                  ; + shift_index (0 or 1)
+    cmp eax, 2048
+    jge .hkp_done
+    mov eax, [keysym_map + rax*4]
+    ; If keysym is 0 (no mapping in this group), fall back to unshifted
+    test eax, eax
+    jnz .hkp_have_ksym
+    mov eax, [hkp_unshifted_ksym]
+.hkp_have_ksym:
 
     ; Check for Ctrl+Shift+V (paste from clipboard)
-    ; Ctrl = bit 2, Shift = bit 0
     mov ecx, ebx
     and ecx, 5               ; ControlMask | ShiftMask
     cmp ecx, 5
     jne .hkp_no_paste
-    ; Check if keysym is 'v' or 'V' (0x76 or 0x56)
-    cmp eax, 0x76
+    cmp eax, 0x76            ; 'v'
     je .hkp_paste
-    cmp eax, 0x56
+    cmp eax, 0x56            ; 'V'
     je .hkp_paste
 .hkp_no_paste:
 
