@@ -5313,18 +5313,20 @@ render_screen:
     movzx r10d, byte [rax + 4] ; attrs (use r10 to preserve rax)
     and r10d, 4                ; inverse bit
     push rax                   ; preserve cell base
+    push rcx                   ; preserve char count
     push rdx
     push rsi
     push r10
     ; rbx is the col, r12 is the row
     call is_cell_selected      ; al = 1 if selected
-    movzx ecx, al
-    shl ecx, 2
+    movzx r11d, al             ; use r11 to avoid clobbering ecx
+    shl r11d, 2
     pop r10
     pop rsi
     pop rdx
+    pop rcx                    ; restore char count
     pop rax                    ; restore cell base
-    xor r10d, ecx              ; toggle inverse if selected
+    xor r10d, r11d             ; toggle inverse if selected
     test r10d, r10d
     jz .rs_no_inv_scan
     xchg edx, esi
