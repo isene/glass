@@ -2,9 +2,9 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~56KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.1-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 56KB.
+Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 58KB.
 
 No toolkit, no rendering library, no font engine. Just your keystrokes, the X11 server, and the kernel.
 
@@ -47,40 +47,53 @@ Available font sizes: 10, 13, 15, 18, 20. Colors are hex RGB.
 - 256-color palette with truecolor (24-bit) SGR mapping
 - Inverse video (SGR 7) for status bars
 - Configurable background, foreground, and cursor colors
+- Visual selection rendering (inverted cells during drag)
+- Visual bell on BEL (0x07)
+- No-flicker rendering (omits ClearArea since cells fully repaint)
 
 ### Terminal Emulation
 - VT100/xterm escape sequence parser
 - Alternate screen buffer (CSI ?1049h/l) for vim, less, man, htop
 - Scroll regions (DECSTBM) for vim splits
-- DECSET/DECRST modes: cursor visibility, autowrap, mouse tracking
+- DECSET/DECRST modes: cursor visibility, autowrap, mouse tracking, bracketed paste
 - Cursor shapes: block, underline, bar (CSI q)
 - Insert/delete lines and characters (CSI L/M/@/P/X)
-- SGR: bold, underline, inverse, 8/16/256/truecolor
+- SGR: bold, underline, inverse, 8/16/256/truecolor (24-bit mapped to 256-color cube)
 - OSC 0/2: dynamic window title
 - CSI private prefixes: ?, >, =
+- Reply-aware event parsing (variable-size replies don't misalign event stream)
 
 ### Input
 - Proper X11 keyboard mapping (GetKeyboardMapping from server)
+- AltGr (Mod5) support for international keyboard layouts (e.g., Norwegian AltGr+4 → $)
+- Latin-1 keysyms (0x00A0-0x00FF) sent as UTF-8 (e.g., AltGr+3 → £)
 - Arrow keys, Home/End, Page Up/Down, Delete, function keys
 - Ctrl and Shift modifiers
 - Mouse reporting (SGR mode 1006) for vim, tmux
 - Bracketed paste mode (CSI ?2004h/l)
-- Ctrl+Shift+V and Shift+Insert paste from clipboard
+- Ctrl+Shift+V pastes CLIPBOARD selection
+- Shift+Insert pastes PRIMARY selection (X11 tradition)
+- Ctrl+D properly exits glass when bare exits (POLLHUP detection)
 
 ### Interaction
 - Scrollback buffer (1000 lines, Shift+PageUp/Down)
-- Text selection (click and drag, X11 PRIMARY selection)
+- Text selection (click and drag, visible inverted highlight)
+- Selection populates X11 PRIMARY for paste in other apps
+- Glass responds to SelectionRequest (TARGETS, UTF8_STRING, STRING)
 - URL detection (http/https), Ctrl+click to open with xdg-open
 - PTY resize on window resize with SIGWINCH
+- Initial PTY size from screen dimensions (no 80×24 default)
+- TERM=xterm-256color set in child environment
 
 ### Architecture
 - Pure x86_64 Linux syscalls (no libc)
-- Single `.asm` source file (~6000 lines)
-- Static binary (~56KB, zero dependencies)
+- Single `.asm` source file (~6500 lines)
+- Static binary (~58KB, zero dependencies)
 - PTY management (posix_openpt, setsid, TIOCSCTTY)
 - X11 request batching (single write per frame)
 - 8-byte grid cells (UCS-2 char + fg + bg + attrs)
 - Circular scrollback buffer
+- Drains large QueryFont replies (~786KB for Unicode font) to keep socket aligned
 
 ## How It Works
 
@@ -88,15 +101,18 @@ glass connects to the X11 server via a Unix domain socket (`/tmp/.X11-unix/X0`),
 
 It opens a PTY, forks a child shell ([bare](https://github.com/isene/bare) by default), and enters an event loop polling both the X11 socket and the PTY master. Keyboard events are translated to terminal input via the server's keymap. PTY output is parsed through a VT100 state machine and rendered to an internal grid. The grid is drawn to the X11 window using batched ImageText16 requests with per-color-run optimization.
 
+Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, other apps' middle-click or Shift+Insert sends a ConvertSelection request to glass which responds with the selection text via ChangeProperty + SelectionNotify.
+
 ## Key Bindings
 
 | Key | Action |
 |-----|--------|
 | Shift+PageUp | Scroll back |
 | Shift+PageDown | Scroll forward |
-| Ctrl+Shift+V | Paste from clipboard |
-| Shift+Insert | Paste from clipboard |
+| Ctrl+Shift+V | Paste from CLIPBOARD |
+| Shift+Insert | Paste from PRIMARY (selected text) |
 | Ctrl+Click | Open URL under cursor |
+| Ctrl+D | Exit (when shell line is empty) |
 
 ## Roadmap
 
@@ -107,6 +123,10 @@ It opens a PTY, forks a child shell ([bare](https://github.com/isene/bare) by de
 - [ ] Opacity/transparency
 - [ ] WM_CLASS for window manager integration
 - [ ] Configurable key bindings
+- [ ] Cursor blink
+- [ ] OSC 8 hyperlinks
+- [ ] OSC 52 clipboard (program-initiated copy)
+- [ ] Word/line selection (double/triple click)
 
 ## The CHasm Suite
 
@@ -114,7 +134,7 @@ It opens a PTY, forks a child shell ([bare](https://github.com/isene/bare) by de
 |------|---------|--------|-------|
 | [bare](https://github.com/isene/bare) | Interactive shell | ~150KB | ~16K |
 | [show](https://github.com/isene/show) | File viewer | ~40KB | ~3.4K |
-| glass | Terminal emulator | ~56KB | ~6K |
+| glass | Terminal emulator | ~58KB | ~6.5K |
 
 All three: pure x86_64 assembly, no libc, no dependencies, direct syscalls.
 
