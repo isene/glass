@@ -176,6 +176,8 @@ shell_name:     db "bare", 0
 shell_flag:     db "-l", 0
 term_env:       db "TERM=xterm-256color", 0
 hkp_dbg_path:   db "/tmp/glass_keys.log", 0
+hkp_paste_marker: db "*** PASTE HANDLER REACHED ***", 10
+hkp_paste_marker_len equ $ - hkp_paste_marker
 
 ; Error messages
 err_x11:        db "glass: cannot connect to X11", 10
@@ -2142,6 +2144,16 @@ handle_x11_events:
     je .hxe_sel_notify
 
 .hxe_skip:
+    ; If type is 1 (Reply), advance by 32 + reply_length*4 bytes
+    cmp al, 1
+    jne .hxe_skip_event
+    ; Reply: bytes 4-7 = additional length in 4-byte units
+    mov eax, [x11_buf + rbx + 4]
+    shl eax, 2
+    add eax, 32
+    add rbx, rax
+    jmp .hxe_loop
+.hxe_skip_event:
     add rbx, 32              ; each event is 32 bytes
     jmp .hxe_loop
 
