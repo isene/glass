@@ -5310,22 +5310,22 @@ render_screen:
     ; Compute effective fg/bg for this cell (with selection XOR)
     movzx edx, byte [rax + 2]  ; cell fg
     movzx esi, byte [rax + 3]  ; cell bg
-    movzx eax, byte [rax + 4]  ; attrs
-    and eax, 4                 ; inverse bit
+    movzx r10d, byte [rax + 4] ; attrs (use r10 to preserve rax)
+    and r10d, 4                ; inverse bit
+    push rax                   ; preserve cell base
     push rdx
     push rsi
-    push rax
-    push rbx
+    push r10
     ; rbx is the col, r12 is the row
     call is_cell_selected      ; al = 1 if selected
     movzx ecx, al
     shl ecx, 2
-    pop rbx
-    pop rax
-    xor eax, ecx               ; toggle inverse if selected
+    pop r10
     pop rsi
     pop rdx
-    test eax, eax
+    pop rax                    ; restore cell base
+    xor r10d, ecx              ; toggle inverse if selected
+    test r10d, r10d
     jz .rs_no_inv_scan
     xchg edx, esi
 .rs_no_inv_scan:
