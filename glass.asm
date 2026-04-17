@@ -224,6 +224,8 @@ x11_rid_mask:       resd 1
 x11_rid_next:       resd 1
 x11_root_window:    resd 1
 x11_root_visual:    resd 1
+x11_screen_width:   resw 1
+x11_screen_height:  resw 1
 x11_root_depth:     resb 1
 x11_white_pixel:    resd 1
 x11_black_pixel:    resd 1
@@ -929,6 +931,10 @@ x11_parse_setup:
     mov [x11_white_pixel], eax
     mov eax, [r12 + 12]
     mov [x11_black_pixel], eax
+    movzx eax, word [r12 + 20]
+    mov [x11_screen_width], ax
+    movzx eax, word [r12 + 22]
+    mov [x11_screen_height], ax
     mov eax, [r12 + 32]
     mov [x11_root_visual], eax
     movzx eax, byte [r12 + 38]
@@ -1236,13 +1242,46 @@ x11_create_window:
     call alloc_xid
     mov [win_id], eax
 
-    ; Calculate window size
+    ; Calculate window size: use full screen (WM may shrink it)
+    movzx eax, word [x11_screen_width]
+    test eax, eax
+    jnz .xcw_have_w
     movzx eax, word [char_width]
     imul eax, DEFAULT_COLS
+.xcw_have_w:
     mov [win_width], rax
+    ; Compute initial grid_cols = win_width / char_width
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .xcw_skip_cols
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_COLS
+    jle .xcw_cols_ok
+    mov rax, MAX_COLS
+.xcw_cols_ok:
+    mov [grid_cols], rax
+.xcw_skip_cols:
+
+    movzx eax, word [x11_screen_height]
+    test eax, eax
+    jnz .xcw_have_h
     movzx eax, word [char_height]
     imul eax, DEFAULT_ROWS
+.xcw_have_h:
     mov [win_height], rax
+    ; Compute initial grid_rows = win_height / char_height
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .xcw_skip_rows
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_ROWS
+    jle .xcw_rows_ok
+    mov rax, MAX_ROWS
+.xcw_rows_ok:
+    mov [grid_rows], rax
+.xcw_skip_rows:
 
     ; Build CreateWindow request
     lea rdi, [tmp_buf]
