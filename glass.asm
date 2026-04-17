@@ -2475,6 +2475,9 @@ handle_x11_events:
     xor edx, edx
     div ecx
     mov [sel_end_row], rax
+    ; Trigger re-render to show selection visually
+    call render_screen
+    call x11_flush
 .hxe_mn_done:
     pop r12
     pop rbx
@@ -4962,6 +4965,58 @@ scroll_view_down:
     pop rbx
     ret
 
+; Returns AL=1 if (r12=row, rbx=col) is in current selection range.
+; Preserves all registers except rax.
+is_cell_selected:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    cmp qword [sel_active], 0
+    je .ics_no
+    ; Normalize start/end so (start_row, start_col) <= (end_row, end_col)
+    mov rcx, [sel_start_row]
+    mov rdx, [sel_start_col]
+    mov rsi, [sel_end_row]
+    mov rdi, [sel_end_col]
+    cmp rcx, rsi
+    jl .ics_normalized
+    jg .ics_swap
+    cmp rdx, rdi
+    jle .ics_normalized
+.ics_swap:
+    xchg rcx, rsi
+    xchg rdx, rdi
+.ics_normalized:
+    ; rcx=start_row, rdx=start_col, rsi=end_row, rdi=end_col
+    ; Check (r12, rbx) >= (start_row, start_col)
+    cmp r12, rcx
+    jl .ics_no
+    jg .ics_check_end
+    cmp rbx, rdx
+    jl .ics_no
+.ics_check_end:
+    ; Check (r12, rbx) <= (end_row, end_col)
+    cmp r12, rsi
+    jg .ics_no
+    jl .ics_yes
+    cmp rbx, rdi
+    jg .ics_no
+.ics_yes:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    mov al, 1
+    ret
+.ics_no:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    xor al, al
+    ret
+
 ; Extract selected text from grid into sel_buf
 ; Walks from sel_start to sel_end, extracting characters
 selection_extract:
@@ -5218,14 +5273,23 @@ render_screen:
     cmp r13, [grid_cols]
     jge .rs_next_row
 
-    ; Get effective fg/bg of cell (apply inverse attr)
+    ; Get effective fg/bg of cell (apply inverse attr + selection)
     mov rax, [rs_row_base]
     mov rdx, r13
     imul rdx, CELL_SIZE
     add rax, rdx
     movzx r14d, byte [rax + 2]  ; fg (offset +2)
     movzx r15d, byte [rax + 3]  ; bg (offset +3)
-    test byte [rax + 4], 4      ; inverse bit in attrs?
+    movzx edx, byte [rax + 4]   ; attrs
+    and edx, 4                  ; inverse bit
+    ; XOR with selection state at (r12, r13)
+    push rbx
+    mov rbx, r13
+    call is_cell_selected       ; al = 1 if selected
+    pop rbx
+    movzx eax, al
+    shl eax, 2                  ; al<<2 maps 1->4
+    xor edx, eax                ; toggle inverse
     jz .rs_no_inv_start
     xchg r14d, r15d             ; swap fg/bg for inverse
 .rs_no_inv_start:
@@ -5243,10 +5307,25 @@ render_screen:
     mov rdx, rbx
     imul rdx, CELL_SIZE
     add rax, rdx
-    ; Compute effective fg/bg for this cell
+    ; Compute effective fg/bg for this cell (with selection XOR)
     movzx edx, byte [rax + 2]  ; cell fg
     movzx esi, byte [rax + 3]  ; cell bg
-    test byte [rax + 4], 4     ; inverse?
+    movzx eax, byte [rax + 4]  ; attrs
+    and eax, 4                 ; inverse bit
+    push rdx
+    push rsi
+    push rax
+    push rbx
+    ; rbx is the col, r12 is the row
+    call is_cell_selected      ; al = 1 if selected
+    movzx ecx, al
+    shl ecx, 2
+    pop rbx
+    pop rax
+    xor eax, ecx               ; toggle inverse if selected
+    pop rsi
+    pop rdx
+    test eax, eax
     jz .rs_no_inv_scan
     xchg edx, esi
 .rs_no_inv_scan:
