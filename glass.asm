@@ -60,6 +60,7 @@
 %define X11_SEND_EVENT        25
 %define X11_CHANGE_WINDOW_ATTRS2 2
 %define X11_GET_PROPERTY      20
+%define X11_GET_GEOMETRY      14
 
 ; X11 event types
 %define EV_KEY_PRESS        2
@@ -361,6 +362,11 @@ bracketed_paste:    resq 1          ; 1 = bracketed paste mode
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
+bell_flash_until:   resq 1          ; CLOCK_REALTIME nanoseconds
+cursor_blink_state: resq 1          ; 0 = invisible, 1 = visible
+last_blink_time:    resq 1          ; nanoseconds of last toggle
+dirty_rows:         resb 256        ; per-row dirty flags (1 = needs redraw)
+all_dirty:          resq 1          ; 1 = full redraw needed
 
 ; OSC title
 osc_buf:            resb 256
@@ -467,6 +473,9 @@ _start:
 
     ; Flush all pending X11 requests
     call x11_flush
+
+    ; Query actual window geometry (window manager may have maximized)
+    call x11_get_geometry
 
     ; Open PTY
     call pty_open
@@ -1370,6 +1379,80 @@ x11_map_window:
     inc dword [x11_seq]
     ret
 
+; Query actual window geometry (size after WM may have resized/maximized)
+; Updates win_width, win_height, grid_cols, grid_rows
+x11_get_geometry:
+    push rbx
+    ; Build GetGeometry request: opcode=14, length=2, drawable
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_GEOMETRY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [win_id]
+    mov [rdi+4], eax
+
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+
+    ; Read reply (32 bytes)
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .xgg_done
+    ; Verify it's a reply (byte 0 = 1)
+    cmp byte [x11_buf], 1
+    jne .xgg_done
+
+    ; Reply: byte 8-11 = root, 12-13 = x, 14-15 = y,
+    ;        16-17 = width, 18-19 = height, 20-21 = border, 22 = depth
+    movzx eax, word [x11_buf + 16]
+    test eax, eax
+    jz .xgg_done
+    mov [win_width], rax
+    movzx eax, word [x11_buf + 18]
+    test eax, eax
+    jz .xgg_done
+    mov [win_height], rax
+    ; Compute grid_cols = win_width / char_width
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .xgg_done
+    mov rax, [win_width]
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_COLS
+    jle .xgg_cols_ok
+    mov rax, MAX_COLS
+.xgg_cols_ok:
+    test rax, rax
+    jz .xgg_done
+    mov [grid_cols], rax
+    mov [prev_grid_cols], rax
+    ; Compute grid_rows = win_height / char_height
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .xgg_done
+    mov rax, [win_height]
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_ROWS
+    jle .xgg_rows_ok
+    mov rax, MAX_ROWS
+.xgg_rows_ok:
+    test rax, rax
+    jz .xgg_done
+    mov [grid_rows], rax
+    mov [prev_grid_rows], rax
+.xgg_done:
+    pop rbx
+    ret
+
 ; Set WM hints (title, delete window protocol)
 x11_set_wm_hints:
     push rbx
@@ -1772,10 +1855,12 @@ pty_fork:
     xor edx, edx
     syscall
 
-    ; Set window size
+    ; Set window size from current grid dimensions (set by x11_get_geometry)
     sub rsp, 8
-    mov word [rsp], DEFAULT_ROWS
-    mov word [rsp+2], DEFAULT_COLS
+    movzx eax, word [grid_rows]
+    mov word [rsp], ax
+    movzx eax, word [grid_cols]
+    mov word [rsp+2], ax
     mov word [rsp+4], 0
     mov word [rsp+6], 0
     mov rax, SYS_IOCTL
@@ -2969,7 +3054,7 @@ vt_process:
     cmp al, 9                ; TAB
     je .vtp_tab
     cmp al, 7                ; BEL
-    je .vtp_loop             ; ignore
+    je .vtp_bel
     cmp al, 0x20
     jb .vtp_loop             ; ignore other control chars
 
@@ -3081,6 +3166,24 @@ vt_process:
     dec rax
 .vtp_tab_ok:
     mov [cursor_col], rax
+    jmp .vtp_loop
+
+.vtp_bel:
+    ; Visual bell: set bell_flash_until = now + 100ms
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    xor edi, edi             ; CLOCK_REALTIME
+    mov rsi, rsp
+    syscall
+    ; Convert sec*1e9 + nsec
+    mov rax, [rsp]
+    imul rax, 1000000000
+    add rax, [rsp + 8]
+    add rax, 100000000       ; +100ms
+    mov [bell_flash_until], rax
+    ; Force redraw to show flash
+    mov qword [all_dirty], 1
+    add rsp, 16
     jmp .vtp_loop
 
 .vtp_esc:
@@ -4863,6 +4966,57 @@ render_screen:
     push r14
     push r15
 
+    ; Check visual bell - if active, fill window with bell color first
+    cmp qword [bell_flash_until], 0
+    jz .rs_no_bell
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    xor edi, edi
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    imul rax, 1000000000
+    add rax, [rsp + 8]
+    add rsp, 16
+    cmp rax, [bell_flash_until]
+    jl .rs_bell_active
+    mov qword [bell_flash_until], 0
+    jmp .rs_no_bell
+.rs_bell_active:
+    ; Set GC fg to bright color for fill
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    mov dword [rdi+12], 0x00666666  ; medium gray flash
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; PolyFillRectangle covering entire window
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], 0
+    mov word [rdi+14], 0
+    mov eax, [win_width]
+    mov word [rdi+16], ax
+    mov eax, [win_height]
+    mov word [rdi+18], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    jmp .rs_after_clear
+.rs_no_bell:
     ; Clear window first
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CLEAR_AREA
@@ -4878,6 +5032,7 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+.rs_after_clear:
 
     ; Draw each row with per-color-run rendering
     ; When scroll_offset > 0, top rows come from scrollback buffer
