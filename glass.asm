@@ -175,6 +175,7 @@ pts_prefix:     db "/dev/pts/", 0
 shell_name:     db "bare", 0
 shell_flag:     db "-l", 0
 term_env:       db "TERM=xterm-256color", 0
+hkp_dbg_path:   db "/tmp/glass_keys.log", 0
 
 ; Error messages
 err_x11:        db "glass: cannot connect to X11", 10
@@ -250,6 +251,7 @@ char_height:        resw 1
 keysym_map:         resd 2048       ; 256 keycodes × 8 keysyms each
 keysyms_per_kc:     resd 1
 hkp_unshifted_ksym: resd 1          ; saved unshifted keysym for special checks
+hkp_dbg_buf:        resb 64         ; debug buffer for keypress log
 
 ; Scrollback
 scroll_buf:         resb MAX_COLS * 1000 * CELL_SIZE  ; 1000 lines
@@ -2055,10 +2057,13 @@ event_loop:
     mov word [poll_fds + 6], 0
 
 .ev_check_pty:
-    ; Check PTY output
+    ; Check PTY output (POLLIN | POLLHUP | POLLERR)
     movzx eax, word [poll_fds + 14]
-    test eax, POLLIN
+    test eax, 0x19           ; POLLIN(1) | POLLERR(8) | POLLHUP(16)
     jz .ev_loop
+    ; If POLLHUP/POLLERR without POLLIN, child died
+    test eax, POLLIN
+    jz .ev_child_died
     mov word [poll_fds + 14], 0
 
     ; Read PTY output
@@ -6134,6 +6139,36 @@ itoa:
     dec ecx
     jnz .itoa_pop
     mov byte [rbx + rax], 0
+    pop rcx
+    pop rbx
+    ret
+
+; hkp_dbg_itoa: rax = number, rdi = output (advances rdi).
+; Preserves all registers except rax, rdi, rdx.
+hkp_dbg_itoa:
+    push rbx
+    push rcx
+    push r8
+    mov rbx, rdi
+    xor ecx, ecx
+    mov r8, 10
+.hi_div:
+    xor edx, edx
+    div r8
+    add dl, '0'
+    push rdx
+    inc ecx
+    test rax, rax
+    jnz .hi_div
+    xor eax, eax
+.hi_pop:
+    pop rdx
+    mov [rbx + rax], dl
+    inc eax
+    dec ecx
+    jnz .hi_pop
+    add rdi, rax
+    pop r8
     pop rcx
     pop rbx
     ret
