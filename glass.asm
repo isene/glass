@@ -5242,21 +5242,8 @@ render_screen:
     inc dword [x11_seq]
     jmp .rs_after_clear
 .rs_no_bell:
-    ; Clear window first
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_CLEAR_AREA
-    mov byte [rdi+1], 0      ; exposures = false
-    mov word [rdi+2], 4      ; length
-    mov eax, [win_id]
-    mov [rdi+4], eax
-    mov word [rdi+8], 0      ; x
-    mov word [rdi+10], 0     ; y
-    mov word [rdi+12], 0     ; width = 0 (entire window)
-    mov word [rdi+14], 0     ; height = 0
-    lea rsi, [tmp_buf]
-    mov rdx, 16
-    call x11_buffer
-    inc dword [x11_seq]
+    ; Skip ClearArea - cells fully cover the grid area via ImageText16
+    ; backgrounds. ClearArea was causing flicker during selection drag.
 .rs_after_clear:
 
     ; Draw each row with per-color-run rendering
