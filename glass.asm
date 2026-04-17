@@ -2819,10 +2819,11 @@ handle_keypress:
     mov [hkp_unshifted_ksym], ecx
 
     ; Check for Shift+Insert (XK_Insert = 0xFF63) on unshifted keysym
+    ; Shift+Insert pastes from PRIMARY selection (X11 tradition)
     test ebx, 1                    ; Shift held?
     jz .hkp_no_shift_insert
     cmp ecx, 0xFF63                ; XK_Insert
-    je .hkp_paste
+    je .hkp_paste_primary
 .hkp_no_shift_insert:
 
     ; Now look up the shifted/Mode_switch keysym based on modifiers
@@ -2860,6 +2861,27 @@ handle_keypress:
     cmp eax, 0xFF00
     jge .hkp_special
 
+    ; Latin-1 supplement (0x00A0-0x00FF) - encode as UTF-8 2-byte
+    cmp eax, 0xA0
+    jb .hkp_check_ascii
+    cmp eax, 0xFF
+    ja .hkp_done
+    ; 2-byte UTF-8: 110xxxxx 10xxxxxx
+    mov ecx, eax
+    shr ecx, 6               ; high 2 bits → first byte low bits
+    or ecx, 0xC0
+    mov [key_out_buf], cl
+    and eax, 0x3F            ; low 6 bits
+    or eax, 0x80
+    mov [key_out_buf+1], al
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 2
+    syscall
+    jmp .hkp_done
+
+.hkp_check_ascii:
     ; XK_space (0xFF20 handled below in special, but also 0x0020)
     cmp eax, 0x20
     je .hkp_ascii
@@ -3064,6 +3086,12 @@ handle_keypress:
 
 .hkp_paste:
     ; Request CLIPBOARD selection via ConvertSelection
+    mov ecx, [clipboard_atom]
+    jmp .hkp_paste_send
+.hkp_paste_primary:
+    ; Request PRIMARY selection
+    mov ecx, [primary_atom]
+.hkp_paste_send:
     ; ConvertSelection: opcode=24, pad, length=6
     ; requestor, selection, target, property, time
     lea rdi, [tmp_buf]
@@ -3072,8 +3100,7 @@ handle_keypress:
     mov word [rdi+2], 6              ; length
     mov eax, [win_id]
     mov [rdi+4], eax                 ; requestor
-    mov eax, [clipboard_atom]
-    mov [rdi+8], eax                 ; selection = CLIPBOARD
+    mov [rdi+8], ecx                 ; selection (CLIPBOARD or PRIMARY)
     mov eax, [utf8_string_atom]
     mov [rdi+12], eax                ; target = UTF8_STRING
     mov eax, [glass_sel_atom]
