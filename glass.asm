@@ -367,6 +367,7 @@ cursor_blink_state: resq 1          ; 0 = invisible, 1 = visible
 last_blink_time:    resq 1          ; nanoseconds of last toggle
 dirty_rows:         resb 256        ; per-row dirty flags (1 = needs redraw)
 all_dirty:          resq 1          ; 1 = full redraw needed
+child_forked:       resq 1          ; 1 if child has been forked
 
 ; OSC title
 osc_buf:            resb 256
@@ -474,18 +475,10 @@ _start:
     ; Flush all pending X11 requests
     call x11_flush
 
-    ; Query actual window geometry (window manager may have maximized)
-    call x11_get_geometry
-
-    ; Open PTY
+    ; Open PTY (but don't fork yet - wait for first ConfigureNotify)
     call pty_open
     test rax, rax
     jnz .die_pty
-
-    ; Fork child
-    call pty_fork
-    test rax, rax
-    jnz .die_fork
 
     ; Enter event loop
     jmp event_loop
@@ -1989,14 +1982,30 @@ event_loop:
     mov word [poll_fds + 14], 0
 
 .ev_loop:
-    ; Poll
+    ; Poll: short timeout if child not yet forked (fallback)
+    cmp qword [child_forked], 0
+    jne .ev_poll_normal
+    mov edx, 200              ; 200ms timeout to fork fallback
+    jmp .ev_do_poll
+.ev_poll_normal:
+    mov rdx, -1               ; infinite timeout
+.ev_do_poll:
     mov rax, SYS_POLL
     lea rdi, [poll_fds]
     mov rsi, 2                ; nfds
-    mov rdx, -1               ; timeout = infinite
     syscall
     test rax, rax
-    jle .ev_loop              ; error or timeout, retry
+    jg .ev_check_x11
+    ; Timeout or error
+    cmp qword [child_forked], 0
+    jne .ev_loop
+    ; Fork now with current dimensions
+    mov qword [child_forked], 1
+    push rbx
+    call pty_fork
+    pop rbx
+    jmp .ev_loop
+.ev_check_x11:
 
     ; Check X11 events
     movzx eax, word [poll_fds + 6]
@@ -2170,6 +2179,17 @@ handle_x11_events:
     mov rdx, rsp
     syscall
     add rsp, 8
+    ; If child not yet forked, fork it now (with correct dimensions)
+    cmp qword [child_forked], 0
+    jne .hxe_cfg_send_winch
+    mov qword [child_forked], 1
+    push rbx
+    push r12
+    call pty_fork
+    pop r12
+    pop rbx
+    jmp .hxe_cfg_done
+.hxe_cfg_send_winch:
     ; Send SIGWINCH to child process group
     mov rax, SYS_KILL
     mov rdi, [child_pid]
