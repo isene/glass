@@ -338,6 +338,7 @@ cfg_opacity_set:    resb 1
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
 cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
 cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
+row_wrapped:        resb MAX_ROWS    ; 1 = row N's last char wrapped to N+1
 osc8_uri_offsets:   resd 256        ; offset in osc8_uris per link id
 osc8_uris:          resb 4096       ; null-terminated URIs from OSC 8
 osc8_uris_pos:      resq 1          ; next free byte in osc8_uris
@@ -5101,6 +5102,10 @@ grid_put_char:
     ; Check autowrap
     cmp qword [autowrap], 0
     je .gpc_clamp             ; no wrap: stay at last column
+    ; Mark current row as wrapping to the next so selection_extract can
+    ; treat the visual rows as one logical line for copy.
+    mov rax, [cursor_row]
+    mov byte [row_wrapped + rax], 1
     ; Wrap to next line
     xor eax, eax
     mov [cursor_col], rax
@@ -5144,6 +5149,15 @@ grid_clear:
     inc rbx
     jmp .gc_loop
 .gc_done:
+    ; Reset wrap flags for all rows
+    xor rbx, rbx
+.gc_wrap_reset:
+    cmp rbx, MAX_ROWS
+    jge .gc_wrap_done
+    mov byte [row_wrapped + rbx], 0
+    inc rbx
+    jmp .gc_wrap_reset
+.gc_wrap_done:
     pop r12
     pop rbx
     ret
@@ -5205,6 +5219,14 @@ grid_clear_line:
     inc rbx
     jmp .gcl_loop
 .gcl_done:
+    ; Clearing a line breaks any wrap that ended on it.
+    mov rax, [cursor_row]
+    mov byte [row_wrapped + rax], 0
+    test rax, rax
+    jz .gcl_no_prev
+    dec rax
+    mov byte [row_wrapped + rax], 0
+.gcl_no_prev:
     pop rbx
     ret
 
@@ -5361,12 +5383,26 @@ grid_scroll_up:
     add r12, [grid_cols]
 .gsu_clear:
     cmp rbx, r12
-    jge .gsu_done
+    jge .gsu_clear_done
     mov rax, rbx
     imul rax, CELL_SIZE
     mov qword [grid + rax], 0x0000000000070020
     inc rbx
     jmp .gsu_clear
+.gsu_clear_done:
+    ; Shift wrap flags up: row_wrapped[i] = row_wrapped[i+1]
+    xor rbx, rbx
+    mov r12, [grid_rows]
+    dec r12
+.gsu_wrap_shift:
+    cmp rbx, r12
+    jge .gsu_wrap_done
+    movzx eax, byte [row_wrapped + rbx + 1]
+    mov [row_wrapped + rbx], al
+    inc rbx
+    jmp .gsu_wrap_shift
+.gsu_wrap_done:
+    mov byte [row_wrapped + r12], 0
 .gsu_done:
     pop r12
     pop rbx
@@ -5585,7 +5621,7 @@ selection_extract:
     jmp .se_col_loop
 
 .se_row_end:
-    ; Add newline at end of each row (except last)
+    ; Add newline at end of each row (except last).
     cmp r12, [sel_end_row]
     je .se_row_next
     ; Trim trailing spaces before adding newline
