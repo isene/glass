@@ -5851,7 +5851,7 @@ render_screen:
 .rs_run_scan:
     cmp rbx, [grid_cols]
     jge .rs_run_draw
-    cmp ecx, 255             ; ImageText16 max
+    cmp ecx, 254             ; PolyText16 max m (255 = font-change marker)
     jge .rs_run_draw
     mov rax, [rs_row_base]
     mov rdx, rbx
