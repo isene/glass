@@ -65,6 +65,11 @@
 %define X11_GET_IMAGE         73
 %define X11_GET_SELECTION_OWNER 23
 %define X11_TRANSLATE_COORDINATES 40
+%define X11_CREATE_PIXMAP     53
+%define X11_FREE_PIXMAP       54
+%define X11_PUT_IMAGE         72
+%define X11_POLY_TEXT_16      75
+%define CW_BACK_PIXMAP        0x00000001
 
 ; X11 event types
 %define EV_KEY_PRESS        2
@@ -252,6 +257,20 @@ pseudo_bg_pixel:    resd 1          ; cached blended pseudo-bg color
 pseudo_bg_set:      resb 1          ; 1 if pseudo-transparency active
 pseudo_setup_done:  resb 1          ; one-shot guard for setup call
 compositor_active:  resb 1          ; 1 if a compositor owns _NET_WM_CM_S0
+bg_pixmap_id:       resd 1          ; server-side wallpaper-blended pixmap
+bg_pixmap_w:        resd 1          ; width the pixmap was built for
+bg_pixmap_h:        resd 1          ; height the pixmap was built for
+pseudo_full:        resb 1          ; 1 = per-pixel pseudo-transparency active
+pseudo_root_pmap:   resd 1
+pseudo_root_x:      resd 1
+pseudo_root_y:      resd 1
+pseudo_strip_h:     resd 1
+pseudo_strip_pixels:resd 1
+pseudo_data_bytes:  resd 1
+pseudo_pi_words:    resd 1
+pseudo_wp_w:        resd 1
+pseudo_bg_w:        resd 1
+pseudo_total_bytes: resd 1
 
 ; Our resources
 win_id:             resd 1
@@ -2506,14 +2525,18 @@ handle_x11_events:
     mov rsi, SIGWINCH
     syscall
 .hxe_cfg_done:
-    ; First time we know our screen position: sample wallpaper there.
+    ; First ConfigureNotify: do the wallpaper sample + blend. WMs often
+    ; emit a burst of CNs at startup (initial map plus reparenting); we
+    ; don't want to re-run this expensive path for each, otherwise we
+    ; starve the PTY read in the event loop.
+    cmp byte [cfg_opacity_set], 1
+    jne .hxe_cfg_no_pseudo
+    cmp byte [compositor_active], 1
+    je .hxe_cfg_no_pseudo
     cmp byte [pseudo_setup_done], 0
     jne .hxe_cfg_no_pseudo
     mov byte [pseudo_setup_done], 1
     call setup_pseudo_transparency
-    cmp byte [pseudo_bg_set], 0
-    je .hxe_cfg_no_pseudo
-    ; Force a redraw so the new palette[0] takes visible effect.
     call render_screen
     call x11_flush
 .hxe_cfg_no_pseudo:
@@ -5649,6 +5672,29 @@ render_screen:
     push r14
     push r15
 
+    ; In pseudo-transparency mode, ImageText16's bg fill is replaced
+    ; with PolyText16 for default-bg cells, so previous frame's text
+    ; and the previous cursor block don't get painted over. Clear the
+    ; whole window first to repaint the wallpaper-tinted BackPixmap;
+    ; cells then redraw cleanly on top.
+    cmp byte [pseudo_full], 1
+    jne .rs_no_pseudo_clear
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CLEAR_AREA
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov word [rdi+8], 0
+    mov word [rdi+10], 0
+    mov word [rdi+12], 0
+    mov word [rdi+14], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_no_pseudo_clear:
+
     ; Check visual bell - if active, fill window with bell color first
     cmp qword [bell_flash_until], 0
     jz .rs_no_bell
@@ -5873,7 +5919,17 @@ render_screen:
     inc dword [x11_seq]
     pop rcx
 
-    ; ImageText16
+    ; If pseudo-transparency is active and this run uses the default
+    ; background (palette index 0), draw the text without filling the
+    ; background so the wallpaper-tinted BackPixmap shows through.
+    cmp byte [pseudo_full], 1
+    jne .rs_imagetext
+    test r15d, r15d
+    jne .rs_imagetext
+    jmp .rs_polytext
+
+.rs_imagetext:
+    ; ImageText16 (text + bg fill)
     push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_IMAGE_TEXT16
@@ -5925,7 +5981,62 @@ render_screen:
     lea rsi, [tmp_buf]
     call x11_buffer
     inc dword [x11_seq]
+    jmp .rs_after_text
 
+.rs_polytext:
+    ; PolyText16 (text only, no bg fill). One TEXTITEM16:
+    ;   byte m, byte delta=0, then 2*m CHAR2B bytes.
+    ; Body bytes after header = 2 + 2*m, padded to 4-byte boundary.
+    push rcx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_TEXT_16
+    mov byte [rdi+1], 0
+    ; request length = (16 + 2 + 2*m + 3) / 4
+    mov eax, ecx
+    shl eax, 1
+    add eax, 16 + 2 + 3
+    shr eax, 2
+    mov word [rdi+2], ax
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    mov rax, r13
+    movzx edx, word [char_width]
+    imul eax, edx
+    mov word [rdi+12], ax
+    movzx eax, word [char_height]
+    imul eax, r12d
+    movzx edx, word [font_ascent]
+    add eax, edx
+    mov word [rdi+14], ax
+    mov byte [rdi+16], cl    ; m
+    mov byte [rdi+17], 0     ; delta
+    ; Copy 2*m CHAR2B bytes from tmp_buf+20 to tmp_buf+18
+    pop rcx
+    push rcx
+    mov eax, ecx
+    shl eax, 1
+    xor edx, edx
+.rs_pt_cp:
+    cmp edx, eax
+    jge .rs_pt_send
+    movzx esi, byte [tmp_buf + 20 + rdx]
+    mov [tmp_buf + 18 + rdx], sil
+    inc edx
+    jmp .rs_pt_cp
+.rs_pt_send:
+    pop rcx
+    mov eax, ecx
+    shl eax, 1
+    add eax, 16 + 2 + 3
+    and eax, ~3
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+
+.rs_after_text:
     ; Advance to next run
     mov r13, rbx
     jmp .rs_run_start
@@ -6297,6 +6408,9 @@ setup_pseudo_transparency:
     test r12d, r12d
     jz .spt_done
 
+    ; r12 = root pixmap id (kept across the rest of the routine)
+    mov [pseudo_root_pmap], r12d
+
     ; --- TranslateCoordinates(win_id, root, 0, 0) -> root_x, root_y
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_TRANSLATE_COORDINATES
@@ -6317,19 +6431,92 @@ setup_pseudo_transparency:
     call x11_drain_until_reply
     test rax, rax
     js .spt_done
-    movzx r13d, word [x11_buf + 12]
-    movzx r14d, word [x11_buf + 14]
+    movzx eax, word [x11_buf + 12]
+    mov [pseudo_root_x], eax
+    movzx eax, word [x11_buf + 14]
+    mov [pseudo_root_y], eax
 
-    ; --- GetImage(root_pixmap, root_x, root_y, 32, 32, 0xFFFFFFFF, ZPixmap)
+    ; --- (Re)create server pixmap if window size changed -------------
+    mov eax, [win_width]
+    mov ecx, [win_height]
+    cmp eax, [bg_pixmap_w]
+    jne .spt_recreate
+    cmp ecx, [bg_pixmap_h]
+    jne .spt_recreate
+    cmp dword [bg_pixmap_id], 0
+    jne .spt_pixmap_ready
+.spt_recreate:
+    cmp dword [bg_pixmap_id], 0
+    je .spt_alloc_new
+    ; FreePixmap the old one
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_FREE_PIXMAP
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [bg_pixmap_id]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+.spt_alloc_new:
+    call alloc_xid
+    mov [bg_pixmap_id], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov al, [x11_root_depth]
+    mov byte [rdi+1], al
+    mov word [rdi+2], 4
+    mov eax, [bg_pixmap_id]
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax                     ; drawable (matches depth)
+    mov eax, [win_width]
+    mov word [rdi+12], ax
+    mov eax, [win_height]
+    mov word [rdi+14], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov eax, [win_width]
+    mov [bg_pixmap_w], eax
+    mov eax, [win_height]
+    mov [bg_pixmap_h], eax
+.spt_pixmap_ready:
+    call x11_flush
+
+    ; --- Strip-by-strip wallpaper fetch + blend + upload --------------
+    ; strip_h = 8 rows: GetImage reply data = win_w * 8 * 4 bytes,
+    ; comfortably under the 64KB x11_buf for any sane width.
+    xor r12d, r12d                       ; current y in window
+.spt_strip:
+    cmp r12d, [win_height]
+    jge .spt_strips_done
+    mov ecx, [win_height]
+    sub ecx, r12d
+    cmp ecx, 8
+    jle .spt_strip_h_ok
+    mov ecx, 8
+.spt_strip_h_ok:
+    mov [pseudo_strip_h], ecx
+
+    ; GetImage(root_pmap, root_x+0, root_y+r12, win_w, strip_h)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_GET_IMAGE
-    mov byte [rdi+1], 2
+    mov byte [rdi+1], 2                  ; ZPixmap
     mov word [rdi+2], 5
-    mov [rdi+4], r12d
-    mov word [rdi+8], r13w
-    mov word [rdi+10], r14w
-    mov word [rdi+12], 32
-    mov word [rdi+14], 32
+    mov eax, [pseudo_root_pmap]
+    mov [rdi+4], eax
+    mov eax, [pseudo_root_x]
+    mov word [rdi+8], ax
+    mov eax, [pseudo_root_y]
+    add eax, r12d
+    mov word [rdi+10], ax
+    mov eax, [win_width]
+    mov word [rdi+12], ax
+    mov eax, [pseudo_strip_h]
+    mov word [rdi+14], ax
     mov dword [rdi+16], 0xFFFFFFFF
     lea rsi, [tmp_buf]
     mov rdx, 20
@@ -6341,82 +6528,161 @@ setup_pseudo_transparency:
     test rax, rax
     js .spt_done
 
-    ; Average R,G,B over the 1024 pixels at offset 32. Pixel is BGRX
-    ; on x86 little-endian for 24/32-bit visuals (the common case).
-    xor r12d, r12d           ; sum R
-    xor r13d, r13d           ; sum G
-    xor r14d, r14d           ; sum B
-    mov ecx, 1024
-    lea rsi, [x11_buf + 32]
-.spt_avg:
-    movzx eax, byte [rsi]
-    add r14d, eax
-    movzx eax, byte [rsi+1]
-    add r13d, eax
-    movzx eax, byte [rsi+2]
-    add r12d, eax
+    ; Blend strip in place: bytes B,G,R,X per pixel.
+    mov eax, [win_width]
+    mul dword [pseudo_strip_h]
+    mov [pseudo_strip_pixels], eax       ; pixel count for this strip
+    mov ecx, eax                         ; loop counter (pixels)
+    test ecx, ecx
+    jz .spt_strip_blended
+    movzx ebx, byte [cfg_opacity]        ; bg weight
+    mov edx, 255
+    sub edx, ebx                         ; wp weight
+    mov [pseudo_wp_w], edx
+    mov [pseudo_bg_w], ebx
+    mov r13d, [cfg_bg_pixel]
+    lea rsi, [x11_buf + 32]              ; first pixel
+.spt_blend_pixel:
+    ; B = (wp_B * wp_w + bg_B * bg_w) / 255
+    movzx eax, byte [rsi]                ; wp B
+    imul eax, [pseudo_wp_w]
+    mov edi, r13d
+    and edi, 0xFF                        ; bg B
+    imul edi, [pseudo_bg_w]
+    add eax, edi
+    mov edi, 255
+    xor edx, edx
+    div edi
+    mov [rsi], al
+    ; G
+    movzx eax, byte [rsi + 1]
+    imul eax, [pseudo_wp_w]
+    mov edi, r13d
+    shr edi, 8
+    and edi, 0xFF
+    imul edi, [pseudo_bg_w]
+    add eax, edi
+    mov edi, 255
+    xor edx, edx
+    div edi
+    mov [rsi + 1], al
+    ; R
+    movzx eax, byte [rsi + 2]
+    imul eax, [pseudo_wp_w]
+    mov edi, r13d
+    shr edi, 16
+    and edi, 0xFF
+    imul edi, [pseudo_bg_w]
+    add eax, edi
+    mov edi, 255
+    xor edx, edx
+    div edi
+    mov [rsi + 2], al
     add rsi, 4
     dec ecx
-    jnz .spt_avg
-    shr r12d, 10             ; / 1024
-    shr r13d, 10
-    shr r14d, 10
+    jnz .spt_blend_pixel
+.spt_strip_blended:
 
-    ; Blend each component: result = (wp * (255-opacity) + bg * opacity) / 255
-    ; Cache: r15d = bg pixel
-    mov r15d, [cfg_bg_pixel]
-    movzx ebx, byte [cfg_opacity]        ; ebx = opacity (bg weight)
+    ; PutImage(bg_pixmap, gc, win_w, strip_h, 0, r12, 0, depth, data)
+    ; request length in 4-byte words = (24 + data_bytes_padded) / 4
+    ; data_bytes = pixel_count * 4 (already 4-aligned)
+    mov eax, [pseudo_strip_pixels]
+    shl eax, 2                           ; data bytes
+    mov [pseudo_data_bytes], eax
+    add eax, 24                          ; + header
+    add eax, 3
+    and eax, ~3
+    mov edi, eax
+    shr edi, 2                           ; words
+    mov [pseudo_pi_words], edi
+    ; Build PutImage header in place (bytes 0..23) just before data
+    ; The data already lives at x11_buf+32, so put header at x11_buf+8
+    ; so it sits contiguously with the pixel data.
+    lea rdi, [x11_buf + 8]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2                  ; ZPixmap
+    mov ax, [pseudo_pi_words + 0]
+    mov word [rdi+2], ax
+    mov eax, [bg_pixmap_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    mov eax, [win_width]
+    mov word [rdi+12], ax
+    mov eax, [pseudo_strip_h]
+    mov word [rdi+14], ax
+    mov word [rdi+16], 0                 ; dst-x
+    mov ax, r12w
+    mov word [rdi+18], ax                ; dst-y
+    mov byte [rdi+20], 0                 ; left-pad
+    mov al, [x11_root_depth]
+    mov byte [rdi+21], al
+    mov word [rdi+22], 0                 ; pad
+    ; Send header (24 bytes) + data (pseudo_data_bytes) directly. The
+    ; data alone can be 60+ KB which overruns the 16 KB x11_write_buf
+    ; if routed via x11_buffer. Flush any pending buffered requests
+    ; first to keep ordering, then write straight to the socket.
+    call x11_flush
+    mov eax, [pseudo_data_bytes]
+    add eax, 24
+    mov [pseudo_total_bytes], eax
+    mov r13d, 0                          ; bytes sent so far
+.spt_pi_send_loop:
+    mov eax, [pseudo_total_bytes]
+    sub eax, r13d
+    test eax, eax
+    jle .spt_pi_send_done
+    mov rdx, rax
+    lea rsi, [x11_buf + 8]
+    add rsi, r13
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    test rax, rax
+    jle .spt_pi_send_done                ; abort on EAGAIN/error
+    add r13d, eax
+    jmp .spt_pi_send_loop
+.spt_pi_send_done:
+    inc dword [x11_seq]
 
-    ; Helper inlined three times (R, G, B). Keep results on the stack.
-    ; --- R ---
-    mov eax, r15d
-    shr eax, 16
-    and eax, 0xFF
-    imul eax, ebx                         ; bg_R * opacity
-    mov ecx, 255
-    sub ecx, ebx                          ; 255 - opacity
-    imul ecx, r12d                        ; wp_R * (255-opacity)
-    add eax, ecx
-    mov ecx, 255
-    xor edx, edx
-    div ecx
-    push rax                              ; save R
-    ; --- G ---
-    mov eax, r15d
-    shr eax, 8
-    and eax, 0xFF
-    imul eax, ebx
-    mov ecx, 255
-    sub ecx, ebx
-    imul ecx, r13d
-    add eax, ecx
-    mov ecx, 255
-    xor edx, edx
-    div ecx
-    push rax                              ; save G
-    ; --- B ---
-    mov eax, r15d
-    and eax, 0xFF
-    imul eax, ebx
-    mov ecx, 255
-    sub ecx, ebx
-    imul ecx, r14d
-    add eax, ecx
-    mov ecx, 255
-    xor edx, edx
-    div ecx                               ; eax = B
-    pop rsi                               ; G
-    shl rsi, 8
-    or rax, rsi
-    pop rsi                               ; R
-    shl rsi, 16
-    or rax, rsi
+    add r12d, [pseudo_strip_h]
+    jmp .spt_strip
+.spt_strips_done:
 
-    ; Apply: palette[0] becomes the blended pixel; remember in case the
-    ; renderer path needs it later.
-    mov [pseudo_bg_pixel], eax
+    ; --- Set window's background pixmap and clear to apply ----------
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], CW_BACK_PIXMAP
+    mov eax, [bg_pixmap_id]
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; ClearArea entire window so the new BackPixmap shows immediately
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CLEAR_AREA
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov word [rdi+8], 0
+    mov word [rdi+10], 0
+    mov word [rdi+12], 0                 ; w=0 means "to right edge"
+    mov word [rdi+14], 0                 ; h=0 means "to bottom edge"
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+
+    mov byte [pseudo_full], 1
     mov byte [pseudo_bg_set], 1
-    mov [palette], eax
 
 .spt_done:
     pop r15

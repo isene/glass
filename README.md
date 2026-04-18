@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.3-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.4-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 58KB.
 
@@ -38,13 +38,14 @@ opacity = 80
 Available font sizes: 10, 13, 15, 18, 20. Colors are hex RGB.
 `opacity` is a 0..100 percentage (100 = opaque, default). Values
 below 100 prefer a 32-bit ARGB visual when a compositor (picom,
-compton, KWin, Mutter, etc.) is detected via `_NET_WM_CM_S0` —
-that gives true per-pixel see-through. With no compositor, glass
-falls back to a wallpaper-tint: it samples the desktop wallpaper
-behind the window, averages it, blends with the configured `bg`,
-and uses that as the cell background. The result color-matches
-the wallpaper area but is a solid tint (not actually see-through).
-Without a configured `opacity`, none of this code runs.
+compton, KWin, Mutter, etc.) is detected via `_NET_WM_CM_S0` — that
+gives true per-pixel see-through. With no compositor, glass reads
+the desktop wallpaper from `_XROOTPMAP_ID`, samples it strip by
+strip behind the window, blends each pixel with the configured
+`bg` using `opacity`, uploads the blended bitmap as the window's
+background pixmap, and switches the renderer to PolyText16 for
+default-bg cells so the wallpaper texture shows through. Without
+a configured `opacity`, none of this code runs.
 
 ## Features
 
