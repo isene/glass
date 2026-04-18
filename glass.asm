@@ -62,6 +62,9 @@
 %define X11_GET_PROPERTY      20
 %define X11_GET_GEOMETRY      14
 %define X11_CREATE_COLORMAP   78
+%define X11_GET_IMAGE         73
+%define X11_GET_SELECTION_OWNER 23
+%define X11_TRANSLATE_COORDINATES 40
 
 ; X11 event types
 %define EV_KEY_PRESS        2
@@ -142,6 +145,10 @@ targets_str:      db "TARGETS", 0
 targets_len       equ 7
 glass_sel_str:    db "GLASS_SEL", 0
 glass_sel_len     equ 9
+xrootpmap_str:    db "_XROOTPMAP_ID", 0
+xrootpmap_len     equ 13
+netwm_cm_str:     db "_NET_WM_CM_S0", 0
+netwm_cm_len      equ 13
 
 ; Window title
 win_title:      db "glass", 0
@@ -239,6 +246,12 @@ x11_min_keycode:    resb 1
 x11_max_keycode:    resb 1
 x11_argb_visual:    resd 1          ; 32-bit TrueColor visual ID (0 if none)
 x11_argb_colormap:  resd 1          ; colormap for ARGB visual (0 if none)
+xrootpmap_atom:     resd 1          ; _XROOTPMAP_ID
+netwm_cm_atom:      resd 1          ; _NET_WM_CM_S0 (compositor selection)
+pseudo_bg_pixel:    resd 1          ; cached blended pseudo-bg color
+pseudo_bg_set:      resb 1          ; 1 if pseudo-transparency active
+pseudo_setup_done:  resb 1          ; one-shot guard for setup call
+compositor_active:  resb 1          ; 1 if a compositor owns _NET_WM_CM_S0
 
 ; Our resources
 win_id:             resd 1
@@ -469,6 +482,17 @@ _start:
 
     ; Get keyboard mapping from server
     call x11_get_keymap
+
+    ; If the user asked for opacity, find out whether a compositor owns
+    ; _NET_WM_CM_S0; this decides whether CreateWindow uses the ARGB32
+    ; visual (real per-pixel transparency) or stays opaque so that
+    ; setup_pseudo_transparency can take over. Skipped entirely when
+    ; opacity is not configured, so opaque-only configs pay no
+    ; X11 round-trip cost.
+    cmp byte [cfg_opacity_set], 1
+    jne .start_no_compositor_check
+    call check_compositor
+.start_no_compositor_check:
 
     ; Build dynamic font name if font_size configured
     call setup_font_name
@@ -1167,6 +1191,63 @@ x11_buffer:
     ret
 
 ; Send and receive (synchronous request)
+; x11_drain_until_reply: read from x11_fd into x11_buf until a reply
+; (type 1) lands. Events (type 2..127) that arrive in the meantime are
+; discarded — fine while we're inside a one-shot setup, missed events
+; are recovered by the next render and the next event-loop poll.
+; Returns rax = 0 on success, -1 on read failure or X11 error reply.
+x11_drain_until_reply:
+    push r12
+    push r13
+.xdr_read_hdr:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .xdr_fail
+    movzx eax, byte [x11_buf]
+    test al, al
+    jz .xdr_fail                  ; X11 error
+    cmp al, 1
+    jne .xdr_read_hdr             ; event, drop and retry
+    ; Reply: drain any extra bytes (reply length in 4-byte units at +4)
+    mov eax, [x11_buf + 4]
+    shl eax, 2
+    test eax, eax
+    jz .xdr_done
+    mov r12, rax                  ; remaining bytes
+    mov r13, 32                   ; current write offset
+.xdr_extra:
+    test r12, r12
+    jz .xdr_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    add rsi, r13
+    mov rdx, r12
+    cmp rdx, 32768
+    jle .xdr_extra_ok
+    mov rdx, 32768
+.xdr_extra_ok:
+    syscall
+    test rax, rax
+    jle .xdr_fail
+    sub r12, rax
+    add r13, rax
+    jmp .xdr_extra
+.xdr_done:
+    xor eax, eax
+    pop r13
+    pop r12
+    ret
+.xdr_fail:
+    mov rax, -1
+    pop r13
+    pop r12
+    ret
+
 x11_send_recv:
     push rbx
     push r12
@@ -1383,9 +1464,14 @@ x11_create_window:
 .xcw_skip_rows:
 
     ; Decide whether to use the ARGB32 visual for transparency.
-    ; Conditions: opacity configured, opacity < 255, ARGB visual found.
-    ; The transparent flag lives in [x11_argb_colormap] (0 = simple path,
-    ; nonzero = ARGB) so it survives across syscalls in x11_create_colormap.
+    ; Conditions: opacity configured, opacity < 255, ARGB visual found,
+    ; AND a compositor is running (else alpha bits are stored but
+    ; ignored on display, so we'd just look opaque). Without a
+    ; compositor we leave the visual alone and let
+    ; setup_pseudo_transparency tint palette[0] from the wallpaper.
+    ; The "transparent path taken" flag lives in [x11_argb_colormap]
+    ; (0 = simple path, nonzero = ARGB) so it survives across syscalls
+    ; in x11_create_colormap.
     cmp byte [cfg_opacity_set], 1
     jne .xcw_pick_visual
     movzx eax, byte [cfg_opacity]
@@ -1393,6 +1479,8 @@ x11_create_window:
     jae .xcw_pick_visual
     cmp dword [x11_argb_visual], 0
     je .xcw_pick_visual
+    cmp byte [compositor_active], 1
+    jne .xcw_pick_visual
     call x11_create_colormap
     call palette_apply_alpha
 .xcw_pick_visual:
@@ -2418,6 +2506,17 @@ handle_x11_events:
     mov rsi, SIGWINCH
     syscall
 .hxe_cfg_done:
+    ; First time we know our screen position: sample wallpaper there.
+    cmp byte [pseudo_setup_done], 0
+    jne .hxe_cfg_no_pseudo
+    mov byte [pseudo_setup_done], 1
+    call setup_pseudo_transparency
+    cmp byte [pseudo_bg_set], 0
+    je .hxe_cfg_no_pseudo
+    ; Force a redraw so the new palette[0] takes visible effect.
+    call render_screen
+    call x11_flush
+.hxe_cfg_no_pseudo:
     pop r12
     pop rbx
     add rbx, 32
@@ -6034,6 +6133,299 @@ init_palette:
 
 .ip_vals: db 0, 0x5F, 0x87, 0xAF, 0xD7, 0xFF
 
+; check_compositor: intern _NET_WM_CM_S0 and read its owner. Sets
+; [compositor_active] = 1 if a compositor owns the selection.
+check_compositor:
+    push rbx
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (netwm_cm_len + 3) / 4
+    mov word [rdi+4], netwm_cm_len
+    mov word [rdi+6], 0
+    lea rsi, [netwm_cm_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.cc_cp:
+    cmp ecx, netwm_cm_len
+    jge .cc_send
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .cc_cp
+.cc_send:
+    mov eax, netwm_cm_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .cc_done
+    mov eax, [x11_buf + 8]
+    test eax, eax
+    jz .cc_done
+    mov [netwm_cm_atom], eax
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .cc_done
+    mov eax, [x11_buf + 8]
+    test eax, eax
+    jz .cc_done
+    mov byte [compositor_active], 1
+.cc_done:
+    pop rbx
+    ret
+
+; Pseudo-transparency setup: when no real compositor is running, sample
+; the desktop wallpaper at the window's screen position, average it, and
+; blend with the configured bg. The resulting solid color is used as
+; palette[0] so glass color-matches the area behind it. This gives a
+; "tint" effect rather than true per-pixel see-through transparency, but
+; needs no compositor and no renderer changes.
+;
+; Skipped if:
+;   - opacity not configured or = 100
+;   - the ARGB visual path was already taken (real transparency available)
+;   - a compositor owns _NET_WM_CM_S0 (real transparency will work)
+;   - root window has no _XROOTPMAP_ID (no wallpaper)
+setup_pseudo_transparency:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    cmp byte [cfg_opacity_set], 1
+    jne .spt_done
+    movzx eax, byte [cfg_opacity]
+    cmp eax, 255
+    jae .spt_done
+    cmp dword [x11_argb_colormap], 0
+    jne .spt_done                       ; ARGB path took it
+    cmp byte [compositor_active], 1
+    je .spt_done                        ; real transparency available, skip
+    call x11_flush
+
+    ; --- Intern _XROOTPMAP_ID and read root pixmap ID ---------------
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (xrootpmap_len + 3) / 4
+    mov word [rdi+4], xrootpmap_len
+    mov word [rdi+6], 0
+    lea rsi, [xrootpmap_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.spt_cp_rp:
+    cmp ecx, xrootpmap_len
+    jge .spt_send_rp
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .spt_cp_rp
+.spt_send_rp:
+    mov eax, xrootpmap_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    test rax, rax
+    js .spt_done
+    mov eax, [x11_buf + 8]
+    test eax, eax
+    jz .spt_done
+    mov [xrootpmap_atom], eax
+
+    ; GetProperty(root, _XROOTPMAP_ID, AnyPropertyType, 0, 1)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov eax, [xrootpmap_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0
+    mov dword [rdi+16], 0
+    mov dword [rdi+20], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    test rax, rax
+    js .spt_done
+    mov eax, [x11_buf + 16]              ; value-length
+    test eax, eax
+    jz .spt_done
+    mov r12d, [x11_buf + 32]             ; root pixmap id
+    test r12d, r12d
+    jz .spt_done
+
+    ; --- TranslateCoordinates(win_id, root, 0, 0) -> root_x, root_y
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_TRANSLATE_COORDINATES
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [x11_root_window]
+    mov [rdi+8], eax
+    mov word [rdi+12], 0
+    mov word [rdi+14], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    test rax, rax
+    js .spt_done
+    movzx r13d, word [x11_buf + 12]
+    movzx r14d, word [x11_buf + 14]
+
+    ; --- GetImage(root_pixmap, root_x, root_y, 32, 32, 0xFFFFFFFF, ZPixmap)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_IMAGE
+    mov byte [rdi+1], 2
+    mov word [rdi+2], 5
+    mov [rdi+4], r12d
+    mov word [rdi+8], r13w
+    mov word [rdi+10], r14w
+    mov word [rdi+12], 32
+    mov word [rdi+14], 32
+    mov dword [rdi+16], 0xFFFFFFFF
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    test rax, rax
+    js .spt_done
+
+    ; Average R,G,B over the 1024 pixels at offset 32. Pixel is BGRX
+    ; on x86 little-endian for 24/32-bit visuals (the common case).
+    xor r12d, r12d           ; sum R
+    xor r13d, r13d           ; sum G
+    xor r14d, r14d           ; sum B
+    mov ecx, 1024
+    lea rsi, [x11_buf + 32]
+.spt_avg:
+    movzx eax, byte [rsi]
+    add r14d, eax
+    movzx eax, byte [rsi+1]
+    add r13d, eax
+    movzx eax, byte [rsi+2]
+    add r12d, eax
+    add rsi, 4
+    dec ecx
+    jnz .spt_avg
+    shr r12d, 10             ; / 1024
+    shr r13d, 10
+    shr r14d, 10
+
+    ; Blend each component: result = (wp * (255-opacity) + bg * opacity) / 255
+    ; Cache: r15d = bg pixel
+    mov r15d, [cfg_bg_pixel]
+    movzx ebx, byte [cfg_opacity]        ; ebx = opacity (bg weight)
+
+    ; Helper inlined three times (R, G, B). Keep results on the stack.
+    ; --- R ---
+    mov eax, r15d
+    shr eax, 16
+    and eax, 0xFF
+    imul eax, ebx                         ; bg_R * opacity
+    mov ecx, 255
+    sub ecx, ebx                          ; 255 - opacity
+    imul ecx, r12d                        ; wp_R * (255-opacity)
+    add eax, ecx
+    mov ecx, 255
+    xor edx, edx
+    div ecx
+    push rax                              ; save R
+    ; --- G ---
+    mov eax, r15d
+    shr eax, 8
+    and eax, 0xFF
+    imul eax, ebx
+    mov ecx, 255
+    sub ecx, ebx
+    imul ecx, r13d
+    add eax, ecx
+    mov ecx, 255
+    xor edx, edx
+    div ecx
+    push rax                              ; save G
+    ; --- B ---
+    mov eax, r15d
+    and eax, 0xFF
+    imul eax, ebx
+    mov ecx, 255
+    sub ecx, ebx
+    imul ecx, r14d
+    add eax, ecx
+    mov ecx, 255
+    xor edx, edx
+    div ecx                               ; eax = B
+    pop rsi                               ; G
+    shl rsi, 8
+    or rax, rsi
+    pop rsi                               ; R
+    shl rsi, 16
+    or rax, rsi
+
+    ; Apply: palette[0] becomes the blended pixel; remember in case the
+    ; renderer path needs it later.
+    mov [pseudo_bg_pixel], eax
+    mov byte [pseudo_bg_set], 1
+    mov [palette], eax
+
+.spt_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; Apply alpha to the palette for ARGB rendering.
 ; palette[0] gets cfg_opacity (the see-through bg).
 ; palette[1..255] get 0xFF (fully opaque) so foreground glyphs and
@@ -6696,6 +7088,7 @@ itoa:
     pop rcx
     pop rbx
     ret
+
 
 ; hkp_dbg_itoa: rax = number, rdi = output (advances rdi).
 ; Preserves all registers except rax, rdi, rdx.
