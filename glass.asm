@@ -3847,6 +3847,44 @@ vt_process:
     je .vtp_osc_set_title
     cmp rax, 8
     je .vtp_osc_8
+    cmp rax, 52
+    je .vtp_osc_52
+    jmp .vtp_loop
+
+.vtp_osc_52:
+    ; osc_buf = "spec;base64data". Find first ';'.
+    xor ecx, ecx
+.vtp_osc52_find_sep:
+    cmp ecx, [osc_pos]
+    jge .vtp_loop
+    cmp byte [osc_buf + rcx], ';'
+    je .vtp_osc52_data_at
+    inc ecx
+    jmp .vtp_osc52_find_sep
+.vtp_osc52_data_at:
+    inc ecx                       ; first byte of base64 data
+    mov rdx, [osc_pos]
+    sub rdx, rcx                  ; data length
+    test rdx, rdx
+    jz .vtp_loop                  ; empty: ignore (clear semantics not implemented)
+    cmp byte [osc_buf + rcx], '?'
+    je .vtp_loop                  ; query: we don't reply
+    ; Decode straight into sel_buf.
+    lea rdi, [osc_buf + rcx]
+    lea rsi, [sel_buf]
+    mov rcx, rdx
+    call b64_decode
+    test rax, rax
+    jz .vtp_loop
+    cmp rax, 16384
+    jle .vtp_osc52_len_ok
+    mov rax, 16384
+.vtp_osc52_len_ok:
+    mov [sel_len], rax
+    ; Claim both PRIMARY and CLIPBOARD so middle-click and Ctrl-V both
+    ; pick up what the program just wrote.
+    call selection_claim_primary
+    call selection_claim_clipboard
     jmp .vtp_loop
 
 .vtp_osc_8:
@@ -5813,6 +5851,123 @@ selection_claim_primary:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
+    ret
+
+; selection_claim_clipboard: SetSelectionOwner on CLIPBOARD (interned).
+; No-op if the clipboard atom didn't intern.
+selection_claim_clipboard:
+    cmp dword [clipboard_atom], 0
+    je .scc_done
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [clipboard_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.scc_done:
+    ret
+
+; b64_decode: rdi = src, rcx = src_len, rsi = dst.
+; Returns rax = number of bytes written. Skips whitespace and '=' pad,
+; ignores any other invalid character. No clobber of caller-saved regs
+; beyond the standard ABI.
+b64_decode:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rcx                  ; src_len (rcx is reused for shift counts)
+    xor r12, r12                  ; out position
+    xor rbx, rbx                  ; in position
+.b64d_loop:
+    xor r13, r13                  ; 24-bit accumulator
+    xor r14d, r14d                ; valid char count (0..4)
+.b64d_chunk:
+    cmp r14, 4
+    jge .b64d_emit
+    cmp rbx, r15
+    jge .b64d_emit
+    movzx eax, byte [rdi + rbx]
+    inc rbx
+    cmp al, 'A'
+    jb .b64d_check_digit
+    cmp al, 'Z'
+    jbe .b64d_upper
+    cmp al, 'a'
+    jb .b64d_chunk
+    cmp al, 'z'
+    ja .b64d_chunk
+    sub eax, 'a' - 26
+    jmp .b64d_have
+.b64d_upper:
+    sub eax, 'A'
+    jmp .b64d_have
+.b64d_check_digit:
+    cmp al, '0'
+    jb .b64d_check_special
+    cmp al, '9'
+    ja .b64d_chunk
+    sub eax, '0' - 52
+    jmp .b64d_have
+.b64d_check_special:
+    cmp al, '+'
+    jne .b64d_check_slash
+    mov eax, 62
+    jmp .b64d_have
+.b64d_check_slash:
+    cmp al, '/'
+    jne .b64d_chunk
+    mov eax, 63
+.b64d_have:
+    shl r13, 6
+    or r13, rax
+    inc r14
+    jmp .b64d_chunk
+.b64d_emit:
+    cmp r14, 1
+    jle .b64d_done
+    cmp r14, 4
+    je .b64d_full
+    mov rax, 4
+    sub rax, r14
+    mov rcx, rax
+    imul rcx, 6
+    shl r13, cl
+.b64d_full:
+    mov rax, r13
+    shr rax, 16
+    mov [rsi + r12], al
+    inc r12
+    cmp r14, 2
+    je .b64d_check_more
+    mov rax, r13
+    shr rax, 8
+    mov [rsi + r12], al
+    inc r12
+    cmp r14, 3
+    je .b64d_check_more
+    mov rax, r13
+    mov [rsi + r12], al
+    inc r12
+.b64d_check_more:
+    cmp rbx, r15
+    jl .b64d_loop
+.b64d_done:
+    mov rax, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
