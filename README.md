@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.7-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.7-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~75KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 58KB.
 
@@ -104,7 +104,7 @@ a configured `opacity`, none of this code runs.
 
 ### Architecture
 - Pure x86_64 Linux syscalls (no libc)
-- Single `.asm` source file (~6500 lines)
+- Single `.asm` source file (~8000 lines)
 - Static binary (~58KB, zero dependencies)
 - PTY management (posix_openpt, setsid, TIOCSCTTY)
 - X11 request batching (single write per frame)
@@ -147,7 +147,7 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 |------|---------|--------|-------|
 | [bare](https://github.com/isene/bare) | Interactive shell | ~150KB | ~16K |
 | [show](https://github.com/isene/show) | File viewer | ~40KB | ~3.4K |
-| glass | Terminal emulator | ~58KB | ~6.5K |
+| glass | Terminal emulator | ~75KB | ~8K |
 
 All three: pure x86_64 assembly, no libc, no dependencies, direct syscalls.
 
