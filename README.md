@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.5-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.6-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~58KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 58KB.
 
@@ -33,9 +33,12 @@ fg = #c0caf5
 cursor = #f7768e
 font_size = 13
 opacity = 80
+cursor_blink = 500
 ```
 
 Available font sizes: 10, 13, 15, 18, 20. Colors are hex RGB.
+`cursor_blink` is the toggle interval in milliseconds (omit or set
+to `0` for a steady cursor).
 `opacity` is a 0..100 percentage (100 = opaque, default). Values
 below 100 prefer a 32-bit ARGB visual when a compositor (picom,
 compton, KWin, Mutter, etc.) is detected via `_NET_WM_CM_S0` — that
@@ -94,6 +97,7 @@ a configured `opacity`, none of this code runs.
 - Selection populates X11 PRIMARY for paste in other apps
 - Glass responds to SelectionRequest (TARGETS, UTF8_STRING, STRING)
 - URL detection (http/https), Ctrl+click to open with xdg-open
+- OSC 8 hyperlinks (`ESC ] 8 ; params ; URI ESC \\`); Ctrl+click opens URI
 - PTY resize on window resize with SIGWINCH
 - Initial PTY size from screen dimensions (no 80×24 default)
 - TERM=xterm-256color set in child environment
@@ -136,8 +140,6 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 - [ ] Opacity/transparency
 - [ ] WM_CLASS for window manager integration
 - [ ] Configurable key bindings
-- [ ] Cursor blink
-- [ ] OSC 8 hyperlinks
 - [ ] OSC 52 clipboard (program-initiated copy)
 
 ## The CHasm Suite

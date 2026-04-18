@@ -335,6 +335,13 @@ cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
 cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
 cfg_opacity_set:    resb 1
+cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
+cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
+cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
+osc8_uri_offsets:   resd 256        ; offset in osc8_uris per link id
+osc8_uris:          resb 4096       ; null-terminated URIs from OSC 8
+osc8_uris_pos:      resq 1          ; next free byte in osc8_uris
+osc8_count:         resq 1          ; number of distinct URIs registered
 cfg_buf:            resb 4096
 
 ; Selection atoms
@@ -469,6 +476,7 @@ _start:
     mov qword [grid_cols], DEFAULT_COLS
     mov qword [grid_rows], DEFAULT_ROWS
     mov qword [cursor_visible], 1
+    mov qword [cursor_blink_state], 1
     mov qword [autowrap], 1
     mov qword [alt_screen_active], 0
     mov qword [mouse_tracking], 0
@@ -2297,29 +2305,70 @@ event_loop:
     mov word [poll_fds + 14], 0
 
 .ev_loop:
-    ; Poll: short timeout if child not yet forked (fallback)
+    ; Poll: short timeout if child not yet forked (fallback), else use the
+    ; cursor-blink interval if set, else infinite.
     cmp qword [child_forked], 0
     jne .ev_poll_normal
     mov edx, 200              ; 200ms timeout to fork fallback
     jmp .ev_do_poll
 .ev_poll_normal:
-    mov rdx, -1               ; infinite timeout
+    cmp qword [cfg_blink_ms], 0
+    je .ev_poll_infinite
+    cmp qword [cursor_visible], 0
+    je .ev_poll_infinite
+    ; Compute remaining ms until next blink toggle
+    call click_now_ms
+    mov rcx, [cursor_blink_until]
+    sub rcx, rax
+    test rcx, rcx
+    jg .ev_blink_timeout_ok
+    mov rcx, 1                ; due now-ish, fire next iteration
+.ev_blink_timeout_ok:
+    cmp rcx, [cfg_blink_ms]
+    jle .ev_blink_timeout_set
+    mov rcx, [cfg_blink_ms]
+.ev_blink_timeout_set:
+    mov rdx, rcx
+    jmp .ev_do_poll
+.ev_poll_infinite:
+    mov rdx, -1
 .ev_do_poll:
     mov rax, SYS_POLL
     lea rdi, [poll_fds]
     mov rsi, 2                ; nfds
     syscall
     test rax, rax
-    jg .ev_check_x11
+    jg .ev_check_blink
     ; Timeout or error
     cmp qword [child_forked], 0
-    jne .ev_loop
+    jne .ev_check_blink
     ; Fork now with current dimensions
     mov qword [child_forked], 1
     push rbx
     call pty_fork
     pop rbx
     jmp .ev_loop
+.ev_check_blink:
+    ; Even if a real fd event woke us, see if the blink timer expired so
+    ; the cursor doesn't drift visually.
+    cmp qword [cfg_blink_ms], 0
+    je .ev_check_x11
+    cmp qword [cursor_visible], 0
+    je .ev_check_x11
+    push rax
+    call click_now_ms
+    mov rcx, rax
+    pop rax
+    cmp rcx, [cursor_blink_until]
+    jl .ev_check_x11
+    ; Toggle state and rearm
+    xor qword [cursor_blink_state], 1
+    add rcx, [cfg_blink_ms]
+    mov [cursor_blink_until], rcx
+    push rax
+    call render_screen
+    call x11_flush
+    pop rax
 .ev_check_x11:
 
     ; Check X11 events
@@ -3795,6 +3844,74 @@ vt_process:
     je .vtp_osc_set_title
     cmp rax, 2
     je .vtp_osc_set_title
+    cmp rax, 8
+    je .vtp_osc_8
+    jmp .vtp_loop
+
+.vtp_osc_8:
+    ; osc_buf = "params;URI" (already null-terminated)
+    ; Find the first ';' to skip params; URI follows.
+    xor ecx, ecx
+.vtp_osc8_find_sep:
+    cmp ecx, [osc_pos]
+    jge .vtp_osc8_no_sep
+    cmp byte [osc_buf + rcx], ';'
+    je .vtp_osc8_uri_at
+    inc ecx
+    jmp .vtp_osc8_find_sep
+.vtp_osc8_no_sep:
+    ; No semicolon: malformed, treat as end-of-link
+    mov byte [cur_osc8_id], 0
+    jmp .vtp_loop
+.vtp_osc8_uri_at:
+    inc ecx                     ; ecx = offset of first URI byte
+    mov rdx, [osc_pos]
+    sub rdx, rcx                ; URI length
+    test rdx, rdx
+    jz .vtp_osc8_close
+    ; Allocate next link id (1..255). Wrap when full.
+    mov rax, [osc8_count]
+    inc rax
+    cmp rax, 255
+    jbe .vtp_osc8_id_ok
+    mov rax, 1
+    mov qword [osc8_uris_pos], 0
+.vtp_osc8_id_ok:
+    mov [osc8_count], rax
+    mov byte [cur_osc8_id], al
+    ; Cap URI length at 511 to keep things sane.
+    cmp rdx, 511
+    jle .vtp_osc8_uri_len_ok
+    mov rdx, 511
+.vtp_osc8_uri_len_ok:
+    ; Bail if remaining osc8_uris space is insufficient (need rdx + 1 bytes)
+    mov r8, [osc8_uris_pos]
+    mov r9, r8
+    add r9, rdx
+    inc r9
+    cmp r9, 4096
+    jle .vtp_osc8_uri_room
+    mov byte [cur_osc8_id], 0    ; out of room, drop
+    jmp .vtp_loop
+.vtp_osc8_uri_room:
+    ; offsets[id] = current pos
+    mov [osc8_uri_offsets + rax*4], r8d
+    ; Copy URI bytes from osc_buf+rcx (length rdx) into osc8_uris+r8
+    xor r10d, r10d
+.vtp_osc8_uri_cp:
+    cmp r10, rdx
+    jge .vtp_osc8_uri_done
+    movzx r11d, byte [osc_buf + rcx + r10]
+    mov [osc8_uris + r8 + r10], r11b
+    inc r10
+    jmp .vtp_osc8_uri_cp
+.vtp_osc8_uri_done:
+    mov byte [osc8_uris + r8 + rdx], 0
+    inc rdx
+    add [osc8_uris_pos], rdx
+    jmp .vtp_loop
+.vtp_osc8_close:
+    mov byte [cur_osc8_id], 0
     jmp .vtp_loop
 
 .vtp_osc_set_title:
@@ -4973,6 +5090,8 @@ grid_put_char:
     mov [grid + rbx + 3], cl         ; bg
     movzx ecx, byte [cur_attrs]
     mov [grid + rbx + 4], cl         ; attrs
+    movzx ecx, byte [cur_osc8_id]
+    mov [grid + rbx + 5], cl         ; OSC 8 hyperlink id (0 = none)
 
     ; Advance cursor
     mov rax, [cursor_col]
@@ -5760,7 +5879,7 @@ render_screen:
     xor r12, r12             ; display row
 .rs_row:
     cmp r12, [grid_rows]
-    jge .rs_cursor
+    jge .rs_after_rows
 
     ; Compute row base pointer accounting for scrollback
     mov rax, [scroll_offset]
@@ -6045,10 +6164,104 @@ render_screen:
     inc r12
     jmp .rs_row
 
+.rs_after_rows:
+    ; OSC 8 hyperlink underline pass: scan grid for cells whose link id
+    ; is non-zero and draw an underline per contiguous span. Done as
+    ; a separate pass so it doesn't perturb the per-color text-run logic.
+    xor r12, r12
+.rs_link_row:
+    cmp r12, [grid_rows]
+    jge .rs_link_done
+    xor r13, r13
+.rs_link_scan:
+    cmp r13, [grid_cols]
+    jge .rs_link_next_row
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx ecx, byte [grid + rax + 5]
+    test ecx, ecx
+    jnz .rs_link_span
+    inc r13
+    jmp .rs_link_scan
+.rs_link_span:
+    mov r14, r13                 ; span start col
+    movzx r15d, byte [grid + rax + 2]   ; fg of first cell (used for line color)
+.rs_link_extend:
+    inc r13
+    cmp r13, [grid_cols]
+    jge .rs_link_draw
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx eax, byte [grid + rax + 5]
+    cmp eax, ecx
+    jne .rs_link_draw
+    jmp .rs_link_extend
+.rs_link_draw:
+    ; ChangeGC fg = palette[r15]
+    push rcx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    mov eax, [palette + r15*4]
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; PolyFillRect at (r14*char_w, (r12+1)*char_h - 1, span_w*char_w, 1)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    mov rax, r14
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+12], ax
+    mov rax, r12
+    inc rax
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    sub eax, 2
+    mov word [rdi+14], ax
+    mov rax, r13
+    sub rax, r14
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+16], ax
+    mov word [rdi+18], 2
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rcx
+    jmp .rs_link_scan
+.rs_link_next_row:
+    inc r12
+    jmp .rs_link_row
+.rs_link_done:
+
 .rs_cursor:
     ; Skip cursor drawing if cursor_visible == 0
     cmp qword [cursor_visible], 0
     je .rs_cursor_done
+    ; Skip if blink is on and we're in the hidden phase
+    cmp qword [cfg_blink_ms], 0
+    je .rs_cursor_no_blink
+    cmp qword [cursor_blink_state], 0
+    je .rs_cursor_done
+.rs_cursor_no_blink:
 
     ; Draw cursor at cursor position
     lea rdi, [tmp_buf]
@@ -6864,11 +7077,20 @@ load_config:
     jmp .lc_skip_line
 
 .lc_try_cursor:
-    ; Match "cursor"
+    ; Match "cursor" but NOT "cursor_blink" (which we handle separately)
     cmp dword [rsi], 'curs'
     jne .lc_try_font_size
     cmp word [rsi+4], 'or'
     jne .lc_try_font_size
+    movzx eax, byte [rsi+6]
+    cmp al, ' '
+    je .lc_cursor_color
+    cmp al, 9
+    je .lc_cursor_color
+    cmp al, '='
+    je .lc_cursor_color
+    jmp .lc_try_font_size           ; not "cursor", try next
+.lc_cursor_color:
     add rsi, 6
     call lc_skip_to_value
     cmp byte [rsi], '#'
@@ -6882,11 +7104,11 @@ load_config:
 .lc_try_font_size:
     ; Match "font_size"
     cmp dword [rsi], 'font'
-    jne .lc_try_opacity
+    jne .lc_try_blink
     cmp dword [rsi+4], '_siz'
-    jne .lc_try_opacity
+    jne .lc_try_blink
     cmp byte [rsi+8], 'e'
-    jne .lc_try_opacity
+    jne .lc_try_blink
     add rsi, 9
     call lc_skip_to_value
     ; Parse decimal number
@@ -6904,6 +7126,34 @@ load_config:
     jmp .lc_fs_digit
 .lc_fs_done:
     mov [cfg_font_size], rax
+    jmp .lc_skip_line
+
+.lc_try_blink:
+    ; Match "cursor_blink"
+    cmp dword [rsi], 'curs'
+    jne .lc_try_opacity
+    cmp dword [rsi+4], 'or_b'
+    jne .lc_try_opacity
+    cmp word [rsi+8], 'li'
+    jne .lc_try_opacity
+    cmp word [rsi+10], 'nk'
+    jne .lc_try_opacity
+    add rsi, 12
+    call lc_skip_to_value
+    xor eax, eax
+.lc_blink_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_blink_done
+    cmp cl, '9'
+    ja .lc_blink_done
+    imul eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .lc_blink_digit
+.lc_blink_done:
+    mov [cfg_blink_ms], rax
     jmp .lc_skip_line
 
 .lc_try_opacity:
@@ -7254,6 +7504,37 @@ url_open_at:
     push r13
     mov r12, rdi             ; row
     mov r13, rsi             ; col
+
+    ; First, check if this cell has an OSC 8 hyperlink id.
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx eax, byte [grid + rax + 5]
+    test eax, eax
+    jz .uoa_no_osc8
+    ; Look up URI offset (must survive the upcoming syscall, so park it
+    ; in r13 — we no longer need the col after this point).
+    mov r13d, [osc8_uri_offsets + rax*4]
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jnz .uoa_done            ; parent done
+    sub rsp, 32
+    lea rax, [xdg_open]
+    mov [rsp], rax
+    lea rax, [osc8_uris + r13]
+    mov [rsp+8], rax
+    mov qword [rsp+16], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [xdg_open]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+    mov rdi, 1
+    mov rax, SYS_EXIT
+    syscall
+.uoa_no_osc8:
 
     xor rbx, rbx             ; url index
 .uoa_loop:
