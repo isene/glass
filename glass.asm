@@ -3795,7 +3795,20 @@ vt_process:
 .vtp_start_csi:
     mov qword [vt_state], VT_CSI
     mov qword [vt_param_count], 0
-    mov dword [vt_params], 0
+    ; Zero the whole vt_params array (16 dwords = 64 bytes). Just zeroing
+    ; the first dword leaves stale params from previous CSIs, which bit
+    ; us with `[H` reading vt_params[1]=49 left over from a preceding
+    ; `[39;49m`, sending the cursor to col 48 instead of col 0.
+    push rdi
+    push rcx
+    push rax
+    lea rdi, [vt_params]
+    mov ecx, 16
+    xor eax, eax
+    rep stosd
+    pop rax
+    pop rcx
+    pop rdi
     mov byte [vt_private], 0
     jmp .vtp_loop
 
