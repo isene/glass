@@ -3842,12 +3842,17 @@ vt_process:
 
 .vtp_reverse_index:
     mov byte [pending_wrap], 0
-    cmp qword [cursor_row], 0
+    ; Scroll the region down if cursor is at scroll_top (or row 0 if no
+    ; region is set); otherwise just move the cursor up one row.
+    mov rax, [scroll_top]
+    cmp [cursor_row], rax
     je .vtp_ri_scroll
+    cmp qword [cursor_row], 0
+    je .vtp_loop                 ; already at top, can't go up
     dec qword [cursor_row]
     jmp .vtp_loop
 .vtp_ri_scroll:
-    call grid_scroll_down
+    call grid_scroll_region_down
     jmp .vtp_loop
 
 .vtp_start_osc:
@@ -4578,7 +4583,7 @@ vt_process:
     mov [cursor_row], rax
     jmp .vtp_loop
 
-; CSI S - Scroll Up
+; CSI S - Scroll Up (within active scroll region)
 .vtp_csi_su:
     mov eax, [vt_params]
     test eax, eax
@@ -4590,7 +4595,7 @@ vt_process:
     test ecx, ecx
     jz .vtp_loop
     push rcx
-    call grid_scroll_up
+    call grid_scroll_region_up
     pop rcx
     dec ecx
     jmp .vtp_su_loop
@@ -5182,11 +5187,15 @@ vt_process:
 grid_put_char:
     push rbx
     ; Honor any pending deferred wrap from the previous char written at
-    ; the last column. Performing the wrap here means the new char goes
-    ; on the next row at col 0, while CR/LF/cursor-positioning would
-    ; have already cleared the flag and skipped this branch.
+    ; the last column, but only if autowrap is still enabled. Apps like
+    ; htop disable autowrap (DECRST 7), write the bottom-right cell to
+    ; fill the corner, then re-enable autowrap; if we wrap during that
+    ; write the bottom-right char lands on the wrong row and the whole
+    ; layout drifts on every refresh.
     cmp byte [pending_wrap], 0
     je .gpc_no_pending
+    cmp qword [autowrap], 0
+    je .gpc_drop_pending
     mov byte [pending_wrap], 0
     mov rbx, [cursor_row]
     mov byte [row_wrapped + rbx], 1
@@ -5201,6 +5210,11 @@ grid_put_char:
     dec rbx
 .gpc_pw_row_ok:
     mov [cursor_row], rbx
+    jmp .gpc_no_pending
+.gpc_drop_pending:
+    ; Autowrap was disabled while a wrap was queued: drop the queue and
+    ; let this char overwrite the cell at the current (last-col) cursor.
+    mov byte [pending_wrap], 0
 .gpc_no_pending:
     mov rbx, [cursor_row]
     imul rbx, MAX_COLS
@@ -5543,45 +5557,77 @@ grid_scroll_up:
     pop rbx
     ret
 
-; Scroll grid down by one line
-grid_scroll_down:
+; Scroll one line DOWN within the active scroll region. If no region
+; is set (scroll_bottom == 0), scrolls the entire grid down. Used by
+; Reverse Index (ESC M) when the cursor is at scroll_top — htop relies
+; on this to insert a row in its narrowed process-list region without
+; touching the header rows above.
+grid_scroll_region_down:
     push rbx
     push r12
-    ; Move rows 0..N-2 to 1..N-1 (backwards)
-    mov rbx, [grid_rows]
-    dec rbx
-    imul rbx, MAX_COLS
-    dec rbx
-.gsd_loop:
-    cmp rbx, 0
-    jl .gsd_clear_first
+    push r13
+    mov r12, [scroll_top]
+    mov r13, [scroll_bottom]
+    test r13, r13
+    jnz .gsrd_have_region
+    ; No region: full-grid scroll
+    xor r12, r12
+    mov r13, [grid_rows]
+    dec r13
+.gsrd_have_region:
+    ; Move rows scroll_top..scroll_bottom-1 DOWN by 1 (work bottom-up)
+    mov rbx, r13
+    dec rbx                     ; rbx = scroll_bottom - 1 (source row)
+.gsrd_loop:
+    cmp rbx, r12
+    jl .gsrd_clear_top
+    ; Copy row rbx to row rbx+1
     mov rax, rbx
+    imul rax, MAX_COLS
     imul rax, CELL_SIZE
     mov rcx, rbx
-    add rcx, MAX_COLS
+    inc rcx
+    imul rcx, MAX_COLS
     imul rcx, CELL_SIZE
-    mov rdx, [grid + rax]
-    mov [grid + rcx], rdx
-    mov rdx, [grid + rax + 8]
-    mov [grid + rcx + 8], rdx
+    mov rdx, MAX_COLS
+.gsrd_cp:
+    test rdx, rdx
+    jz .gsrd_cp_done
+    mov rdi, [grid + rax]
+    mov [grid + rcx], rdi
+    mov rdi, [grid + rax + 8]
+    mov [grid + rcx + 8], rdi
+    add rax, CELL_SIZE
+    add rcx, CELL_SIZE
+    dec rdx
+    jmp .gsrd_cp
+.gsrd_cp_done:
     dec rbx
-    jmp .gsd_loop
-.gsd_clear_first:
-    ; Clear first row
-    xor rbx, rbx
-.gsd_clear:
-    cmp rbx, [grid_cols]
-    jge .gsd_done
-    mov rax, rbx
+    jmp .gsrd_loop
+.gsrd_clear_top:
+    ; Clear scroll_top row
+    mov rax, r12
+    imul rax, MAX_COLS
     imul rax, CELL_SIZE
+    xor rdx, rdx
+.gsrd_clear:
+    cmp rdx, [grid_cols]
+    jge .gsrd_done
     mov qword [grid + rax], DEFAULT_CELL_LO
     mov qword [grid + rax + 8], 0
-    inc rbx
-    jmp .gsd_clear
-.gsd_done:
+    add rax, CELL_SIZE
+    inc rdx
+    jmp .gsrd_clear
+.gsrd_done:
+    pop r13
     pop r12
     pop rbx
     ret
+
+; Old full-grid scroll-down kept for callers that want it explicitly
+; (CSI T). Both ultimately go through grid_scroll_region_down now.
+grid_scroll_down:
+    jmp grid_scroll_region_down
 
 ; Scroll view backward (into scrollback history)
 scroll_view_up:
