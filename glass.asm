@@ -5662,6 +5662,13 @@ selection_extract:
     ; Add newline at end of each row (except last).
     cmp r12, [sel_end_row]
     je .se_row_next
+    ; If this row wrapped to the next, treat them as one logical
+    ; line: no newline, no trailing-space trim. bare emits visible
+    ; padding right up to grid_cols on wrap, so the space before
+    ; the wrap is part of the content.
+    movzx eax, byte [row_wrapped + r12]
+    test eax, eax
+    jnz .se_row_next
     ; Trim trailing spaces before adding newline
 .se_trim:
     test r15d, r15d

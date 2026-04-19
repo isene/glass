@@ -95,6 +95,7 @@ a configured `opacity`, none of this code runs.
 - Double-click to select word (alnum + `_-./~+@:%=`)
 - Triple-click to select whole line
 - Selection populates X11 PRIMARY for paste in other apps
+- Wrap-aware copy: visually-wrapped lines join into one logical line when selected
 - Glass responds to SelectionRequest (TARGETS, UTF8_STRING, STRING)
 - URL detection (http/https), Ctrl+click to open with xdg-open
 - OSC 8 hyperlinks (`ESC ] 8 ; params ; URI ESC \\`); Ctrl+click opens URI
