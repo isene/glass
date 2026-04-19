@@ -384,6 +384,14 @@ cursor_row:         resq 1
 cursor_col:         resq 1
 cursor_saved_row:   resq 1
 cursor_saved_col:   resq 1
+; Deferred autowrap: when a printable char is written at the last column
+; we keep the cursor there and set pending_wrap=1 instead of immediately
+; advancing to the next row. The wrap is performed when the NEXT
+; printable char arrives. CR/LF/BS/cursor-positioning all clear the
+; flag without consuming the queued advance — this matches xterm and
+; prevents the classic "blank row between rows" bug when programs
+; pad to grid_cols and follow with [K\r\n.
+pending_wrap:       resb 1
 
 ; VT parser
 vt_state:           resq 1
@@ -3691,10 +3699,12 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_cr:
+    mov byte [pending_wrap], 0
     mov qword [cursor_col], 0
     jmp .vtp_loop
 
 .vtp_lf:
+    mov byte [pending_wrap], 0
     mov rax, [cursor_row]
     inc rax
     ; Check scroll region bottom (use scroll_bottom if set, else grid_rows-1)
@@ -3718,12 +3728,14 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_bs:
+    mov byte [pending_wrap], 0
     cmp qword [cursor_col], 0
     je .vtp_loop
     dec qword [cursor_col]
     jmp .vtp_loop
 
 .vtp_tab:
+    mov byte [pending_wrap], 0
     mov rax, [cursor_col]
     add rax, 8
     and rax, ~7
@@ -3813,6 +3825,7 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_save_cursor:
+    mov byte [pending_wrap], 0
     mov rax, [cursor_row]
     mov [cursor_saved_row], rax
     mov rax, [cursor_col]
@@ -3820,6 +3833,7 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_restore_cursor:
+    mov byte [pending_wrap], 0
     mov rax, [cursor_saved_row]
     mov [cursor_row], rax
     mov rax, [cursor_saved_col]
@@ -3827,6 +3841,7 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_reverse_index:
+    mov byte [pending_wrap], 0
     cmp qword [cursor_row], 0
     je .vtp_ri_scroll
     dec qword [cursor_row]
@@ -4410,6 +4425,7 @@ vt_process:
 
 ; CSI A - Cursor Up
 .vtp_csi_cuu:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_cuu_go
@@ -4426,6 +4442,7 @@ vt_process:
 
 ; CSI B - Cursor Down
 .vtp_csi_cud:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_cud_go
@@ -4444,6 +4461,7 @@ vt_process:
 
 ; CSI C - Cursor Forward
 .vtp_csi_cuf:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_cuf_go
@@ -4462,6 +4480,7 @@ vt_process:
 
 ; CSI D - Cursor Backward
 .vtp_csi_cub:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_cub_go
@@ -4478,6 +4497,7 @@ vt_process:
 
 ; CSI H - Cursor Position
 .vtp_csi_cup:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]     ; row (1-based)
     test eax, eax
     jnz .vtp_cup_row
@@ -4536,6 +4556,7 @@ vt_process:
 
 ; CSI G - Cursor Horizontal Absolute
 .vtp_csi_cha:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_cha_go
@@ -4547,6 +4568,7 @@ vt_process:
 
 ; CSI d - Line Position Absolute
 .vtp_csi_vpa:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_vpa_go
@@ -4592,6 +4614,7 @@ vt_process:
 
 ; CSI s - Save Cursor Position
 .vtp_csi_save_cursor:
+    mov byte [pending_wrap], 0
     mov rax, [cursor_row]
     mov [cursor_saved_row], rax
     mov rax, [cursor_col]
@@ -4600,6 +4623,7 @@ vt_process:
 
 ; CSI u - Restore Cursor Position
 .vtp_csi_restore_cursor:
+    mov byte [pending_wrap], 0
     mov rax, [cursor_saved_row]
     mov [cursor_row], rax
     mov rax, [cursor_saved_col]
@@ -4655,6 +4679,7 @@ vt_process:
 
 ; CSI r - Set Scrolling Region (DECSTBM)
 .vtp_csi_decstbm:
+    mov byte [pending_wrap], 0
     mov eax, [vt_params]
     test eax, eax
     jnz .vtp_stbm_top
@@ -5156,6 +5181,27 @@ vt_process:
 ; ax = UCS-2 character (16-bit)
 grid_put_char:
     push rbx
+    ; Honor any pending deferred wrap from the previous char written at
+    ; the last column. Performing the wrap here means the new char goes
+    ; on the next row at col 0, while CR/LF/cursor-positioning would
+    ; have already cleared the flag and skipped this branch.
+    cmp byte [pending_wrap], 0
+    je .gpc_no_pending
+    mov byte [pending_wrap], 0
+    mov rbx, [cursor_row]
+    mov byte [row_wrapped + rbx], 1
+    mov qword [cursor_col], 0
+    inc rbx
+    cmp rbx, [grid_rows]
+    jl .gpc_pw_row_ok
+    push rax
+    call grid_scroll_up
+    pop rax
+    mov rbx, [grid_rows]
+    dec rbx
+.gpc_pw_row_ok:
+    mov [cursor_row], rbx
+.gpc_no_pending:
     mov rbx, [cursor_row]
     imul rbx, MAX_COLS
     add rbx, [cursor_col]
@@ -5180,27 +5226,18 @@ grid_put_char:
     inc rax
     cmp rax, [grid_cols]
     jl .gpc_ok
-    ; Check autowrap
+    ; Reached past the last column.
     cmp qword [autowrap], 0
     je .gpc_clamp             ; no wrap: stay at last column
-    ; Mark current row as wrapping to the next so selection_extract can
-    ; treat the visual rows as one logical line for copy.
-    mov rax, [cursor_row]
-    mov byte [row_wrapped + rax], 1
-    ; Wrap to next line
-    xor eax, eax
-    mov [cursor_col], rax
-    mov rax, [cursor_row]
-    inc rax
-    cmp rax, [grid_rows]
-    jl .gpc_row_ok
-    push rax
-    call grid_scroll_up
-    pop rax
-    mov rax, [grid_rows]
+    ; Defer the wrap: leave cursor at last col, set pending_wrap. The
+    ; next printable char performs the actual advance; CR/LF/cursor
+    ; positioning between now and then clears the flag and the wrap
+    ; is silently dropped, which is exactly what apps expect when they
+    ; pad to grid_cols and then send [K\r\n.
+    mov rax, [grid_cols]
     dec rax
-.gpc_row_ok:
-    mov [cursor_row], rax
+    mov [cursor_col], rax
+    mov byte [pending_wrap], 1
     pop rbx
     ret
 .gpc_clamp:
