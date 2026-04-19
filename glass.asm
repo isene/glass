@@ -5319,22 +5319,52 @@ grid_clear_below:
     ret
 
 ; Clear from cursor to end of line
+; Erase from cursor to end of line, filling cleared cells with the
+; CURRENT SGR attributes (Background Color Erase / BCE — default xterm
+; behavior). Apps like htop rely on this to extend an inverse-video
+; header/footer bar to the right edge of the screen by setting SGR 7
+; then sending [K, instead of writing N spaces.
 grid_clear_right:
     push rbx
+    push r12
+    push r13
     mov rbx, [cursor_col]
-    mov rcx, [cursor_row]
-    imul rcx, MAX_COLS
+    mov r12, [cursor_row]
+    imul r12, MAX_COLS
+    ; Pre-pack the cell low qword with current attrs/flags/space.
+    ; Layout: [0]=' ', [1]=0, [2]=fg_default, [3]=bg_default, [4]=attrs,
+    ;         [5]=0 (osc8), [6]=0, [7]=0
+    movzx eax, byte [cur_fg_default]
+    shl eax, 16
+    movzx edx, byte [cur_bg_default]
+    shl edx, 24
+    or eax, edx
+    movzx edx, byte [cur_attrs]
+    shl rdx, 32
+    or rax, rdx
+    or rax, 0x20                      ; space char
+    mov r13, rax                      ; cell_lo template
+    ; Pack pixel hi qword: [8-11]=fg_pixel, [12-15]=bg_pixel
+    mov eax, [cur_bg_pixel]
+    shl rax, 32
+    mov edx, [cur_fg_pixel]
+    or rax, rdx
+    push rax                          ; save cell_hi for the loop
 .gcr_loop:
     cmp rbx, [grid_cols]
     jge .gcr_done
-    mov rax, rcx
+    mov rax, r12
     add rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], DEFAULT_CELL_LO
-    mov qword [grid + rax + 8], 0
+    mov [grid + rax], r13             ; lo qword (char + flags + attrs)
+    mov rdx, [rsp]                    ; hi qword (pixels)
+    mov [grid + rax + 8], rdx
     inc rbx
     jmp .gcr_loop
 .gcr_done:
+    pop rax                           ; discard cell_hi
+    pop r13
+    pop r12
     pop rbx
     ret
 
