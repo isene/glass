@@ -69,7 +69,16 @@
 %define X11_FREE_PIXMAP       54
 %define X11_PUT_IMAGE         72
 %define X11_POLY_TEXT_16      75
+%define X11_QUERY_EXTENSION   98
 %define CW_BACK_PIXMAP        0x00000001
+
+; XRender extension minor opcodes (sent with major = render_major_opcode)
+%define RENDER_QUERY_VERSION         0
+%define RENDER_QUERY_PICT_FORMATS    1
+%define RENDER_CREATE_PICTURE        4
+%define RENDER_FREE_PICTURE          7
+%define RENDER_COMPOSITE             8
+%define RENDER_OP_OVER               3
 
 ; X11 event types
 %define EV_KEY_PRESS        2
@@ -155,6 +164,10 @@ wm_protocols_str: db "WM_PROTOCOLS", 0
 wm_protocols_len  equ 12
 wm_delete_str:  db "WM_DELETE_WINDOW", 0
 wm_delete_len   equ 16
+
+; XRender extension name (used by QueryExtension)
+render_ext_str:   db "RENDER", 0
+render_ext_len    equ 6
 
 ; Selection atom names
 clipboard_str:    db "CLIPBOARD", 0
@@ -293,6 +306,23 @@ gc_id:              resd 1
 gc_bg_id:           resd 1
 font_id:            resd 1
 wm_protocols_atom:  resd 1
+
+; XRender extension state. render_major is 0 if RENDER is unavailable
+; (or QueryExtension hasn't run yet) — emoji rendering is gated on it
+; being non-zero. window_picture wraps the glass window; emoji_pictures
+; hold the cached ARGB rasters produced by `convert`.
+render_major:           resd 1     ; major opcode, 0 = unavailable
+render_format_argb32:   resd 1     ; PictFormat ID for ARGB32 source
+render_format_window:   resd 1     ; PictFormat ID matching our visual
+render_window_picture:  resd 1     ; Picture wrapping the glass window
+render_temp_gc:         resd 1     ; GC used to PutImage onto pixmaps
+
+%define MAX_EMOJI 1024
+emoji_codepoints:       resd MAX_EMOJI   ; 32-bit codepoints we've seen
+emoji_pictures:         resd MAX_EMOJI   ; XID of XRender Picture (0 = not yet rendered)
+emoji_pixmaps:          resd MAX_EMOJI   ; XID of backing Pixmap
+emoji_count:            resq 1
+cur_emoji_index:        resw 1     ; set by UTF-8 decoder before grid_put_char
 wm_delete_atom:     resd 1
 
 ; Font metrics
@@ -574,6 +604,10 @@ _start:
 
     ; Intern selection atoms
     call x11_intern_sel_atoms
+
+    ; Probe for the RENDER extension and set up Picture for our window.
+    ; Required for color emoji rendering. Silently skipped if not present.
+    call x11_setup_render
 
     ; Map window
     call x11_map_window
@@ -1710,6 +1744,199 @@ x11_create_gc:
     call x11_buffer
     inc dword [x11_seq]
 
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; XRender extension setup. Probes for RENDER, then queries PictFormats
+; to find the ARGB32 format we need for emoji source pictures and the
+; format matching our window's visual. On success creates a Picture
+; wrapping our window so emoji can be composited onto it. All emoji
+; rendering is silently disabled if RENDER is unavailable.
+; ══════════════════════════════════════════════════════════════════════
+x11_setup_render:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    ; QueryExtension "RENDER"
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_EXTENSION
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (render_ext_len + 3) / 4
+    mov word [rdi+4], render_ext_len
+    mov word [rdi+6], 0
+    lea rsi, [render_ext_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xsr_cp_name:
+    cmp ecx, render_ext_len
+    jge .xsr_send_qe
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xsr_cp_name
+.xsr_send_qe:
+    mov eax, render_ext_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    ; Reply layout: byte 8 = present, byte 9 = major opcode
+    cmp byte [x11_buf + 8], 1
+    jne .xsr_unavailable
+    movzx eax, byte [x11_buf + 9]
+    mov [render_major], eax
+
+    ; RenderQueryPictFormats (variable-size reply with all formats)
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_QUERY_PICT_FORMATS
+    mov word [rdi+2], 1
+    mov rdx, 4
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    ; Reply: bytes 8-11 = num formats, then 28 bytes per format starting
+    ; at offset 32. Each format: id(4), type(1), depth(1), pad(2),
+    ; r_shift(2), r_mask(2), g_shift(2), g_mask(2), b_shift(2), b_mask(2),
+    ; a_shift(2), a_mask(2), colormap(4).
+    mov ecx, [x11_buf + 8]              ; num formats
+    test ecx, ecx
+    jz .xsr_unavailable
+    lea rbx, [x11_buf + 32]             ; first format
+.xsr_fmt_loop:
+    test ecx, ecx
+    jz .xsr_fmt_done
+    ; type must be Direct (1)
+    cmp byte [rbx + 4], 1
+    jne .xsr_fmt_next
+    movzx eax, byte [rbx + 5]           ; depth
+    movzx edx, word [rbx + 8]           ; r_shift
+    movzx esi, word [rbx + 14]          ; g_shift
+    movzx edi, word [rbx + 20]          ; b_shift
+    movzx r8d, word [rbx + 22]          ; a_shift
+    movzx r9d, word [rbx + 24]          ; a_mask
+    ; ARGB32: depth=32, r_shift=16, g_shift=8, b_shift=0, a_shift=24, a_mask=0xFF
+    cmp eax, 32
+    jne .xsr_check_window
+    cmp edx, 16
+    jne .xsr_check_window
+    cmp esi, 8
+    jne .xsr_check_window
+    test edi, edi
+    jnz .xsr_check_window
+    cmp r8d, 24
+    jne .xsr_check_window
+    cmp r9d, 0xFF
+    jne .xsr_check_window
+    cmp dword [render_format_argb32], 0
+    jne .xsr_check_window               ; already found
+    mov eax, [rbx]
+    mov [render_format_argb32], eax
+    jmp .xsr_check_window
+.xsr_check_window:
+    ; Window format: matches our window's depth (24 normally, 32 in
+    ; ARGB transparency mode). RGB ordering R=16/G=8/B=0.
+    movzx r12d, byte [rbx + 5]          ; depth
+    movzx r13d, word [rbx + 8]          ; r_shift
+    movzx r14d, word [rbx + 14]         ; g_shift
+    movzx eax, word [rbx + 20]          ; b_shift
+    cmp r13d, 16
+    jne .xsr_fmt_next
+    cmp r14d, 8
+    jne .xsr_fmt_next
+    test eax, eax
+    jnz .xsr_fmt_next
+    ; Take a depth-24 format if we don't have a window format yet, or
+    ; upgrade to depth-32 if ARGB visual is in use.
+    cmp dword [x11_argb_colormap], 0
+    je .xsr_want_24
+    cmp r12d, 32
+    jne .xsr_fmt_next
+    jmp .xsr_take_window
+.xsr_want_24:
+    cmp r12d, 24
+    jne .xsr_fmt_next
+.xsr_take_window:
+    cmp dword [render_format_window], 0
+    jne .xsr_fmt_next
+    mov eax, [rbx]
+    mov [render_format_window], eax
+.xsr_fmt_next:
+    add rbx, 28
+    dec ecx
+    jmp .xsr_fmt_loop
+.xsr_fmt_done:
+    ; Need both formats to proceed
+    cmp dword [render_format_argb32], 0
+    je .xsr_unavailable
+    cmp dword [render_format_window], 0
+    je .xsr_unavailable
+
+    ; CreatePicture wrapping our window so we can composite onto it.
+    ; Request: opcode=major, minor=4, length=5, picture-id, drawable,
+    ; format, value-mask=0.
+    call alloc_xid
+    mov [render_window_picture], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5
+    mov eax, [render_window_picture]
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax
+    mov eax, [render_format_window]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0               ; value-mask
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Allocate a GC for putting RGBA pixmaps. Reused across all emoji.
+    call alloc_xid
+    mov [render_temp_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [render_temp_gc]
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0               ; value-mask
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.xsr_unavailable:
+    mov dword [render_major], 0
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
