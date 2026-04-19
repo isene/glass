@@ -110,7 +110,21 @@
 %define DEFAULT_ROWS    24
 %define MAX_COLS        400
 %define MAX_ROWS        128
-%define CELL_SIZE       8
+%define CELL_SIZE       16
+; Cell layout (16 bytes):
+;   [0-1]   char (UCS-2 low 16 bits)
+;   [2]     fg flags (bit 0 = use default fg from palette[7])
+;   [3]     bg flags (bit 0 = use default bg from palette[0])
+;   [4]     attrs (bold/underline/inverse bits)
+;   [5]     osc8 link id (0 = none)
+;   [6-7]   reserved (zero)
+;   [8-11]  fg pixel (32-bit ARGB; ignored when fg-default flag set)
+;   [12-15] bg pixel (32-bit ARGB; ignored when bg-default flag set)
+;
+; DEFAULT_CELL_LO: char=space, both default flags set, attrs=0, osc8=0.
+; Kept inside 32-bit signed range so it fits a `mov qword [mem], imm32`
+; without warnings (avoids reload via register at every clear site).
+%define DEFAULT_CELL_LO 0x0000000001010020
 
 ; VT parser states
 %define VT_NORMAL       0
@@ -118,6 +132,7 @@
 %define VT_CSI          2
 %define VT_CSI_PARAM    3
 %define VT_OSC          4
+%define VT_CHARSET      5    ; consume one charset designator byte, then VT_NORMAL
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data section
@@ -377,8 +392,15 @@ vt_param_count:     resq 1
 vt_private:         resb 1
 
 ; Current attributes
-cur_fg:             resb 1
-cur_bg:             resb 1
+; cur_fg_pixel/cur_bg_pixel hold the resolved 32-bit pixel for any
+; explicitly-set color (indexed or truecolor). When the default
+; flag is set the pixel is ignored and palette[7]/palette[0] is
+; used at render time, so changes to those palette slots after
+; cells are written are still honored.
+cur_fg_pixel:       resd 1
+cur_bg_pixel:       resd 1
+cur_fg_default:     resb 1     ; 1 = use palette[7] at render time
+cur_bg_default:     resb 1     ; 1 = use palette[0] at render time
 cur_attrs:          resb 1
 default_fg:         resb 1
 default_bg:         resb 1
@@ -472,8 +494,10 @@ _start:
     ; Set defaults
     mov byte [default_fg], 7     ; white
     mov byte [default_bg], 0     ; black
-    mov byte [cur_fg], 7
-    mov byte [cur_bg], 0
+    mov byte [cur_fg_default], 1
+    mov byte [cur_bg_default], 1
+    mov dword [cur_fg_pixel], 0
+    mov dword [cur_bg_pixel], 0
     mov qword [grid_cols], DEFAULT_COLS
     mov qword [grid_rows], DEFAULT_ROWS
     mov qword [cursor_visible], 1
@@ -3582,6 +3606,8 @@ vt_process:
     je .vtp_csi
     cmp rcx, VT_OSC
     je .vtp_osc
+    cmp rcx, VT_CHARSET
+    je .vtp_charset
 
     ; VT_NORMAL
     cmp al, 27               ; ESC
@@ -3743,6 +3769,27 @@ vt_process:
     je .vtp_start_osc
     cmp al, 'c'
     je .vtp_full_reset
+    ; Charset designators ESC ( / ) / * / + <X>: swallow the next byte
+    ; (the charset designator like 'B' for ASCII, '0' for DEC graphics).
+    ; ncurses sends ESC ( B liberally to reset the G0 charset; without
+    ; this the 'B' would be written to the screen as a literal char.
+    cmp al, '('
+    je .vtp_charset_start
+    cmp al, ')'
+    je .vtp_charset_start
+    cmp al, '*'
+    je .vtp_charset_start
+    cmp al, '+'
+    je .vtp_charset_start
+    jmp .vtp_loop
+
+.vtp_charset_start:
+    mov qword [vt_state], VT_CHARSET
+    jmp .vtp_loop
+
+.vtp_charset:
+    ; Discard the designator byte and return to normal.
+    mov qword [vt_state], VT_NORMAL
     jmp .vtp_loop
 
 .vtp_start_csi:
@@ -4006,8 +4053,10 @@ vt_process:
     call grid_clear
     mov qword [cursor_row], 0
     mov qword [cursor_col], 0
-    mov byte [cur_fg], 7
-    mov byte [cur_bg], 0
+    mov byte [cur_fg_default], 1
+    mov byte [cur_bg_default], 1
+    mov dword [cur_fg_pixel], 0
+    mov dword [cur_bg_pixel], 0
     mov byte [cur_attrs], 0
     ; Reset DECSET modes
     mov qword [cursor_visible], 1
@@ -4232,7 +4281,7 @@ vt_process:
     mov [alt_cursor_row], rax
     mov rax, [cursor_col]
     mov [alt_cursor_col], rax
-    ; Copy main grid to alt_grid (save it) - 8 bytes at a time
+    ; Copy main grid to alt_grid (save it) - 16 bytes per cell
     push r12
     push r13
     xor r12, r12
@@ -4242,7 +4291,9 @@ vt_process:
     jge .vtp_alt_save_done
     mov rax, [grid + r12]
     mov [alt_grid + r12], rax
-    add r12, 8
+    mov rax, [grid + r12 + 8]
+    mov [alt_grid + r12 + 8], rax
+    add r12, CELL_SIZE
     jmp .vtp_alt_save
 .vtp_alt_save_done:
     pop r13
@@ -4257,7 +4308,7 @@ vt_process:
 .vtp_alt_screen_off:
     cmp qword [alt_screen_active], 0
     je .vtp_loop                ; already on main screen
-    ; Copy alt_grid back to grid (restore main) - 8 bytes at a time
+    ; Copy alt_grid back to grid (restore main) - 16 bytes per cell
     push r12
     push r13
     xor r12, r12
@@ -4267,7 +4318,9 @@ vt_process:
     jge .vtp_alt_restore_done
     mov rax, [alt_grid + r12]
     mov [grid + r12], rax
-    add r12, 8
+    mov rax, [alt_grid + r12 + 8]
+    mov [grid + r12 + 8], rax
+    add r12, CELL_SIZE
     jmp .vtp_alt_restore
 .vtp_alt_restore_done:
     pop r13
@@ -4285,8 +4338,10 @@ vt_process:
     mov qword [mouse_tracking], 0
     mov qword [mouse_sgr], 0
     mov qword [bracketed_paste], 0
-    mov byte [cur_fg], 7
-    mov byte [cur_bg], 0
+    mov byte [cur_fg_default], 1
+    mov byte [cur_bg_default], 1
+    mov dword [cur_fg_pixel], 0
+    mov dword [cur_bg_pixel], 0
     mov byte [cur_attrs], 0
     mov qword [cursor_style], 0
     jmp .vtp_loop
@@ -4556,16 +4611,18 @@ vt_process:
     add rdx, rcx
     cmp rdx, [grid_cols]
     jge .vtp_dch_clear
-    ; Copy cell at col+n to col (8 bytes)
+    ; Copy cell at col+n to col (16 bytes)
     mov rdx, rbx
     add rdx, rax
     add rdx, rcx
     imul rdx, CELL_SIZE
     mov r8, [grid + rdx]
+    mov r9, [grid + rdx + 8]
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
     mov [grid + rdx], r8
+    mov [grid + rdx + 8], r9
     inc rax
     jmp .vtp_dch_shift
 .vtp_dch_clear:
@@ -4575,7 +4632,8 @@ vt_process:
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
-    mov qword [grid + rdx], 0x0000000000070020
+    mov qword [grid + rdx], DEFAULT_CELL_LO
+    mov qword [grid + rdx + 8], 0
     inc rax
     jmp .vtp_dch_clear
 .vtp_dch_done:
@@ -4625,16 +4683,18 @@ vt_process:
     sub rdx, rcx
     cmp rdx, [cursor_col]
     jl .vtp_ich_clear
-    ; Copy cell at col-n to col (8 bytes)
+    ; Copy cell at col-n to col (16 bytes)
     mov rdx, rbx
     add rdx, rax
     sub rdx, rcx
     imul rdx, CELL_SIZE
     mov r8, [grid + rdx]
+    mov r9, [grid + rdx + 8]
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
     mov [grid + rdx], r8
+    mov [grid + rdx + 8], r9
     dec rax
     jmp .vtp_ich_shift
 .vtp_ich_clear:
@@ -4651,7 +4711,8 @@ vt_process:
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
-    mov qword [grid + rdx], 0x0000000000070020
+    mov qword [grid + rdx], DEFAULT_CELL_LO
+    mov qword [grid + rdx + 8], 0
     pop rdx
     inc rax
     jmp .vtp_ich_clear_loop
@@ -4697,6 +4758,8 @@ vt_process:
 .vtp_il_cp:
     mov r8, [rsi]
     mov [rdi], r8
+    mov r8, [rsi + 8]
+    mov [rdi + 8], r8
     add rsi, CELL_SIZE
     add rdi, CELL_SIZE
     dec rcx
@@ -4725,7 +4788,8 @@ vt_process:
     mov rdi, rbx
     add rdi, rdx
     imul rdi, CELL_SIZE
-    mov qword [grid + rdi], 0x0000000000070020
+    mov qword [grid + rdi], DEFAULT_CELL_LO
+    mov qword [grid + rdi + 8], 0
     inc rdx
     jmp .vtp_il_clear_row
 .vtp_il_clear_next:
@@ -4775,6 +4839,8 @@ vt_process:
 .vtp_dl_cp:
     mov r8, [rsi]
     mov [rdi], r8
+    mov r8, [rsi + 8]
+    mov [rdi + 8], r8
     add rsi, CELL_SIZE
     add rdi, CELL_SIZE
     dec rcx
@@ -4805,7 +4871,8 @@ vt_process:
     mov rdi, rbx
     add rdi, rdx
     imul rdi, CELL_SIZE
-    mov qword [grid + rdi], 0x0000000000070020
+    mov qword [grid + rdi], DEFAULT_CELL_LO
+    mov qword [grid + rdi + 8], 0
     inc rdx
     jmp .vtp_dl_clear_row
 .vtp_dl_clear_rnext:
@@ -4837,7 +4904,8 @@ vt_process:
     mov rdx, rbx
     add rdx, rax
     imul rdx, CELL_SIZE
-    mov qword [grid + rdx], 0x0000000000070020
+    mov qword [grid + rdx], DEFAULT_CELL_LO
+    mov qword [grid + rdx + 8], 0
     inc rax
     dec ecx
     jmp .vtp_ech_loop
@@ -4879,7 +4947,9 @@ vt_process:
     cmp eax, 37
     jg .vtp_sgr_check_bg
     sub eax, 30
-    mov [cur_fg], al
+    mov ecx, [palette + rax*4]
+    mov [cur_fg_pixel], ecx
+    mov byte [cur_fg_default], 0
     jmp .vtp_sgr_next
 
     ; 40-47: background colors
@@ -4889,7 +4959,9 @@ vt_process:
     cmp eax, 47
     jg .vtp_sgr_check_bright_fg
     sub eax, 40
-    mov [cur_bg], al
+    mov ecx, [palette + rax*4]
+    mov [cur_bg_pixel], ecx
+    mov byte [cur_bg_default], 0
     jmp .vtp_sgr_next
 
     ; 90-97: bright foreground
@@ -4899,7 +4971,9 @@ vt_process:
     cmp eax, 97
     jg .vtp_sgr_check_bright_bg
     sub eax, 82              ; 90-82 = 8
-    mov [cur_fg], al
+    mov ecx, [palette + rax*4]
+    mov [cur_fg_pixel], ecx
+    mov byte [cur_fg_default], 0
     jmp .vtp_sgr_next
 
     ; 100-107: bright background
@@ -4909,7 +4983,9 @@ vt_process:
     cmp eax, 107
     jg .vtp_sgr_check_256
     sub eax, 92
-    mov [cur_bg], al
+    mov ecx, [palette + rax*4]
+    mov [cur_bg_pixel], ecx
+    mov byte [cur_bg_default], 0
     jmp .vtp_sgr_next
 
     ; 38;5;N or 48;5;N: 256-color
@@ -4935,74 +5011,37 @@ vt_process:
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov eax, [vt_params + rbx*4]
-    mov [cur_fg], al
+    and eax, 0xFF                       ; clamp 0..255
+    mov ecx, [palette + rax*4]
+    mov [cur_fg_pixel], ecx
+    mov byte [cur_fg_default], 0
     jmp .vtp_sgr_next
 .vtp_sgr_fg_true:
-    ; 38;2;R;G;B - find closest palette color
-    ; Skip R, G, B params (consume them so they don't get misinterpreted)
-    inc rbx              ; R
+    ; 38;2;R;G;B - store the explicit RGB pixel directly. The
+    ; TrueColor visual interprets the 32-bit pixel as 0xAARRGGBB,
+    ; so we set alpha=0xFF and pack the components as-is.
+    inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov ecx, [vt_params + rbx*4]   ; R
-    inc rbx              ; G
+    and ecx, 0xFF
+    inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov edx, [vt_params + rbx*4]   ; G
-    inc rbx              ; B
+    and edx, 0xFF
+    inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov esi, [vt_params + rbx*4]   ; B
-    ; Simple mapping: use 256-color cube (16 + 36*r/51 + 6*g/51 + b/51)
-    push rbx
-    mov eax, ecx
-    mov ebx, 51
-    xor edx, edx
-    div ebx              ; r = R/51
-    imul eax, 36
-    mov ecx, eax
-    mov eax, [vt_params + (rbx-1)*4]  ; reload G (edx was clobbered)
-    ; Actually, let's simplify: map to nearest 16 color
-    ; If all components < 64: use 0 (black)
-    ; Use weighted average to pick closest of 16 colors
-    pop rbx
-    push rbx
-    ; Simple approach: map R,G,B to 6x6x6 cube index
-    mov eax, [vt_params + (rbx-2)*4]  ; R
-    mov ecx, 42                        ; 255/6 ≈ 42
-    xor edx, edx
-    div ecx
-    cmp eax, 5
-    jle .vtp_fg_r_ok
-    mov eax, 5
-.vtp_fg_r_ok:
-    imul eax, 36
-    mov ecx, eax                       ; r_idx * 36
-    mov eax, [vt_params + (rbx-1)*4]  ; G
-    push rcx
-    mov ecx, 42
-    xor edx, edx
-    div ecx
-    cmp eax, 5
-    jle .vtp_fg_g_ok
-    mov eax, 5
-.vtp_fg_g_ok:
-    imul eax, 6
-    pop rcx
-    add ecx, eax                       ; + g_idx * 6
-    mov eax, [vt_params + rbx*4]      ; B
-    push rcx
-    mov ecx, 42
-    xor edx, edx
-    div ecx
-    cmp eax, 5
-    jle .vtp_fg_b_ok
-    mov eax, 5
-.vtp_fg_b_ok:
-    pop rcx
-    add ecx, eax                       ; + b_idx
-    add ecx, 16                        ; offset into 256-color palette
-    mov [cur_fg], cl
-    pop rbx
+    and esi, 0xFF
+    shl ecx, 16
+    shl edx, 8
+    or ecx, edx
+    or ecx, esi
+    or ecx, 0xFF000000
+    mov [cur_fg_pixel], ecx
+    mov byte [cur_fg_default], 0
     jmp .vtp_sgr_next
 
 .vtp_sgr_bg256:
@@ -5020,58 +5059,42 @@ vt_process:
     cmp rbx, [vt_param_count]
     jge .vtp_loop
     mov eax, [vt_params + rbx*4]
-    mov [cur_bg], al
+    and eax, 0xFF
+    mov ecx, [palette + rax*4]
+    mov [cur_bg_pixel], ecx
+    mov byte [cur_bg_default], 0
     jmp .vtp_sgr_next
 .vtp_sgr_bg_true:
-    ; 48;2;R;G;B - consume R,G,B and map to nearest palette
-    inc rbx
-    inc rbx
+    ; 48;2;R;G;B - store the explicit RGB pixel directly.
     inc rbx
     cmp rbx, [vt_param_count]
     jge .vtp_loop
-    ; Map to 256-color cube (same as fg)
-    push rbx
-    mov eax, [vt_params + (rbx-2)*4]  ; R
-    mov ecx, 42
-    xor edx, edx
-    div ecx
-    cmp eax, 5
-    jle .vtp_bg_r_ok
-    mov eax, 5
-.vtp_bg_r_ok:
-    imul eax, 36
-    mov ecx, eax
-    mov eax, [vt_params + (rbx-1)*4]  ; G
-    push rcx
-    mov ecx, 42
-    xor edx, edx
-    div ecx
-    cmp eax, 5
-    jle .vtp_bg_g_ok
-    mov eax, 5
-.vtp_bg_g_ok:
-    imul eax, 6
-    pop rcx
-    add ecx, eax
-    mov eax, [vt_params + rbx*4]      ; B
-    push rcx
-    mov ecx, 42
-    xor edx, edx
-    div ecx
-    cmp eax, 5
-    jle .vtp_bg_b_ok
-    mov eax, 5
-.vtp_bg_b_ok:
-    pop rcx
-    add ecx, eax
-    add ecx, 16
-    mov [cur_bg], cl
-    pop rbx
+    mov ecx, [vt_params + rbx*4]   ; R
+    and ecx, 0xFF
+    inc rbx
+    cmp rbx, [vt_param_count]
+    jge .vtp_loop
+    mov edx, [vt_params + rbx*4]   ; G
+    and edx, 0xFF
+    inc rbx
+    cmp rbx, [vt_param_count]
+    jge .vtp_loop
+    mov esi, [vt_params + rbx*4]   ; B
+    and esi, 0xFF
+    shl ecx, 16
+    shl edx, 8
+    or ecx, edx
+    or ecx, esi
+    or ecx, 0xFF000000
+    mov [cur_bg_pixel], ecx
+    mov byte [cur_bg_default], 0
     jmp .vtp_sgr_next
 
 .vtp_sgr_reset:
-    mov byte [cur_fg], 7
-    mov byte [cur_bg], 0
+    mov byte [cur_fg_default], 1
+    mov byte [cur_bg_default], 1
+    mov dword [cur_fg_pixel], 0
+    mov dword [cur_bg_pixel], 0
     mov byte [cur_attrs], 0
     jmp .vtp_sgr_next
 .vtp_sgr_bold:
@@ -5093,10 +5116,12 @@ vt_process:
     and byte [cur_attrs], ~4
     jmp .vtp_sgr_next
 .vtp_sgr_default_fg:
-    mov byte [cur_fg], 7
+    mov byte [cur_fg_default], 1
+    mov dword [cur_fg_pixel], 0
     jmp .vtp_sgr_next
 .vtp_sgr_default_bg:
-    mov byte [cur_bg], 0
+    mov byte [cur_bg_default], 1
+    mov dword [cur_bg_pixel], 0
     jmp .vtp_sgr_next
 
 .vtp_sgr_next:
@@ -5122,15 +5147,20 @@ grid_put_char:
     imul rbx, MAX_COLS
     add rbx, [cursor_col]
     imul rbx, CELL_SIZE
-    mov [grid + rbx], ax             ; char (16-bit)
-    movzx ecx, byte [cur_fg]
-    mov [grid + rbx + 2], cl         ; fg
-    movzx ecx, byte [cur_bg]
-    mov [grid + rbx + 3], cl         ; bg
+    mov [grid + rbx], ax             ; [0-1] char (16-bit)
+    movzx ecx, byte [cur_fg_default]
+    mov [grid + rbx + 2], cl         ; [2] fg default flag
+    movzx ecx, byte [cur_bg_default]
+    mov [grid + rbx + 3], cl         ; [3] bg default flag
     movzx ecx, byte [cur_attrs]
-    mov [grid + rbx + 4], cl         ; attrs
+    mov [grid + rbx + 4], cl         ; [4] attrs
     movzx ecx, byte [cur_osc8_id]
-    mov [grid + rbx + 5], cl         ; OSC 8 hyperlink id (0 = none)
+    mov [grid + rbx + 5], cl         ; [5] OSC 8 link id
+    mov word [grid + rbx + 6], 0     ; [6-7] reserved
+    mov ecx, [cur_fg_pixel]
+    mov [grid + rbx + 8], ecx        ; [8-11] fg pixel
+    mov ecx, [cur_bg_pixel]
+    mov [grid + rbx + 12], ecx       ; [12-15] bg pixel
 
     ; Advance cursor
     mov rax, [cursor_col]
@@ -5183,7 +5213,8 @@ grid_clear:
     jge .gc_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020  ; space=0x0020, fg=7, bg=0, attrs=0
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
     jmp .gc_loop
 .gc_done:
@@ -5214,7 +5245,8 @@ grid_clear_below:
     jge .gcb_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
     jmp .gcb_loop
 .gcb_done:
@@ -5234,7 +5266,8 @@ grid_clear_right:
     mov rax, rcx
     add rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
     jmp .gcr_loop
 .gcr_done:
@@ -5253,7 +5286,8 @@ grid_clear_line:
     mov rax, rcx
     add rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
     jmp .gcl_loop
 .gcl_done:
@@ -5301,6 +5335,8 @@ grid_scroll_region_up:
     jge .gsru_cp_done
     mov r8, [grid + rax]
     mov [grid + rcx], r8
+    mov r8, [grid + rax + 8]
+    mov [grid + rcx + 8], r8
     add rax, CELL_SIZE
     add rcx, CELL_SIZE
     inc rdx
@@ -5321,7 +5357,8 @@ grid_scroll_region_up:
     mov rax, rbx
     add rax, rdx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rdx
     jmp .gsru_cl
 .gsru_done:
@@ -5347,9 +5384,13 @@ grid_scroll_up:
     jge .gsu_save_done
     mov rax, rcx
     imul rax, CELL_SIZE
-    mov r8, [grid + rax]             ; read cell (8 bytes)
-    lea rbx, [r13 + rcx * CELL_SIZE]
-    mov [scroll_buf + rbx], r8       ; write to scroll_buf
+    mov rbx, rcx
+    imul rbx, CELL_SIZE         ; scale 16 isn't a valid LEA factor
+    add rbx, r13
+    mov r8, [grid + rax]
+    mov [scroll_buf + rbx], r8
+    mov r8, [grid + rax + 8]
+    mov [scroll_buf + rbx + 8], r8
     inc rcx
     jmp .gsu_save
 .gsu_save_done:
@@ -5358,8 +5399,11 @@ grid_scroll_up:
 .gsu_save_pad:
     cmp rdx, MAX_COLS
     jge .gsu_save_advance
-    lea rbx, [r13 + rdx * CELL_SIZE]
-    mov qword [scroll_buf + rbx], 0x0000000000070020  ; space, fg=7, bg=0, attrs=0
+    mov rbx, rdx
+    imul rbx, CELL_SIZE
+    add rbx, r13
+    mov qword [scroll_buf + rbx], DEFAULT_CELL_LO
+    mov qword [scroll_buf + rbx + 8], 0
     inc rdx
     jmp .gsu_save_pad
 .gsu_save_advance:
@@ -5407,9 +5451,11 @@ grid_scroll_up:
     imul rax, CELL_SIZE
     mov rcx, rbx
     imul rcx, CELL_SIZE
-    ; Copy 8 bytes (one cell)
+    ; Copy one cell (16 bytes)
     mov rdx, [grid + rax]
     mov [grid + rcx], rdx
+    mov rdx, [grid + rax + 8]
+    mov [grid + rcx + 8], rdx
     inc rbx
     jmp .gsu_loop
 .gsu_clear_last:
@@ -5424,7 +5470,8 @@ grid_scroll_up:
     jge .gsu_clear_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
     jmp .gsu_clear
 .gsu_clear_done:
@@ -5465,6 +5512,8 @@ grid_scroll_down:
     imul rcx, CELL_SIZE
     mov rdx, [grid + rax]
     mov [grid + rcx], rdx
+    mov rdx, [grid + rax + 8]
+    mov [grid + rcx + 8], rdx
     dec rbx
     jmp .gsd_loop
 .gsd_clear_first:
@@ -5475,7 +5524,8 @@ grid_scroll_down:
     jge .gsd_done
     mov rax, rbx
     imul rax, CELL_SIZE
-    mov qword [grid + rax], 0x0000000000070020
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
     jmp .gsd_clear
 .gsd_done:
@@ -6140,13 +6190,21 @@ render_screen:
     cmp r13, [grid_cols]
     jge .rs_next_row
 
-    ; Get effective fg/bg of cell (apply inverse attr + selection)
+    ; Get effective fg/bg pixel of cell (apply inverse attr + selection).
+    ; cell[2] bit 0 = use palette[7] for fg; otherwise cell[8-11] is the
+    ; explicit 32-bit pixel. Same for bg via cell[3] / cell[12-15].
     mov rax, [rs_row_base]
     mov rdx, r13
     imul rdx, CELL_SIZE
     add rax, rdx
-    movzx r14d, byte [rax + 2]  ; fg (offset +2)
-    movzx r15d, byte [rax + 3]  ; bg (offset +3)
+    mov r14d, [palette + 7*4]
+    mov edx, [rax + 8]
+    test byte [rax + 2], 1
+    cmovz r14d, edx
+    mov r15d, [palette]
+    mov edx, [rax + 12]
+    test byte [rax + 3], 1
+    cmovz r15d, edx
     movzx edx, byte [rax + 4]   ; attrs
     and edx, 4                  ; inverse bit
     ; XOR with selection state at (r12, r13)
@@ -6174,9 +6232,15 @@ render_screen:
     mov rdx, rbx
     imul rdx, CELL_SIZE
     add rax, rdx
-    ; Compute effective fg/bg for this cell (with selection XOR)
-    movzx edx, byte [rax + 2]  ; cell fg
-    movzx esi, byte [rax + 3]  ; cell bg
+    ; Compute effective fg/bg pixel for this cell (with selection XOR)
+    mov edx, [palette + 7*4]
+    mov r10d, [rax + 8]
+    test byte [rax + 2], 1
+    cmovz edx, r10d
+    mov esi, [palette]
+    mov r10d, [rax + 12]
+    test byte [rax + 3], 1
+    cmovz esi, r10d
     movzx r10d, byte [rax + 4] ; attrs (use r10 to preserve rax)
     and r10d, 4                ; inverse bit
     push rax                   ; preserve cell base
@@ -6217,7 +6281,7 @@ render_screen:
     test ecx, ecx
     jz .rs_next_row
 
-    ; ChangeGC fg/bg
+    ; ChangeGC fg/bg (r14d/r15d already hold resolved 32-bit pixels)
     push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
@@ -6226,22 +6290,21 @@ render_screen:
     mov eax, [gc_id]
     mov [rdi+4], eax
     mov dword [rdi+8], GC_FOREGROUND | GC_BACKGROUND
-    mov eax, [palette + r14*4]
-    mov [rdi+12], eax
-    mov eax, [palette + r15*4]
-    mov [rdi+16], eax
+    mov [rdi+12], r14d
+    mov [rdi+16], r15d
     lea rsi, [tmp_buf]
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
     pop rcx
 
-    ; If pseudo-transparency is active and this run uses the default
-    ; background (palette index 0), draw the text without filling the
-    ; background so the wallpaper-tinted BackPixmap shows through.
+    ; If pseudo-transparency is active and this run's effective bg pixel
+    ; equals palette[0] (the see-through default), draw text without
+    ; filling so the wallpaper-tinted BackPixmap shows through.
     cmp byte [pseudo_full], 1
     jne .rs_imagetext
-    test r15d, r15d
+    mov eax, [palette]
+    cmp r15d, eax
     jne .rs_imagetext
     jmp .rs_polytext
 
@@ -6385,7 +6448,11 @@ render_screen:
     jmp .rs_link_scan
 .rs_link_span:
     mov r14, r13                 ; span start col
-    movzx r15d, byte [grid + rax + 2]   ; fg of first cell (used for line color)
+    ; Resolve fg pixel of first cell (used for underline color)
+    mov r15d, [palette + 7*4]
+    mov edx, [grid + rax + 8]
+    test byte [grid + rax + 2], 1
+    cmovz r15d, edx
 .rs_link_extend:
     inc r13
     cmp r13, [grid_cols]
@@ -6399,7 +6466,7 @@ render_screen:
     jne .rs_link_draw
     jmp .rs_link_extend
 .rs_link_draw:
-    ; ChangeGC fg = palette[r15]
+    ; ChangeGC fg = r15 (already a resolved pixel)
     push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
@@ -6408,8 +6475,7 @@ render_screen:
     mov eax, [gc_id]
     mov [rdi+4], eax
     mov dword [rdi+8], GC_FOREGROUND
-    mov eax, [palette + r15*4]
-    mov [rdi+12], eax
+    mov [rdi+12], r15d
     lea rsi, [tmp_buf]
     mov rdx, 16
     call x11_buffer
