@@ -243,6 +243,18 @@ font_18_len equ $ - font_18 - 1
 font_20: db "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso10646-1", 0
 font_20_len equ $ - font_20 - 1
 
+; Larger Terminus presets — much more legible than misc-fixed at the
+; same point size. Available wherever the `xfonts-terminus` package
+; is installed (Debian/Ubuntu, Arch, Fedora).
+font_22: db "-xos4-terminus-medium-r-normal--22-220-72-72-c-110-iso10646-1", 0
+font_22_len equ $ - font_22 - 1
+font_24: db "-xos4-terminus-medium-r-normal--24-240-72-72-c-120-iso10646-1", 0
+font_24_len equ $ - font_24 - 1
+font_28: db "-xos4-terminus-medium-r-normal--28-280-72-72-c-140-iso10646-1", 0
+font_28_len equ $ - font_28 - 1
+font_32: db "-xos4-terminus-medium-r-normal--32-320-72-72-c-160-iso10646-1", 0
+font_32_len equ $ - font_32 - 1
+
 ; PTY paths
 ptmx_path:      db "/dev/ptmx", 0
 pts_prefix:     db "/dev/pts/", 0
@@ -9344,6 +9356,14 @@ setup_font_name:
     je .sfn_18
     cmp rax, 20
     je .sfn_20
+    cmp rax, 22
+    je .sfn_22
+    cmp rax, 24
+    je .sfn_24
+    cmp rax, 28
+    je .sfn_28
+    cmp rax, 32
+    je .sfn_32
     jmp .sfn_done            ; unsupported size, use default
 
 .sfn_10:
@@ -9365,6 +9385,22 @@ setup_font_name:
 .sfn_20:
     lea rsi, [font_20]
     mov r12, font_20_len
+    jmp .sfn_copy
+.sfn_22:
+    lea rsi, [font_22]
+    mov r12, font_22_len
+    jmp .sfn_copy
+.sfn_24:
+    lea rsi, [font_24]
+    mov r12, font_24_len
+    jmp .sfn_copy
+.sfn_28:
+    lea rsi, [font_28]
+    mov r12, font_28_len
+    jmp .sfn_copy
+.sfn_32:
+    lea rsi, [font_32]
+    mov r12, font_32_len
 
 .sfn_copy:
     ; Copy font name to dyn_font_name

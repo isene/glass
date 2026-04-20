@@ -54,7 +54,10 @@ opacity = 80
 cursor_blink = 500
 ```
 
-Available font sizes: 10, 13, 15, 18, 20. Colors are hex RGB.
+Available font sizes: 10, 13, 15, 18, 20 (misc-fixed, always present),
+22, 24, 28, 32 (xos4-terminus, requires the `xfonts-terminus` package
+on Debian/Ubuntu/Arch/Fedora — much more legible at large sizes).
+Colors are hex RGB.
 `cursor_blink` is the toggle interval in milliseconds (omit or set
 to `0` for a steady cursor).
 `opacity` is a 0..100 percentage (100 = opaque, default). Values
@@ -153,11 +156,12 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 
 ## Roadmap
 
-- [ ] True emoji rendering (Xrender extension)
+- [x] True emoji rendering (XRender extension + bundled cache)
+- [x] Opacity/transparency (compositor + wallpaper sampling fallback)
+- [ ] Pure-asm TTF parser/rasterizer (the bonkers route — kitty-grade fonts without breaking pure-asm/zero-deps)
 - [ ] Tab/split support (multiple PTYs)
 - [ ] Font ligatures
 - [ ] Image protocol (Sixel or kitty graphics)
-- [ ] Opacity/transparency
 - [ ] WM_CLASS for window manager integration
 - [ ] Configurable key bindings
 
