@@ -3421,26 +3421,46 @@ pty_fork:
     mov rdi, [x11_fd]
     syscall
 
-    ; Build child env: copy envp, replace/add TERM=xterm-256color
+    ; Build child env: copy parent envp into child_envp, replacing
+    ; TERM with our own value and dropping any inherited variables
+    ; that identify a different terminal emulator. If glass was launched
+    ; from kitty, KITTY_WINDOW_ID etc. would otherwise pass through and
+    ; mislead detect-protocol code (e.g. glow) into sending kitty
+    ; graphics commands to glass that we can't handle yet.
     mov rsi, [envp]
     lea rdi, [child_envp]
-    xor ecx, ecx             ; dest index
-    xor r8d, r8d             ; found TERM flag
+    xor ecx, ecx                     ; dest index
+    xor r8d, r8d                     ; found TERM flag
 .ptf_env_copy:
     mov rax, [rsi]
     test rax, rax
     jz .ptf_env_add_term
-    ; Check if this is TERM=
+    ; Drop KITTY_*  (KITTY_WINDOW_ID, KITTY_PID, KITTY_LISTEN_ON, ...)
+    cmp dword [rax], 'KITT'
+    jne .ptf_chk_terminfo
+    cmp byte [rax+4], 'Y'
+    jne .ptf_chk_terminfo
+    cmp byte [rax+5], '_'
+    je .ptf_env_skip
+.ptf_chk_terminfo:
+    ; Drop TERMINFO (parent's terminfo dir is kitty's; child should
+    ; fall back to system terminfo for the TERM we advertise).
     cmp dword [rax], 'TERM'
     jne .ptf_env_keep
+    cmp dword [rax+4], 'INFO'
+    jne .ptf_chk_term
+    cmp byte [rax+8], '='
+    je .ptf_env_skip
+.ptf_chk_term:
+    ; Replace TERM= with our own value.
     cmp byte [rax+4], '='
     jne .ptf_env_keep
-    ; Replace TERM with our value
     lea rax, [term_env]
     mov r8d, 1
 .ptf_env_keep:
     mov [rdi + rcx*8], rax
     inc ecx
+.ptf_env_skip:
     add rsi, 8
     jmp .ptf_env_copy
 .ptf_env_add_term:
