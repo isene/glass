@@ -12,6 +12,7 @@
 %define SYS_CLOSE       3
 %define SYS_POLL        7
 %define SYS_MMAP        9
+%define SYS_MUNMAP      11
 %define SYS_IOCTL       16
 %define SYS_DUP2        33
 %define SYS_SOCKET      41
@@ -87,6 +88,18 @@
 %define RENDER_COMPOSITE             8
 %define RENDER_OP_OVER               3
 
+; Kitty graphics protocol
+%define APC_BODY_MAX        16384            ; one APC body cap (glow chunks ~4K)
+%define APC_PAYLOAD_MAX     16777216         ; 16MB accumulator for base64 chunks
+%define IMG_SLOTS           32
+%define IMG_SLOT_SIZE       32
+%define PLACE_SLOTS         32
+%define PLACE_SLOT_SIZE     16
+%define MAX_IMG_DIM         8192             ; sanity cap on width/height
+%define IMG_DECODE_MAX      67108864         ; 64MB max decoded RGBA
+%define MMAP_PROT_RW        3
+%define MMAP_FLAGS_PRIV     0x22             ; MAP_PRIVATE | MAP_ANONYMOUS
+
 ; X11 event types
 %define EV_KEY_PRESS        2
 %define EV_KEY_RELEASE      3
@@ -149,7 +162,8 @@
 %define VT_CSI_PARAM    3
 %define VT_OSC          4
 %define VT_CHARSET      5    ; consume one charset designator byte, then VT_NORMAL
-%define VT_STRING       6    ; APC/DCS/PM body: discard bytes until ST (ESC \) or BEL
+%define VT_STRING       6    ; DCS/PM body: discard bytes until ST (ESC \) or BEL
+%define VT_APC          7    ; APC body: capture into apc_body, dispatch on ST/BEL
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data section
@@ -203,6 +217,18 @@ convert_arg_none: db "none", 0
 convert_arg_depth:db "-depth", 0
 convert_arg_8:    db "8", 0
 convert_arg_rgba: db "RGBA:-", 0
+; PNG → RGBA conversion for kitty graphics: `convert png:- rgba:-`
+convert_arg_png_in: db "png:-", 0
+convert_arg_rgba_lower: db "rgba:-", 0
+
+; Advertised TERM for the child shell. Set to xterm-kitty so apps
+; (glow, ueberzug, etc.) detect that glass supports kitty graphics.
+; Change from xterm-256color happens once image display is wired up.
+kitty_term_env: db "TERM=xterm-kitty", 0
+; _GLASS_ID= identifies glass specifically so apps that want to test
+; for glass (vs. real kitty) can branch. Not yet used by any known
+; client, but cheap to advertise.
+glass_id_env: db "_GLASS_ID=1", 0
 
 ; Selection atom names
 clipboard_str:    db "CLIPBOARD", 0
@@ -292,7 +318,7 @@ pts_prefix:     db "/dev/pts/", 0
 ; Shell to launch
 shell_name:     db "bare", 0
 shell_flag:     db "-l", 0
-term_env:       db "TERM=xterm-256color", 0
+term_env:       db "TERM=xterm-kitty", 0
 hkp_dbg_path:   db "/tmp/glass_keys.log", 0
 hkp_paste_marker: db "*** PASTE HANDLER REACHED ***", 10
 hkp_paste_marker_len equ $ - hkp_paste_marker
@@ -382,6 +408,25 @@ gc_bg_id:           resd 1
 font_id:            resd 1
 font_id_bold:       resd 1          ; bold variant; equals font_id when none
 gc_current_font:    resd 1          ; tracks which font is loaded in gc_id
+
+; Kitty graphics protocol state
+apc_body:           resb APC_BODY_MAX
+apc_body_len:       resq 1
+apc_payload:        resb APC_PAYLOAD_MAX  ; accumulated base64 across chunks
+apc_payload_len:    resq 1
+apc_pending_id:     resd 1          ; image id from first chunk's a=t
+apc_pending_fmt:    resd 1          ; 100=PNG, 32=RGBA, 24=RGB
+apc_pending_w:      resd 1          ; for raw RGBA
+apc_pending_h:      resd 1
+apc_pending_q:      resb 1          ; quiet level
+apc_pending_active: resb 1          ; 1 = mid-transmission (m=1 seen)
+apc_pending_place:  resb 1          ; 1 = a=T, place after decoding
+img_table:          resb IMG_SLOTS * IMG_SLOT_SIZE
+place_table:        resb PLACE_SLOTS * PLACE_SLOT_SIZE
+place_count:        resq 1
+img_decode_buf:     resq 1          ; mmap'd RGBA scratch (decoded PNG)
+img_decode_len:     resq 1          ; allocated bytes
+png_argv:           resq 8          ; argv[] for the convert child
 run_bold:           resb 1          ; current run's bold bit (renderer)
 run_underline:      resb 1          ; current run's underline bit (renderer)
 wm_protocols_atom:  resd 1
@@ -4868,6 +4913,8 @@ vt_process:
     je .vtp_charset
     cmp rcx, VT_STRING
     je .vtp_string_discard
+    cmp rcx, VT_APC
+    je .vtp_apc_capture
 
     ; VT_NORMAL
     cmp al, 27               ; ESC
@@ -5068,13 +5115,10 @@ vt_process:
     je .vtp_charset_start
     cmp al, '+'
     je .vtp_charset_start
-    ; Application Program Command (kitty graphics, tmux passthrough),
-    ; Device Control String (sixel, DECRQSS), Privacy Message —
-    ; consume the body silently until ST (ESC \) or BEL. Without this,
-    ; apps like pointer leak the kitty-graphics command parameters as
-    ; visible text after a stray 'G'.
+    ; Application Program Command (kitty graphics): capture body and
+    ; dispatch on terminator. DCS / PM still get discarded silently.
     cmp al, '_'
-    je .vtp_start_string
+    je .vtp_start_apc
     cmp al, 'P'
     je .vtp_start_string
     cmp al, '^'
@@ -5109,6 +5153,54 @@ vt_process:
     jne .vtp_string_discard      ; nested ESC? keep discarding
 .vtp_string_end:
     mov qword [vt_state], VT_NORMAL
+    jmp .vtp_loop
+
+.vtp_start_apc:
+    mov qword [vt_state], VT_APC
+    mov qword [apc_body_len], 0
+    jmp .vtp_loop
+
+.vtp_apc_capture:
+    ; BEL terminates and dispatches.
+    cmp al, 7
+    je .vtp_apc_dispatch
+    ; ESC could start ST (ESC \).
+    cmp al, 27
+    jne .vtp_apc_store
+    cmp r14, r13
+    jge .vtp_loop                    ; out of bytes; resume next read
+    mov al, [r12 + r14]
+    inc r14
+    cmp al, '\'
+    je .vtp_apc_dispatch
+    ; Stray ESC inside body: keep capturing both the ESC and this byte
+    ; (rare, but pessimistically preserve so we don't break weird apps).
+    push rax
+    mov al, 27
+    call .vtp_apc_store_helper
+    pop rax
+.vtp_apc_store:
+    call .vtp_apc_store_helper
+    jmp .vtp_loop
+
+.vtp_apc_store_helper:
+    mov rcx, [apc_body_len]
+    cmp rcx, APC_BODY_MAX
+    jge .vtp_apc_store_full
+    mov [apc_body + rcx], al
+    inc qword [apc_body_len]
+.vtp_apc_store_full:
+    ret
+
+.vtp_apc_dispatch:
+    mov qword [vt_state], VT_NORMAL
+    ; Only handle 'G' (kitty graphics). Everything else is silently
+    ; dropped — mostly tmux passthrough or app-specific extensions.
+    cmp qword [apc_body_len], 1
+    jl .vtp_loop
+    cmp byte [apc_body], 'G'
+    jne .vtp_loop
+    call handle_kitty_apc
     jmp .vtp_loop
 
 .vtp_start_csi:
@@ -8124,6 +8216,67 @@ render_screen:
     jmp .rs_emoji_row
 .rs_emoji_done:
 
+    ; Image overlay pass: composite each entry in place_table via
+    ; XRender, scaled into its declared cell rectangle.
+    cmp dword [render_major], 0
+    je .rs_imgs_done
+    xor r12, r12
+.rs_imgs_loop:
+    cmp r12, PLACE_SLOTS
+    jge .rs_imgs_done
+    mov eax, r12d
+    imul eax, PLACE_SLOT_SIZE
+    lea r13, [place_table + rax]
+    mov edi, [r13]
+    test edi, edi
+    jz .rs_imgs_next
+    call img_find
+    test rsi, rsi
+    jz .rs_imgs_next
+    mov r14d, [rsi + 16]             ; picture id (r14 callee-saved)
+    test r14d, r14d
+    jz .rs_imgs_next
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_COMPOSITE
+    mov word [rdi+2], 9
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov [rdi+8], r14d                ; src picture
+    mov dword [rdi+12], 0            ; mask = None
+    mov eax, [render_window_picture]
+    mov [rdi+16], eax                ; dst
+    mov word [rdi+20], 0             ; src x
+    mov word [rdi+22], 0             ; src y
+    mov word [rdi+24], 0             ; mask x
+    mov word [rdi+26], 0             ; mask y
+    movzx eax, word [r13 + 6]        ; anchor_col
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+28], ax
+    movzx eax, word [r13 + 4]        ; anchor_row
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+30], ax
+    movzx eax, word [r13 + 8]        ; cell_w
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+32], ax
+    movzx eax, word [r13 + 10]       ; cell_h
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+34], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 36
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_imgs_next:
+    inc r12
+    jmp .rs_imgs_loop
+.rs_imgs_done:
+
 .rs_cursor:
     ; Skip cursor drawing if cursor_visible == 0
     cmp qword [cursor_visible], 0
@@ -9951,6 +10104,1333 @@ setup_font_name:
     mov [dyn_font_name_len], rcx
 
 .sfn_done:
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Kitty graphics protocol — APC body handler
+; ══════════════════════════════════════════════════════════════════════
+; Wire format (all chunks are framed by VT_APC capture):
+;   first chunk:  Ga=t,f=100,i=ID,q=2,m=1;<base64>
+;   continue:     Gm=1;<base64>
+;   final:        Gm=0;<base64>
+;   place:        Ga=p,i=ID,c=W,r=H,q=2,C=1
+;   delete:       Ga=d,d=i,i=ID,q=2
+;
+; Parsed key=value parameters end up in apc_kv_* BSS slots, then we
+; dispatch by action.
+section .bss
+apc_kv_a:           resb 1          ; action: 't','p','T','d', 0=missing
+apc_kv_i:           resd 1          ; image id (decimal)
+apc_kv_f:           resd 1          ; format (24/32/100; default 32)
+apc_kv_m:           resb 1          ; more chunks (0/1; default 0)
+apc_kv_q:           resb 1          ; quiet level
+apc_kv_C:           resb 1          ; 1 = don't move cursor
+apc_kv_c:           resw 1          ; dest cell columns
+apc_kv_r:           resw 1          ; dest cell rows
+apc_kv_s:           resd 1          ; source pixel width (raw RGBA)
+apc_kv_v:           resd 1          ; source pixel height (raw RGBA)
+apc_kv_d:           resb 1          ; delete target ('a' / 'i')
+apc_payload_off:    resq 1          ; offset of payload start in apc_body
+
+section .text
+
+; Reset apc_kv_* to safe defaults at the start of every APC.
+apc_reset_kv:
+    mov byte [apc_kv_a], 0
+    mov dword [apc_kv_i], 0
+    mov dword [apc_kv_f], 32
+    mov byte [apc_kv_m], 0
+    mov byte [apc_kv_q], 0
+    mov byte [apc_kv_C], 0
+    mov word [apc_kv_c], 0
+    mov word [apc_kv_r], 0
+    mov dword [apc_kv_s], 0
+    mov dword [apc_kv_v], 0
+    mov byte [apc_kv_d], 0
+    ret
+
+; Parse decimal at [rsi] into rax. Stops on first non-digit. rsi
+; advances past the digits. Caller must zero rax beforehand if needed.
+apc_parse_uint:
+    xor eax, eax
+.apu_loop:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .apu_done
+    cmp cl, '9'
+    ja .apu_done
+    imul eax, eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .apu_loop
+.apu_done:
+    ret
+
+; Walk apc_body[1..apc_body_len], parsing comma-separated key=value
+; tokens until ';' (start of payload) or end of body. On return,
+; apc_payload_off holds the offset just past ';' (or apc_body_len if
+; there's no payload in this chunk).
+apc_parse_header:
+    push rbx
+    push r12
+    call apc_reset_kv
+    mov rbx, 1                       ; skip leading 'G'
+    mov r12, [apc_body_len]
+.aph_token:
+    cmp rbx, r12
+    jge .aph_done_no_payload
+    movzx eax, byte [apc_body + rbx]
+    cmp al, ';'
+    je .aph_have_payload
+    cmp al, ','
+    jne .aph_key
+    inc rbx
+    jmp .aph_token
+.aph_key:
+    ; al = key letter (one byte), then expect '='.
+    inc rbx
+    cmp rbx, r12
+    jge .aph_done_no_payload
+    cmp byte [apc_body + rbx], '='
+    jne .aph_skip_to_sep             ; malformed — skip to next , or ;
+    inc rbx
+    cmp rbx, r12
+    jge .aph_done_no_payload
+    lea rsi, [apc_body + rbx]
+    call apc_parse_value             ; reads al as key, advances rsi past value
+    sub rsi, apc_body
+    mov rbx, rsi                     ; offset of the next ',' / ';' / end
+    jmp .aph_token
+
+.aph_skip_to_sep:
+    cmp rbx, r12
+    jge .aph_done_no_payload
+    movzx eax, byte [apc_body + rbx]
+    cmp al, ','
+    je .aph_token
+    cmp al, ';'
+    je .aph_have_payload
+    inc rbx
+    jmp .aph_skip_to_sep
+
+.aph_have_payload:
+    inc rbx                          ; skip the ';'
+    mov [apc_payload_off], rbx
+    jmp .aph_ret
+.aph_done_no_payload:
+    mov [apc_payload_off], r12
+.aph_ret:
+    pop r12
+    pop rbx
+    ret
+
+; rax = key letter, rsi = pointer to value start. Reads/parses based
+; on key, advances rsi past the value (stops at ',' / ';' / EOL).
+apc_parse_value:
+    cmp al, 'a'
+    je .apv_a
+    cmp al, 'i'
+    je .apv_i
+    cmp al, 'f'
+    je .apv_f
+    cmp al, 'm'
+    je .apv_m
+    cmp al, 'q'
+    je .apv_q
+    cmp al, 'C'
+    je .apv_C_kv
+    cmp al, 'c'
+    je .apv_c
+    cmp al, 'r'
+    je .apv_r
+    cmp al, 's'
+    je .apv_s
+    cmp al, 'v'
+    je .apv_v
+    cmp al, 'd'
+    je .apv_d
+    jmp .apv_skip                    ; unknown key — skip
+.apv_a:
+    movzx eax, byte [rsi]
+    mov [apc_kv_a], al
+    inc rsi
+    jmp .apv_skip                    ; tolerate trailing junk after 1-char val
+.apv_i:
+    call apc_parse_uint
+    mov [apc_kv_i], eax
+    jmp .apv_skip
+.apv_f:
+    call apc_parse_uint
+    mov [apc_kv_f], eax
+    jmp .apv_skip
+.apv_m:
+    call apc_parse_uint
+    mov [apc_kv_m], al
+    jmp .apv_skip
+.apv_q:
+    call apc_parse_uint
+    mov [apc_kv_q], al
+    jmp .apv_skip
+.apv_C_kv:
+    call apc_parse_uint
+    mov [apc_kv_C], al
+    jmp .apv_skip
+.apv_c:
+    call apc_parse_uint
+    mov [apc_kv_c], ax
+    jmp .apv_skip
+.apv_r:
+    call apc_parse_uint
+    mov [apc_kv_r], ax
+    jmp .apv_skip
+.apv_s:
+    call apc_parse_uint
+    mov [apc_kv_s], eax
+    jmp .apv_skip
+.apv_v:
+    call apc_parse_uint
+    mov [apc_kv_v], eax
+    jmp .apv_skip
+.apv_d:
+    movzx eax, byte [rsi]
+    mov [apc_kv_d], al
+    inc rsi
+.apv_skip:
+    movzx ecx, byte [rsi]
+    test cl, cl
+    jz .apv_done
+    cmp cl, ','
+    je .apv_done
+    cmp cl, ';'
+    je .apv_done
+    inc rsi
+    jmp .apv_skip
+.apv_done:
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; Base64 decoder.
+;   rdi = src bytes (base64 ASCII), rsi = src length
+;   rdx = dst buffer
+; Returns rax = bytes written. Skips whitespace and '=' padding.
+; Uses a 256-entry lookup table built lazily on first call.
+; ──────────────────────────────────────────────────────────────────
+section .bss
+b64_table:          resb 256
+b64_table_init:     resb 1
+section .text
+
+b64_init_table:
+    push rdi
+    push rcx
+    push rax
+    cmp byte [b64_table_init], 1
+    je .b64it_done
+    ; Mark all entries 0xFF (invalid)
+    lea rdi, [b64_table]
+    mov ecx, 256
+    mov al, 0xFF
+    rep stosb
+    ; A..Z = 0..25
+    xor ecx, ecx
+.b64it_az:
+    cmp ecx, 26
+    jge .b64it_after_az
+    mov eax, ecx
+    add eax, 'A'
+    mov [b64_table + rax], cl
+    inc ecx
+    jmp .b64it_az
+.b64it_after_az:
+    ; a..z = 26..51
+    xor ecx, ecx
+.b64it_atoz:
+    cmp ecx, 26
+    jge .b64it_after_atoz
+    mov eax, ecx
+    add eax, 'a'
+    lea edx, [ecx + 26]
+    mov [b64_table + rax], dl
+    inc ecx
+    jmp .b64it_atoz
+.b64it_after_atoz:
+    ; 0..9 = 52..61
+    xor ecx, ecx
+.b64it_09:
+    cmp ecx, 10
+    jge .b64it_after_09
+    mov eax, ecx
+    add eax, '0'
+    lea edx, [ecx + 52]
+    mov [b64_table + rax], dl
+    inc ecx
+    jmp .b64it_09
+.b64it_after_09:
+    mov byte [b64_table + '+'], 62
+    mov byte [b64_table + '/'], 63
+    mov byte [b64_table_init], 1
+.b64it_done:
+    pop rax
+    pop rcx
+    pop rdi
+    ret
+
+base64_decode:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call b64_init_table
+    mov r12, rdi                     ; src
+    mov r13, rsi                     ; src len
+    mov r14, rdx                     ; dst
+    xor r15, r15                     ; src index
+    xor rbx, rbx                     ; dst written
+    xor edx, edx                     ; running 24-bit accumulator
+    xor ecx, ecx                     ; bits accumulated
+.b64d_loop:
+    cmp r15, r13
+    jge .b64d_done
+    movzx eax, byte [r12 + r15]
+    inc r15
+    movzx eax, byte [b64_table + rax]
+    cmp al, 0xFF
+    je .b64d_loop                    ; whitespace / '=' / unknown
+    shl edx, 6
+    or edx, eax
+    add ecx, 6
+    cmp ecx, 8
+    jl .b64d_loop
+    sub ecx, 8
+    mov eax, edx
+    mov esi, ecx
+    shr eax, cl
+    mov [r14 + rbx], al
+    inc rbx
+    ; Mask off the byte we just emitted from the accumulator.
+    mov eax, 1
+    shl eax, cl
+    dec eax
+    and edx, eax
+    jmp .b64d_loop
+.b64d_done:
+    mov rax, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; PNG header parser.
+;   rdi = PNG data, rsi = data length
+; Returns: eax = width, edx = height, rcx = 1 on success / 0 on
+; failure. PNG layout: 8-byte sig, then 13-byte IHDR chunk whose
+; data is at offset 16: width(4 BE), height(4 BE).
+; ──────────────────────────────────────────────────────────────────
+png_dimensions:
+    cmp rsi, 24
+    jl .pd_fail
+    cmp byte [rdi + 0], 0x89
+    jne .pd_fail
+    cmp byte [rdi + 1], 'P'
+    jne .pd_fail
+    cmp byte [rdi + 2], 'N'
+    jne .pd_fail
+    cmp byte [rdi + 3], 'G'
+    jne .pd_fail
+    ; Width at offset 16, big-endian
+    mov al, [rdi + 16]
+    mov ah, [rdi + 17]
+    rol ax, 8                        ; ah:al -> al:ah => big-endian
+    movzx eax, ax
+    mov cl, [rdi + 18]
+    mov ch, [rdi + 19]
+    shl eax, 16
+    movzx ecx, cx
+    rol cx, 8
+    movzx ecx, cx
+    or eax, ecx                      ; full 32-bit width
+    push rax
+    ; Height at offset 20
+    mov al, [rdi + 20]
+    mov ah, [rdi + 21]
+    rol ax, 8
+    movzx eax, ax
+    mov cl, [rdi + 22]
+    mov ch, [rdi + 23]
+    shl eax, 16
+    rol cx, 8
+    movzx ecx, cx
+    or eax, ecx
+    mov edx, eax
+    pop rax
+    mov ecx, 1
+    ret
+.pd_fail:
+    xor eax, eax
+    xor edx, edx
+    xor ecx, ecx
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; Fork convert to decode PNG → RGBA into the mmap'd img_decode_buf.
+;   rdi = pointer to PNG bytes, rsi = byte count, edx = expected RGBA
+;   bytes (width*height*4). Returns rax = bytes actually read, or 0
+;   on failure.
+;
+; Pipeline:  parent → pipe1 → child stdin (PNG bytes)
+;            child stdout → pipe2 → parent (RGBA bytes)
+; Child:     execve("/usr/bin/convert", ["convert","png:-","rgba:-"])
+; ──────────────────────────────────────────────────────────────────
+png_decode_to_rgba:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                     ; PNG data
+    mov r13, rsi                     ; PNG length
+    mov r14, rdx                     ; expected RGBA bytes
+
+    ; mmap a fresh decode buffer if needed (or larger)
+    mov rax, [img_decode_len]
+    cmp r14, rax
+    jbe .pdr_have_buf
+    ; Need bigger buf — unmap existing then mmap fresh
+    mov rax, [img_decode_buf]
+    test rax, rax
+    jz .pdr_alloc
+    push rax
+    mov rax, SYS_MUNMAP
+    mov rdi, [img_decode_buf]
+    mov rsi, [img_decode_len]
+    syscall
+    pop rax
+    mov qword [img_decode_buf], 0
+.pdr_alloc:
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, r14
+    mov rdx, MMAP_PROT_RW
+    mov r10, MMAP_FLAGS_PRIV
+    mov r8, -1
+    xor r9, r9
+    syscall
+    cmp rax, -4096
+    ja .pdr_fail
+    mov [img_decode_buf], rax
+    mov [img_decode_len], r14
+.pdr_have_buf:
+
+    ; Build argv: convert png:- rgba:-
+    lea rax, [convert_path]
+    mov [png_argv + 0*8], rax
+    lea rax, [convert_arg_png_in]
+    mov [png_argv + 1*8], rax
+    lea rax, [convert_arg_rgba_lower]
+    mov [png_argv + 2*8], rax
+    mov qword [png_argv + 3*8], 0
+
+    ; Two pipes: stdin (parent → child PNG), stdout (child → parent RGBA)
+    sub rsp, 32
+    mov rax, SYS_PIPE
+    lea rdi, [rsp]
+    syscall
+    test rax, rax
+    js .pdr_pipe_fail
+    mov rax, SYS_PIPE
+    lea rdi, [rsp + 8]
+    syscall
+    test rax, rax
+    js .pdr_pipe_fail
+    mov ebx, [rsp]                   ; in_read  (child stdin source)
+    mov r15d, [rsp + 4]              ; in_write (parent writes here)
+    mov r10d, [rsp + 8]              ; out_read (parent reads here)
+    mov r11d, [rsp + 12]             ; out_write (child stdout target)
+    add rsp, 32
+
+    ; Fork
+    sub rsp, 16                      ; reserve for r10/r11 across syscall
+    mov [rsp], r10d
+    mov [rsp + 4], r11d
+    mov rax, SYS_FORK
+    syscall
+    mov r10d, [rsp]
+    mov r11d, [rsp + 4]
+    add rsp, 16
+    test rax, rax
+    js .pdr_fork_fail
+    jnz .pdr_parent
+
+    ; ── Child ──
+    ; dup2(in_read, 0); dup2(out_write, 1); close pipe ends; exec.
+    mov rax, SYS_DUP2
+    mov edi, ebx
+    xor esi, esi
+    syscall
+    mov rax, SYS_DUP2
+    mov edi, r11d
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r10d
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r11d
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [convert_path]
+    lea rsi, [png_argv]
+    mov rdx, [envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov rdi, 127
+    syscall
+
+.pdr_parent:
+    push rax                         ; child pid
+    ; Close child-side fds
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r11d
+    syscall
+    pop r11                          ; child pid in r11
+
+    ; Spawn second fork to write PNG to stdin? Easier: just write
+    ; ourselves. The PNG fits in a single write() in practice since
+    ; convert reads as we feed.
+    ; Write all PNG bytes
+    mov rdi, r12                     ; src
+    mov r12, r13                     ; remaining = len
+    push r11                         ; save pid
+.pdr_write:
+    test r12, r12
+    jz .pdr_write_done
+    mov rax, SYS_WRITE
+    push rdi
+    mov rsi, rdi
+    mov rdx, r12
+    mov edi, r15d
+    syscall
+    pop rdi
+    cmp rax, 0
+    jle .pdr_write_done
+    add rdi, rax
+    sub r12, rax
+    jmp .pdr_write
+.pdr_write_done:
+    pop r11
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+
+    ; Read RGBA from out_read until EOF or buffer full
+    push r11
+    xor r12, r12                     ; bytes received
+.pdr_read:
+    cmp r12, r14
+    jge .pdr_read_done
+    mov rax, SYS_READ
+    mov edi, r10d
+    mov rsi, [img_decode_buf]
+    add rsi, r12
+    mov rdx, r14
+    sub rdx, r12
+    syscall
+    test rax, rax
+    jle .pdr_read_done
+    add r12, rax
+    jmp .pdr_read
+.pdr_read_done:
+    mov rax, SYS_CLOSE
+    mov edi, r10d
+    syscall
+    pop r11
+
+    ; Reap child
+    push r12
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov rdi, r11
+    mov rsi, rsp
+    xor edx, edx
+    xor r10, r10
+    syscall
+    add rsp, 16
+    pop r12
+
+    mov rax, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.pdr_pipe_fail:
+    add rsp, 32
+.pdr_fork_fail:
+.pdr_fail:
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; Image table helpers.
+; Slot layout (32 bytes):
+;   +0  id (dword)
+;   +4  width (dword)
+;   +8  height (dword)
+;   +12 pixmap_id (dword)
+;   +16 picture_id (dword)
+;   +20 in_use (byte)
+;   +21..31 padding
+; ──────────────────────────────────────────────────────────────────
+img_find:
+    ; rdi = id. Returns rsi = slot pointer or 0 if not found.
+    xor ecx, ecx
+.if_loop:
+    cmp ecx, IMG_SLOTS
+    jge .if_miss
+    mov eax, ecx
+    imul eax, IMG_SLOT_SIZE
+    lea rsi, [img_table + rax]
+    cmp byte [rsi + 20], 0
+    je .if_next
+    cmp [rsi], edi
+    je .if_hit
+.if_next:
+    inc ecx
+    jmp .if_loop
+.if_miss:
+    xor esi, esi
+.if_hit:
+    ret
+
+img_alloc:
+    ; rdi = id. Find existing or pick free slot. Returns rsi = slot.
+    push rdi
+    call img_find
+    pop rdi
+    test rsi, rsi
+    jnz .ia_done
+    xor ecx, ecx
+.ia_scan:
+    cmp ecx, IMG_SLOTS
+    jge .ia_evict
+    mov eax, ecx
+    imul eax, IMG_SLOT_SIZE
+    lea rsi, [img_table + rax]
+    cmp byte [rsi + 20], 0
+    je .ia_take
+    inc ecx
+    jmp .ia_scan
+.ia_evict:
+    ; All used — evict slot 0 (simple FIFO; could be smarter)
+    lea rsi, [img_table]
+    call img_release_picture_in_rsi
+.ia_take:
+    mov [rsi], edi
+    mov dword [rsi + 4], 0
+    mov dword [rsi + 8], 0
+    mov dword [rsi + 12], 0
+    mov dword [rsi + 16], 0
+    mov byte [rsi + 20], 1
+.ia_done:
+    ret
+
+; rsi = slot pointer; release server-side picture/pixmap and mark free.
+img_release_picture_in_rsi:
+    push rbx
+    mov ebx, [rsi + 16]              ; picture_id
+    test ebx, ebx
+    jz .irp_no_pic
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_FREE_PICTURE
+    mov word [rdi+2], 2
+    mov [rdi+4], ebx
+    push rsi
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    pop rsi
+    inc dword [x11_seq]
+.irp_no_pic:
+    mov ebx, [rsi + 12]              ; pixmap_id
+    test ebx, ebx
+    jz .irp_no_pix
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_FREE_PIXMAP
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], ebx
+    push rsi
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    pop rsi
+    inc dword [x11_seq]
+.irp_no_pix:
+    mov byte [rsi + 20], 0
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; Upload RGBA bytes from img_decode_buf into a new server pixmap +
+; XRender Picture, store XIDs in slot at rsi.
+;   rsi = slot pointer (must already be allocated, in_use=1)
+;   rdi = width, rdx = height, r8 = byte count (w*h*4)
+; ──────────────────────────────────────────────────────────────────
+img_upload_rsi:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsi                     ; slot
+    mov r13, rdi                     ; width
+    mov r14, rdx                     ; height
+    mov r15, r8                      ; bytes
+
+    ; Sanity check
+    cmp dword [render_major], 0
+    je .iur_fail
+
+    ; CreatePixmap depth=32, w=r13, h=r14, drawable=win
+    call alloc_xid
+    mov [r12 + 12], eax              ; pixmap_id
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov byte [rdi+1], 32
+    mov word [rdi+2], 4
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], r13w
+    mov word [rdi+14], r14w
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Make sure render_temp_gc exists for depth-32 pixmaps
+    cmp byte [render_gc_ready], 1
+    je .iur_gc_done
+    call alloc_xid
+    mov [render_temp_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [render_temp_gc]
+    mov [rdi+4], eax
+    mov eax, [r12 + 12]              ; depth-32 drawable
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov byte [render_gc_ready], 1
+.iur_gc_done:
+
+    ; PutImage in row-stride chunks. X11 caps requests around 16MB
+    ; even with BIG-REQUESTS, but keeping each PutImage ≤ 256KB lets
+    ; us avoid that whole code path. Send strips of N rows at a time
+    ; where N*width*4 ≤ 200000 bytes.
+    call x11_flush
+    xor rcx, rcx                     ; current y
+    mov rax, 200000
+    xor edx, edx
+    mov ebx, r13d
+    shl ebx, 2                       ; bytes per row
+    test ebx, ebx
+    jz .iur_after_putimage
+    div rbx                          ; rax = rows-per-strip
+    test rax, rax
+    jnz .iur_have_strip
+    mov rax, 1                       ; at minimum one row per strip
+.iur_have_strip:
+    mov r8, rax                      ; rows per strip
+.iur_strip_loop:
+    cmp rcx, r14
+    jge .iur_after_putimage
+    mov r9, r14
+    sub r9, rcx
+    cmp r9, r8
+    jle .iur_strip_h_ok
+    mov r9, r8
+.iur_strip_h_ok:
+    ; strip_bytes = r9 * width * 4
+    mov rax, r9
+    imul rax, r13
+    shl rax, 2
+    push rcx
+    push r9
+    push rax                         ; strip bytes
+
+    ; Header
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2              ; ZPixmap
+    mov rdx, rax
+    add rdx, 24 + 3
+    shr rdx, 2
+    mov word [rdi+2], dx
+    mov edx, [r12 + 12]
+    mov [rdi+4], edx
+    mov edx, [render_temp_gc]
+    mov [rdi+8], edx
+    mov word [rdi+12], r13w          ; width
+    mov word [rdi+14], r9w           ; strip height
+    mov word [rdi+16], 0
+    mov word [rdi+18], cx            ; dst-y
+    mov byte [rdi+20], 0
+    mov byte [rdi+21], 32
+    mov word [rdi+22], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+
+    ; Strip data
+    pop rax                          ; strip bytes
+    pop r9
+    pop rcx
+    push r9
+    push rcx
+    mov rsi, [img_decode_buf]
+    mov rdi, rcx                     ; y
+    imul rdi, r13                    ; * width
+    shl rdi, 2                       ; * 4 = byte offset
+    add rsi, rdi
+    mov rdx, rax
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    pop rax
+    ; Pad to 4
+    test al, 3
+    jz .iur_no_pad
+    mov edx, 4
+    sub edx, eax
+    and edx, 3
+    sub rsp, 8
+    mov qword [rsp], 0
+    push rdx
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    mov rsi, rsp
+    add rsi, 8
+    pop rdx
+    syscall
+    add rsp, 8
+.iur_no_pad:
+    inc dword [x11_seq]
+    pop rcx
+    pop r9
+    add rcx, r9
+    jmp .iur_strip_loop
+.iur_after_putimage:
+
+    ; Create XRender Picture
+    call alloc_xid
+    mov [r12 + 16], eax              ; picture_id
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5
+    mov eax, [r12 + 16]
+    mov [rdi+4], eax
+    mov eax, [r12 + 12]
+    mov [rdi+8], eax
+    mov eax, [render_format_argb32]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Stash dimensions
+    mov [r12 + 4], r13d
+    mov [r12 + 8], r14d
+    call x11_flush
+    mov rax, 1
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.iur_fail:
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; Place table — record where each placed image goes.
+; Slot layout (16 bytes):
+;   +0 image_id (dword, 0 = empty)
+;   +4 anchor_row (word)
+;   +6 anchor_col (word)
+;   +8 cell_w (word)
+;   +10 cell_h (word)
+;   +12 pad
+; ──────────────────────────────────────────────────────────────────
+place_add:
+    ; rdi=id, esi=row, edx=col, ecx=cw, r8d=ch
+    push rbx
+    xor ebx, ebx
+.pa_scan:
+    cmp ebx, PLACE_SLOTS
+    jge .pa_full
+    mov eax, ebx
+    imul eax, PLACE_SLOT_SIZE
+    lea r9, [place_table + rax]
+    cmp dword [r9], 0
+    je .pa_take
+    cmp [r9], edi
+    jne .pa_next
+.pa_take:
+    mov [r9], edi
+    mov [r9 + 4], si
+    mov [r9 + 6], dx
+    mov [r9 + 8], cx
+    mov [r9 + 10], r8w
+    mov dword [r9 + 12], 0
+    pop rbx
+    ret
+.pa_next:
+    inc ebx
+    jmp .pa_scan
+.pa_full:
+    pop rbx
+    ret
+
+place_clear_image:
+    ; rdi = id; remove all entries that match
+    xor ecx, ecx
+.pci_loop:
+    cmp ecx, PLACE_SLOTS
+    jge .pci_done
+    mov eax, ecx
+    imul eax, PLACE_SLOT_SIZE
+    lea rsi, [place_table + rax]
+    cmp [rsi], edi
+    jne .pci_next
+    mov dword [rsi], 0
+.pci_next:
+    inc ecx
+    jmp .pci_loop
+.pci_done:
+    ret
+
+; Clear all placements.
+place_clear_all:
+    lea rdi, [place_table]
+    mov ecx, PLACE_SLOTS * PLACE_SLOT_SIZE / 8
+    xor eax, eax
+    rep stosq
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; The actual dispatcher: called when one APC chunk has been captured
+; into apc_body. apc_body[0] is 'G'.
+; ──────────────────────────────────────────────────────────────────
+handle_kitty_apc:
+    push rbx
+    push r12
+    push r13
+    push r14
+    call apc_parse_header
+
+    ; If continuation chunk, infer action from pending state.
+    movzx eax, byte [apc_kv_a]
+    test al, al
+    jnz .hka_have_action
+    cmp byte [apc_pending_active], 1
+    jne .hka_done                    ; orphan chunk — drop
+    mov al, 't'
+    mov [apc_kv_a], al
+.hka_have_action:
+
+    ; Dispatch on action
+    cmp al, 'd'
+    je .hka_delete
+    cmp al, 'p'
+    je .hka_place
+    cmp al, 't'
+    je .hka_transmit
+    cmp al, 'T'
+    je .hka_transmit_place
+    jmp .hka_done
+
+.hka_transmit_place:
+    mov byte [apc_pending_place], 1
+    jmp .hka_xmit_common
+.hka_transmit:
+    mov byte [apc_pending_place], 0
+.hka_xmit_common:
+    ; If first chunk (not active), capture params.
+    cmp byte [apc_pending_active], 1
+    je .hka_append
+    mov eax, [apc_kv_i]
+    mov [apc_pending_id], eax
+    mov eax, [apc_kv_f]
+    mov [apc_pending_fmt], eax
+    mov eax, [apc_kv_s]
+    mov [apc_pending_w], eax
+    mov eax, [apc_kv_v]
+    mov [apc_pending_h], eax
+    movzx eax, byte [apc_kv_q]
+    mov [apc_pending_q], al
+    mov qword [apc_payload_len], 0
+    mov byte [apc_pending_active], 1
+.hka_append:
+    ; Append apc_body[apc_payload_off..apc_body_len] to apc_payload.
+    mov rsi, [apc_payload_off]
+    mov rcx, [apc_body_len]
+    sub rcx, rsi
+    jbe .hka_after_append
+    mov rdx, [apc_payload_len]
+    add rdx, rcx
+    cmp rdx, APC_PAYLOAD_MAX
+    ja .hka_after_append             ; overflow — drop silently
+    lea rdi, [apc_payload]
+    add rdi, [apc_payload_len]
+    lea rsi, [apc_body]
+    add rsi, [apc_payload_off]
+.hka_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .hka_copy
+    mov rdx, [apc_payload_len]
+    add rdx, [apc_body_len]
+    sub rdx, [apc_payload_off]
+    mov [apc_payload_len], rdx
+.hka_after_append:
+
+    ; If more chunks coming, wait for them.
+    cmp byte [apc_kv_m], 1
+    je .hka_done
+
+    ; Last chunk — decode the accumulated payload and store the image.
+    call kitty_finalize_image
+    mov byte [apc_pending_active], 0
+    jmp .hka_done
+
+.hka_place:
+    ; Place an existing image at the cursor.
+    mov edi, [apc_kv_i]
+    test edi, edi
+    jz .hka_done
+    call img_find
+    test rsi, rsi
+    jz .hka_done
+    ; Compute cell_w / cell_h: explicit c=/r=, else native pixels / cell.
+    movzx ecx, word [apc_kv_c]       ; cell_w request
+    test ecx, ecx
+    jnz .hka_have_cw
+    mov eax, [rsi + 4]               ; image width in pixels
+    movzx edx, word [char_width]
+    test edx, edx
+    jz .hka_done
+    add eax, edx
+    dec eax                          ; ceil division
+    xor edx, edx
+    movzx r8d, word [char_width]
+    div r8d
+    mov ecx, eax
+.hka_have_cw:
+    movzx r8d, word [apc_kv_r]       ; cell_h request
+    test r8d, r8d
+    jnz .hka_have_ch
+    mov eax, [rsi + 8]               ; image height
+    movzx edx, word [char_height]
+    test edx, edx
+    jz .hka_done
+    add eax, edx
+    dec eax
+    xor edx, edx
+    movzx r9d, word [char_height]
+    div r9d
+    mov r8d, eax
+.hka_have_ch:
+    ; place_add: rdi=id, esi=row, edx=col, ecx=cw, r8d=ch
+    mov rdi, [cursor_row]
+    mov rsi, rdi
+    mov edi, [apc_kv_i]
+    mov rdx, [cursor_col]
+    call place_add
+    ; Ask the renderer to redraw the image overlay.
+    call render_screen
+    call x11_flush
+    jmp .hka_done
+
+.hka_delete:
+    movzx eax, byte [apc_kv_d]
+    cmp al, 'a'
+    je .hka_delete_all
+    ; default 'i' or 'I' or any other — delete by id
+    mov edi, [apc_kv_i]
+    test edi, edi
+    jz .hka_done
+    push rdi
+    call img_find
+    pop rdi
+    test rsi, rsi
+    jz .hka_done
+    call img_release_picture_in_rsi
+    mov edi, [apc_kv_i]
+    call place_clear_image
+    call render_screen
+    call x11_flush
+    jmp .hka_done
+
+.hka_delete_all:
+    xor ecx, ecx
+.hka_da_loop:
+    cmp ecx, IMG_SLOTS
+    jge .hka_da_done
+    mov eax, ecx
+    imul eax, IMG_SLOT_SIZE
+    lea rsi, [img_table + rax]
+    cmp byte [rsi + 20], 0
+    je .hka_da_next
+    push rcx
+    call img_release_picture_in_rsi
+    pop rcx
+.hka_da_next:
+    inc ecx
+    jmp .hka_da_loop
+.hka_da_done:
+    call place_clear_all
+    call render_screen
+    call x11_flush
+
+.hka_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────
+; Decode the accumulated base64 payload, run convert if PNG, then
+; upload as XRender Picture into the image table.
+; ──────────────────────────────────────────────────────────────────
+kitty_finalize_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Reuse apc_body as the base64-decoded scratch (no good reason it
+    ; can't be repurposed; the body for the next chunk is rebuilt).
+    ; Decoded size = ceil(payload_len * 3 / 4) which fits in
+    ; APC_PAYLOAD_MAX comfortably; we mmap separately to be safe.
+    mov rax, [apc_payload_len]
+    test rax, rax
+    jz .kfi_done
+    mov rdi, rax
+    add rdi, 3
+    shr rdi, 2
+    imul rdi, 3                      ; max decoded bytes
+    cmp rdi, APC_PAYLOAD_MAX
+    ja .kfi_done
+
+    ; Allocate decode scratch via mmap (simpler than juggling buffers).
+    mov rax, SYS_MMAP
+    mov r13, rdi                     ; remember requested size
+    xor edi, edi
+    mov rsi, r13
+    mov rdx, MMAP_PROT_RW
+    mov r10, MMAP_FLAGS_PRIV
+    mov r8, -1
+    xor r9, r9
+    syscall
+    cmp rax, -4096
+    ja .kfi_done
+    mov r12, rax                     ; decoded buffer
+
+    ; base64_decode(apc_payload, apc_payload_len, r12)
+    lea rdi, [apc_payload]
+    mov rsi, [apc_payload_len]
+    mov rdx, r12
+    call base64_decode
+    mov r14, rax                     ; decoded byte count
+
+    ; Branch on format.
+    mov eax, [apc_pending_fmt]
+    cmp eax, 32
+    je .kfi_raw_rgba
+    cmp eax, 24
+    je .kfi_raw_rgb
+    ; Default: PNG (f=100). Read dimensions from header, fork convert.
+    mov rdi, r12
+    mov rsi, r14
+    call png_dimensions
+    test rcx, rcx
+    jz .kfi_unmap_decoded
+    mov ebx, eax                     ; width
+    mov r15d, edx                    ; height
+    cmp ebx, MAX_IMG_DIM
+    ja .kfi_unmap_decoded
+    cmp r15d, MAX_IMG_DIM
+    ja .kfi_unmap_decoded
+
+    ; Need width*height*4 bytes
+    mov eax, ebx
+    imul eax, r15d
+    shl eax, 2
+    cmp eax, IMG_DECODE_MAX
+    ja .kfi_unmap_decoded
+    mov rdi, r12                     ; PNG src
+    mov rsi, r14                     ; PNG len
+    mov edx, eax                     ; expected RGBA bytes
+    call png_decode_to_rgba
+    mov r14, rax                     ; bytes received
+    test r14, r14
+    jz .kfi_unmap_decoded
+    jmp .kfi_have_rgba
+
+.kfi_raw_rgba:
+    ; Width/height come from s/v parameters; r14 bytes already in r12.
+    mov ebx, [apc_pending_w]
+    mov r15d, [apc_pending_h]
+    cmp ebx, MAX_IMG_DIM
+    ja .kfi_unmap_decoded
+    cmp r15d, MAX_IMG_DIM
+    ja .kfi_unmap_decoded
+    ; Verify byte count = w*h*4
+    mov eax, ebx
+    imul eax, r15d
+    shl eax, 2
+    cmp r14, rax
+    jne .kfi_unmap_decoded
+    ; Move into img_decode_buf so img_upload_rsi finds it
+    cmp eax, [img_decode_len]
+    jbe .kfi_have_idb
+    mov rax, [img_decode_buf]
+    test rax, rax
+    jz .kfi_alloc_idb
+    push rax
+    mov rax, SYS_MUNMAP
+    mov rdi, [img_decode_buf]
+    mov rsi, [img_decode_len]
+    syscall
+    pop rax
+    mov qword [img_decode_buf], 0
+.kfi_alloc_idb:
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, r14
+    mov rdx, MMAP_PROT_RW
+    mov r10, MMAP_FLAGS_PRIV
+    mov r8, -1
+    xor r9, r9
+    syscall
+    cmp rax, -4096
+    ja .kfi_unmap_decoded
+    mov [img_decode_buf], rax
+    mov [img_decode_len], r14
+.kfi_have_idb:
+    ; copy r14 bytes from r12 to img_decode_buf
+    mov rsi, r12
+    mov rdi, [img_decode_buf]
+    mov rcx, r14
+    rep movsb
+    jmp .kfi_have_rgba
+
+.kfi_raw_rgb:
+    ; Not implemented for now — drop.
+    jmp .kfi_unmap_decoded
+
+.kfi_have_rgba:
+    ; Allocate (or re-use) image slot and upload.
+    mov edi, [apc_pending_id]
+    call img_alloc
+    ; img_upload_rsi: rsi=slot, rdi=w, rdx=h, r8=bytes
+    mov rdi, rbx
+    mov edx, r15d
+    mov r8, r14
+    call img_upload_rsi
+
+    ; If a=T, place at cursor immediately.
+    cmp byte [apc_pending_place], 1
+    jne .kfi_unmap_decoded
+    mov edi, [apc_pending_id]
+    call img_find
+    test rsi, rsi
+    jz .kfi_unmap_decoded
+    mov eax, [rsi + 4]
+    movzx edx, word [char_width]
+    test edx, edx
+    jz .kfi_unmap_decoded
+    add eax, edx
+    dec eax
+    xor edx, edx
+    movzx r8d, word [char_width]
+    div r8d
+    mov ecx, eax                     ; cell_w
+    mov eax, [rsi + 8]
+    movzx edx, word [char_height]
+    test edx, edx
+    jz .kfi_unmap_decoded
+    add eax, edx
+    dec eax
+    xor edx, edx
+    movzx r9d, word [char_height]
+    div r9d
+    mov r8d, eax                     ; cell_h
+    mov rsi, [cursor_row]
+    mov rdx, [cursor_col]
+    mov edi, [apc_pending_id]
+    call place_add
+    call render_screen
+    call x11_flush
+
+.kfi_unmap_decoded:
+    mov rax, SYS_MUNMAP
+    mov rdi, r12
+    mov rsi, r13
+    syscall
+.kfi_done:
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
