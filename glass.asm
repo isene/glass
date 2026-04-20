@@ -149,6 +149,7 @@
 %define VT_CSI_PARAM    3
 %define VT_OSC          4
 %define VT_CHARSET      5    ; consume one charset designator byte, then VT_NORMAL
+%define VT_STRING       6    ; APC/DCS/PM body: discard bytes until ST (ESC \) or BEL
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data section
@@ -4815,6 +4816,8 @@ vt_process:
     je .vtp_osc
     cmp rcx, VT_CHARSET
     je .vtp_charset
+    cmp rcx, VT_STRING
+    je .vtp_string_discard
 
     ; VT_NORMAL
     cmp al, 27               ; ESC
@@ -5015,6 +5018,17 @@ vt_process:
     je .vtp_charset_start
     cmp al, '+'
     je .vtp_charset_start
+    ; Application Program Command (kitty graphics, tmux passthrough),
+    ; Device Control String (sixel, DECRQSS), Privacy Message —
+    ; consume the body silently until ST (ESC \) or BEL. Without this,
+    ; apps like pointer leak the kitty-graphics command parameters as
+    ; visible text after a stray 'G'.
+    cmp al, '_'
+    je .vtp_start_string
+    cmp al, 'P'
+    je .vtp_start_string
+    cmp al, '^'
+    je .vtp_start_string
     jmp .vtp_loop
 
 .vtp_charset_start:
@@ -5023,6 +5037,27 @@ vt_process:
 
 .vtp_charset:
     ; Discard the designator byte and return to normal.
+    mov qword [vt_state], VT_NORMAL
+    jmp .vtp_loop
+
+.vtp_start_string:
+    mov qword [vt_state], VT_STRING
+    jmp .vtp_loop
+
+.vtp_string_discard:
+    ; BEL terminates (xterm-style)
+    cmp al, 7
+    je .vtp_string_end
+    ; ESC could start ST (ESC \) — peek next byte
+    cmp al, 27
+    jne .vtp_loop
+    cmp r14, r13
+    jge .vtp_loop
+    mov al, [r12 + r14]
+    inc r14
+    cmp al, '\'
+    jne .vtp_string_discard      ; nested ESC? keep discarding
+.vtp_string_end:
     mov qword [vt_state], VT_NORMAL
     jmp .vtp_loop
 
