@@ -427,6 +427,13 @@ place_count:        resq 1
 img_decode_buf:     resq 1          ; mmap'd RGBA scratch (decoded PNG)
 img_decode_len:     resq 1          ; allocated bytes
 png_argv:           resq 8          ; argv[] for the convert child
+; Pipe fds for the convert pipeline. Kept in BSS rather than scratch
+; registers because syscall clobbers r11 every call, and there aren't
+; enough callee-saved regs to spare without juggling.
+png_in_read:        resd 1          ; child stdin source (parent: closed)
+png_in_write:       resd 1          ; parent writes PNG bytes here
+png_out_read:       resd 1          ; parent reads RGBA bytes here
+png_out_write:      resd 1          ; child stdout target (parent: closed)
 run_bold:           resb 1          ; current run's bold bit (renderer)
 run_underline:      resb 1          ; current run's underline bit (renderer)
 wm_protocols_atom:  resd 1
@@ -10384,10 +10391,12 @@ base64_decode:
     push r13
     push r14
     push r15
-    call b64_init_table
+    ; Stash params BEFORE the table init, since that helper does not
+    ; preserve rdx (it iterates with edx during the build).
     mov r12, rdi                     ; src
     mov r13, rsi                     ; src len
     mov r14, rdx                     ; dst
+    call b64_init_table
     xor r15, r15                     ; src index
     xor rbx, rbx                     ; dst written
     xor edx, edx                     ; running 24-bit accumulator
@@ -10528,67 +10537,70 @@ png_decode_to_rgba:
     mov [img_decode_len], r14
 .pdr_have_buf:
 
-    ; Build argv: convert png:- rgba:-
+    ; Build argv: convert png:- -depth 8 rgba:-
+    ; -depth 8 is critical: high-precision PNGs (16-bit channels) would
+    ; otherwise emit 8 bytes/pixel, doubling the output and corrupting
+    ; the strip layout.
     lea rax, [convert_path]
     mov [png_argv + 0*8], rax
     lea rax, [convert_arg_png_in]
     mov [png_argv + 1*8], rax
-    lea rax, [convert_arg_rgba_lower]
+    lea rax, [convert_arg_depth]
     mov [png_argv + 2*8], rax
-    mov qword [png_argv + 3*8], 0
+    lea rax, [convert_arg_8]
+    mov [png_argv + 3*8], rax
+    lea rax, [convert_arg_rgba_lower]
+    mov [png_argv + 4*8], rax
+    mov qword [png_argv + 5*8], 0
 
-    ; Two pipes: stdin (parent → child PNG), stdout (child → parent RGBA)
-    sub rsp, 32
+    ; Two pipes (stdin: parent → child PNG, stdout: child → parent RGBA)
+    sub rsp, 16
     mov rax, SYS_PIPE
     lea rdi, [rsp]
     syscall
     test rax, rax
-    js .pdr_pipe_fail
+    js .pdr_pipe_fail1
+    mov eax, [rsp]
+    mov [png_in_read], eax
+    mov eax, [rsp + 4]
+    mov [png_in_write], eax
     mov rax, SYS_PIPE
-    lea rdi, [rsp + 8]
+    lea rdi, [rsp]
     syscall
     test rax, rax
-    js .pdr_pipe_fail
-    mov ebx, [rsp]                   ; in_read  (child stdin source)
-    mov r15d, [rsp + 4]              ; in_write (parent writes here)
-    mov r10d, [rsp + 8]              ; out_read (parent reads here)
-    mov r11d, [rsp + 12]             ; out_write (child stdout target)
-    add rsp, 32
+    js .pdr_pipe_fail1
+    mov eax, [rsp]
+    mov [png_out_read], eax
+    mov eax, [rsp + 4]
+    mov [png_out_write], eax
+    add rsp, 16
 
-    ; Fork
-    sub rsp, 16                      ; reserve for r10/r11 across syscall
-    mov [rsp], r10d
-    mov [rsp + 4], r11d
     mov rax, SYS_FORK
     syscall
-    mov r10d, [rsp]
-    mov r11d, [rsp + 4]
-    add rsp, 16
     test rax, rax
-    js .pdr_fork_fail
+    js .pdr_fail
     jnz .pdr_parent
 
     ; ── Child ──
-    ; dup2(in_read, 0); dup2(out_write, 1); close pipe ends; exec.
     mov rax, SYS_DUP2
-    mov edi, ebx
+    mov edi, [png_in_read]
     xor esi, esi
     syscall
     mov rax, SYS_DUP2
-    mov edi, r11d
+    mov edi, [png_out_write]
     mov esi, 1
     syscall
     mov rax, SYS_CLOSE
-    mov edi, ebx
+    mov edi, [png_in_read]
     syscall
     mov rax, SYS_CLOSE
-    mov edi, r15d
+    mov edi, [png_in_write]
     syscall
     mov rax, SYS_CLOSE
-    mov edi, r10d
+    mov edi, [png_out_read]
     syscall
     mov rax, SYS_CLOSE
-    mov edi, r11d
+    mov edi, [png_out_write]
     syscall
     mov rax, SYS_EXECVE
     lea rdi, [convert_path]
@@ -10600,52 +10612,44 @@ png_decode_to_rgba:
     syscall
 
 .pdr_parent:
-    push rax                         ; child pid
-    ; Close child-side fds
+    mov r15, rax                     ; child pid
     mov rax, SYS_CLOSE
-    mov edi, ebx
+    mov edi, [png_in_read]
     syscall
     mov rax, SYS_CLOSE
-    mov edi, r11d
+    mov edi, [png_out_write]
     syscall
-    pop r11                          ; child pid in r11
 
-    ; Spawn second fork to write PNG to stdin? Easier: just write
-    ; ourselves. The PNG fits in a single write() in practice since
-    ; convert reads as we feed.
-    ; Write all PNG bytes
-    mov rdi, r12                     ; src
-    mov r12, r13                     ; remaining = len
-    push r11                         ; save pid
+    ; Write all PNG bytes to png_in_write. r12=src, r13=remaining.
+    mov rdi, r12                     ; restore src into rdi
+    mov r12, r13                     ; remaining = original length
 .pdr_write:
     test r12, r12
     jz .pdr_write_done
-    mov rax, SYS_WRITE
-    push rdi
     mov rsi, rdi
     mov rdx, r12
-    mov edi, r15d
+    mov rax, SYS_WRITE
+    push rdi
+    mov edi, [png_in_write]
     syscall
     pop rdi
-    cmp rax, 0
+    test rax, rax
     jle .pdr_write_done
     add rdi, rax
     sub r12, rax
     jmp .pdr_write
 .pdr_write_done:
-    pop r11
     mov rax, SYS_CLOSE
-    mov edi, r15d
+    mov edi, [png_in_write]
     syscall
 
-    ; Read RGBA from out_read until EOF or buffer full
-    push r11
+    ; Read RGBA from png_out_read into img_decode_buf.
     xor r12, r12                     ; bytes received
 .pdr_read:
     cmp r12, r14
     jge .pdr_read_done
     mov rax, SYS_READ
-    mov edi, r10d
+    mov edi, [png_out_read]
     mov rsi, [img_decode_buf]
     add rsi, r12
     mov rdx, r14
@@ -10657,21 +10661,18 @@ png_decode_to_rgba:
     jmp .pdr_read
 .pdr_read_done:
     mov rax, SYS_CLOSE
-    mov edi, r10d
+    mov edi, [png_out_read]
     syscall
-    pop r11
 
-    ; Reap child
-    push r12
+    ; Reap child to avoid zombies.
     sub rsp, 16
     mov rax, SYS_WAIT4
-    mov rdi, r11
+    mov rdi, r15
     mov rsi, rsp
     xor edx, edx
     xor r10, r10
     syscall
     add rsp, 16
-    pop r12
 
     mov rax, r12
     pop r15
@@ -10681,9 +10682,8 @@ png_decode_to_rgba:
     pop rbx
     ret
 
-.pdr_pipe_fail:
-    add rsp, 32
-.pdr_fork_fail:
+.pdr_pipe_fail1:
+    add rsp, 16
 .pdr_fail:
     xor eax, eax
     pop r15
