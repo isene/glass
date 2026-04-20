@@ -166,16 +166,30 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 | Alt+b | Cycle through `bg_cycle` colors from `~/.glassrc` |
 | Alt+t | Toggle ~50% window opacity (requires a compositor) |
 
+The five Alt-key shortcuts are rebindable via `~/.glassrc`:
+
+```
+key.font_inc    = alt+plus
+key.font_dec    = alt+minus
+key.font_reset  = alt+underscore
+key.bg_cycle    = alt+b
+key.opacity     = alt+t
+```
+
+Modifiers: `alt`, `ctrl`, `shift`. Keys: any single ASCII character or
+the named keys `plus`, `minus`, `underscore`, `equal`, `space`. An
+empty value disables the binding.
+
 ## Roadmap
 
 - [x] True emoji rendering (XRender extension + bundled cache)
 - [x] Opacity/transparency (compositor + wallpaper sampling fallback)
+- [x] Configurable key bindings (the five Alt-key shortcuts)
 - [ ] Pure-asm TTF parser/rasterizer (the bonkers route — kitty-grade fonts without breaking pure-asm/zero-deps)
 - [ ] Tab/split support (multiple PTYs)
 - [ ] Font ligatures
-- [ ] Image protocol (Sixel or kitty graphics)
+- [ ] Image display via kitty graphics protocol (APC `ESC _G ... ESC \`) — rasters now silently consumed
 - [ ] WM_CLASS for window manager integration
-- [ ] Configurable key bindings
 
 ## The CHasm Suite
 

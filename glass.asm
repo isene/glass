@@ -482,6 +482,18 @@ opacity_toggle:     resb 1          ; 0 = opaque (or untouched), 1 = ~50%
 opacity_atom:       resd 1          ; _NET_WM_WINDOW_OPACITY atom id
 opacity_atom_set:   resb 1          ; 1 once interned
 original_font_size: resq 1          ; cfg_font_size at startup (for reset)
+
+; Configurable keybinding table. Five slots, one per Alt-action.
+; mod byte holds the required Shift|Ctrl|Alt mask (bits 0,2,3).
+; A mod value of 0 means the binding is disabled.
+KB_FONT_INC      equ 0
+KB_FONT_DEC      equ 1
+KB_FONT_RESET    equ 2
+KB_BG_CYCLE      equ 3
+KB_OPACITY       equ 4
+KB_COUNT         equ 5
+keybind_mods:    resb KB_COUNT
+keybind_keysyms: resd KB_COUNT
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
 cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
 cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
@@ -659,6 +671,10 @@ _start:
 
     ; Parse DISPLAY number
     call parse_display
+
+    ; Seed default Alt+key bindings before parsing the user's config so
+    ; load_config can override individual entries via key.NAME = ...
+    call init_keybindings
 
     ; Load config from ~/.glassrc (before X11 connect)
     call load_config
@@ -4480,23 +4496,37 @@ handle_keypress:
     je .hkp_paste
 .hkp_no_paste:
 
-    ; Alt+key shortcuts (Mod1Mask = bit 3 of state)
-    test ebx, 8
-    jz .hkp_no_alt
-    cmp eax, 0x2B            ; '+' (font size step up)
+    ; Configurable shortcut dispatch. Each binding is (mods, keysym).
+    ; mods=0 means the binding is disabled. Only Shift|Ctrl|Alt bits
+    ; (0|2|3 = mask 0x0D) participate in the comparison so AltGr/Lock
+    ; don't accidentally suppress matches.
+    xor ecx, ecx
+.hkp_kbd_loop:
+    cmp ecx, KB_COUNT
+    jge .hkp_no_alt
+    movzx edx, byte [keybind_mods + rcx]
+    test edx, edx
+    jz .hkp_kbd_next
+    mov esi, ebx
+    and esi, 0x0D
+    cmp esi, edx
+    jne .hkp_kbd_next
+    cmp eax, [keybind_keysyms + rcx*4]
+    jne .hkp_kbd_next
+    ; Match — dispatch by index
+    cmp ecx, KB_FONT_INC
     je .hkp_font_inc
-    cmp eax, 0x3D            ; '=' alias for + on US-style layouts
-    je .hkp_font_inc
-    cmp eax, 0x2D            ; '-' (font size step down)
+    cmp ecx, KB_FONT_DEC
     je .hkp_font_dec
-    cmp eax, 0x5F            ; '_' (font reset)
+    cmp ecx, KB_FONT_RESET
     je .hkp_font_reset
-    cmp eax, 0x30            ; '0' (font reset alias)
-    je .hkp_font_reset
-    cmp eax, 0x62            ; 'b' (cycle bg color)
+    cmp ecx, KB_BG_CYCLE
     je .hkp_bg_cycle
-    cmp eax, 0x74            ; 't' (toggle 50% opacity)
+    cmp ecx, KB_OPACITY
     je .hkp_opacity_toggle
+.hkp_kbd_next:
+    inc ecx
+    jmp .hkp_kbd_loop
 .hkp_no_alt:
 
     ; Dispatch on keysym ranges
@@ -9078,7 +9108,7 @@ load_config:
 .lc_try_font_weight:
     ; Match "font_weight = bold"
     cmp dword [rsi], 'font'
-    jne .lc_skip_line
+    jne .lc_try_keybind
     cmp dword [rsi+4], '_wei'
     jne .lc_skip_line
     cmp word [rsi+8], 'gh'
@@ -9090,6 +9120,62 @@ load_config:
     cmp dword [rsi], 'bold'
     jne .lc_skip_line
     mov byte [cfg_font_bold], 1
+    jmp .lc_skip_line
+
+.lc_try_keybind:
+    ; Match "key.NAME = ..." for the five Alt-action bindings.
+    cmp dword [rsi], 'key.'
+    jne .lc_skip_line
+    add rsi, 4
+    ; Identify the binding name; advance rsi past it on match.
+    cmp dword [rsi], 'font'
+    jne .lc_kb_try_bg
+    cmp byte [rsi+4], '_'
+    jne .lc_kb_try_bg
+    ; "font_inc", "font_dec", or "font_reset"
+    cmp dword [rsi+5], 'inc '
+    je .lc_kb_font_inc
+    cmp dword [rsi+5], 'inc='
+    je .lc_kb_font_inc
+    cmp dword [rsi+5], 'dec '
+    je .lc_kb_font_dec
+    cmp dword [rsi+5], 'dec='
+    je .lc_kb_font_dec
+    cmp dword [rsi+5], 'rese'
+    jne .lc_skip_line
+    cmp byte [rsi+9], 't'
+    jne .lc_skip_line
+    add rsi, 10
+    mov edi, KB_FONT_RESET
+    jmp .lc_kb_call
+.lc_kb_font_inc:
+    add rsi, 8
+    mov edi, KB_FONT_INC
+    jmp .lc_kb_call
+.lc_kb_font_dec:
+    add rsi, 8
+    mov edi, KB_FONT_DEC
+    jmp .lc_kb_call
+.lc_kb_try_bg:
+    cmp dword [rsi], 'bg_c'
+    jne .lc_kb_try_opacity
+    cmp dword [rsi+4], 'ycle'
+    jne .lc_kb_try_opacity
+    add rsi, 8
+    mov edi, KB_BG_CYCLE
+    jmp .lc_kb_call
+.lc_kb_try_opacity:
+    cmp dword [rsi], 'opac'
+    jne .lc_skip_line
+    cmp word [rsi+4], 'it'
+    jne .lc_skip_line
+    cmp byte [rsi+6], 'y'
+    jne .lc_skip_line
+    add rsi, 7
+    mov edi, KB_OPACITY
+.lc_kb_call:
+    call lc_skip_to_value
+    call parse_keybinding
     jmp .lc_skip_line
 
 .lc_skip_line:
@@ -9848,6 +9934,146 @@ setup_font_name:
     pop r12
     pop rbx
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Default keybinding table (Alt+key Shortcuts)
+; ══════════════════════════════════════════════════════════════════════
+; Modifier bits: Shift=1, Ctrl=4, Alt=8 (matches X11 state mask).
+init_keybindings:
+    ; font_inc: Alt + plus
+    mov byte [keybind_mods + KB_FONT_INC], 8
+    mov dword [keybind_keysyms + KB_FONT_INC*4], 0x2B
+    ; font_dec: Alt + minus
+    mov byte [keybind_mods + KB_FONT_DEC], 8
+    mov dword [keybind_keysyms + KB_FONT_DEC*4], 0x2D
+    ; font_reset: Alt + underscore (Alt+Shift+- on most layouts)
+    mov byte [keybind_mods + KB_FONT_RESET], 8
+    mov dword [keybind_keysyms + KB_FONT_RESET*4], 0x5F
+    ; bg_cycle: Alt + b
+    mov byte [keybind_mods + KB_BG_CYCLE], 8
+    mov dword [keybind_keysyms + KB_BG_CYCLE*4], 0x62
+    ; opacity_toggle: Alt + t
+    mov byte [keybind_mods + KB_OPACITY], 8
+    mov dword [keybind_keysyms + KB_OPACITY*4], 0x74
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Parse a single key.NAME = MOD+...+KEY entry from .glassrc.
+; ══════════════════════════════════════════════════════════════════════
+; rsi points at the value string (e.g. "alt+plus" or "ctrl+alt+t" or
+; an empty value to disable). rdi = binding index. Modifies the
+; binding in place; on parse failure leaves the slot unchanged.
+parse_keybinding:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                      ; index
+    xor r13d, r13d                    ; mods accumulator
+    xor ebx, ebx                      ; keysym (final)
+
+.pkb_skip_ws:
+    movzx eax, byte [rsi]
+    cmp al, ' '
+    je .pkb_skip_ws_inc
+    cmp al, 9
+    je .pkb_skip_ws_inc
+    jmp .pkb_token
+.pkb_skip_ws_inc:
+    inc rsi
+    jmp .pkb_skip_ws
+
+.pkb_token:
+    ; Empty / EOL / comment? Disable the binding.
+    movzx eax, byte [rsi]
+    test al, al
+    jz .pkb_disable
+    cmp al, 10
+    je .pkb_disable
+    cmp al, '#'
+    je .pkb_disable
+
+    ; Try modifiers: alt, ctrl, shift (followed by '+').
+    cmp dword [rsi], 'alt+'
+    jne .pkb_try_ctrl
+    or r13d, 8
+    add rsi, 4
+    jmp .pkb_token
+.pkb_try_ctrl:
+    cmp dword [rsi], 'ctrl'
+    jne .pkb_try_shift
+    cmp byte [rsi+4], '+'
+    jne .pkb_try_shift
+    or r13d, 4
+    add rsi, 5
+    jmp .pkb_token
+.pkb_try_shift:
+    cmp dword [rsi], 'shif'
+    jne .pkb_named_keys
+    cmp word [rsi+4], 't+'
+    jne .pkb_named_keys
+    or r13d, 1
+    add rsi, 6
+    jmp .pkb_token
+
+.pkb_named_keys:
+    ; Multi-character key names — order matters when prefixes overlap.
+    cmp dword [rsi], 'plus'
+    jne .pkb_try_minus
+    mov ebx, 0x2B
+    jmp .pkb_apply
+.pkb_try_minus:
+    cmp dword [rsi], 'minu'
+    jne .pkb_try_underscore
+    cmp byte [rsi+4], 's'
+    jne .pkb_try_underscore
+    mov ebx, 0x2D
+    jmp .pkb_apply
+.pkb_try_underscore:
+    cmp dword [rsi], 'unde'
+    jne .pkb_try_equal
+    cmp dword [rsi+4], 'rsco'
+    jne .pkb_try_equal
+    cmp word [rsi+8], 're'
+    jne .pkb_try_equal
+    mov ebx, 0x5F
+    jmp .pkb_apply
+.pkb_try_equal:
+    cmp dword [rsi], 'equa'
+    jne .pkb_try_space
+    cmp byte [rsi+4], 'l'
+    jne .pkb_try_space
+    mov ebx, 0x3D
+    jmp .pkb_apply
+.pkb_try_space:
+    cmp dword [rsi], 'spac'
+    jne .pkb_single_char
+    cmp byte [rsi+4], 'e'
+    jne .pkb_single_char
+    mov ebx, 0x20
+    jmp .pkb_apply
+
+.pkb_single_char:
+    ; Fall back to a single printable ASCII keysym (a..z, A..Z, 0..9,
+    ; or any 0x20..0x7E literal).
+    movzx eax, byte [rsi]
+    cmp al, 0x20
+    jb .pkb_done
+    cmp al, 0x7E
+    ja .pkb_done
+    mov ebx, eax
+
+.pkb_apply:
+    mov [keybind_mods + r12], r13b
+    mov [keybind_keysyms + r12*4], ebx
+.pkb_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.pkb_disable:
+    mov byte [keybind_mods + r12], 0
+    jmp .pkb_done
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Runtime font size change (Alt+plus / Alt+minus / Alt+_)
