@@ -255,6 +255,25 @@ font_28_len equ $ - font_28 - 1
 font_32: db "-xos4-terminus-medium-r-normal--32-320-72-72-c-160-iso10646-1", 0
 font_32_len equ $ - font_32 - 1
 
+; Bold companions. Same metrics (cell width / height) as the medium
+; XLFDs above so the grid stays aligned. font_10 and font_20 have no
+; bold variant at the same metrics; SGR 1 falls back to medium for
+; those sizes.
+font_13_bold: db "-misc-fixed-bold-r-semicondensed--13-120-75-75-c-60-iso10646-1", 0
+font_13_bold_len equ $ - font_13_bold - 1
+font_15_bold: db "-misc-fixed-bold-r-normal--15-140-75-75-c-90-iso10646-1", 0
+font_15_bold_len equ $ - font_15_bold - 1
+font_18_bold: db "-misc-fixed-bold-r-normal--18-120-100-100-c-90-iso10646-1", 0
+font_18_bold_len equ $ - font_18_bold - 1
+font_22_bold: db "-xos4-terminus-bold-r-normal--22-220-72-72-c-110-iso10646-1", 0
+font_22_bold_len equ $ - font_22_bold - 1
+font_24_bold: db "-xos4-terminus-bold-r-normal--24-240-72-72-c-120-iso10646-1", 0
+font_24_bold_len equ $ - font_24_bold - 1
+font_28_bold: db "-xos4-terminus-bold-r-normal--28-280-72-72-c-140-iso10646-1", 0
+font_28_bold_len equ $ - font_28_bold - 1
+font_32_bold: db "-xos4-terminus-bold-r-normal--32-320-72-72-c-160-iso10646-1", 0
+font_32_bold_len equ $ - font_32_bold - 1
+
 ; PTY paths
 ptmx_path:      db "/dev/ptmx", 0
 pts_prefix:     db "/dev/pts/", 0
@@ -350,6 +369,10 @@ win_id:             resd 1
 gc_id:              resd 1
 gc_bg_id:           resd 1
 font_id:            resd 1
+font_id_bold:       resd 1          ; bold variant; equals font_id when none
+gc_current_font:    resd 1          ; tracks which font is loaded in gc_id
+run_bold:           resb 1          ; current run's bold bit (renderer)
+run_underline:      resb 1          ; current run's underline bit (renderer)
 wm_protocols_atom:  resd 1
 
 ; XRender extension state. render_major is 0 if RENDER is unavailable
@@ -558,6 +581,8 @@ osc_in_num:         resq 1          ; 1 = still parsing OSC number
 cfg_font_size:      resq 1          ; 0 = default, else pixel size
 dyn_font_name:      resb 128
 dyn_font_name_len:  resq 1
+dyn_bold_font_name: resb 128
+dyn_bold_font_name_len: resq 1
 
 ; Mouse escape sequence buffer
 mouse_seq_buf:      resb 32
@@ -1508,6 +1533,52 @@ x11_open_font:
     call x11_buffer
     inc dword [x11_seq]
 
+    ; Bold companion: only when setup_font_name set dyn_bold_font_name
+    mov rax, [dyn_bold_font_name_len]
+    test rax, rax
+    jz .xof_no_bold
+    call alloc_xid
+    mov [font_id_bold], eax
+    lea r12, [dyn_bold_font_name]
+    mov r13, [dyn_bold_font_name_len]
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_OPEN_FONT
+    mov byte [rdi+1], 0
+    mov ecx, r13d
+    add ecx, 3
+    and ecx, ~3
+    shr ecx, 2
+    add ecx, 3
+    mov word [rdi+2], cx
+    mov eax, [font_id_bold]
+    mov [rdi+4], eax
+    mov word [rdi+8], r13w
+    mov word [rdi+10], 0
+    lea rbx, [rdi + 12]
+    xor ecx, ecx
+.xof_bcp:
+    cmp ecx, r13d
+    jge .xof_bpad
+    movzx eax, byte [r12 + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xof_bcp
+.xof_bpad:
+    mov eax, r13d
+    add eax, 3
+    and eax, ~3
+    add eax, 12
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+    jmp .xof_done
+.xof_no_bold:
+    ; No matching bold variant: alias bold to medium so renderer's
+    ; ChangeGC font path is a no-op for bold cells at this size.
+    mov eax, [font_id]
+    mov [font_id_bold], eax
+.xof_done:
     pop r13
     pop r12
     pop rbx
@@ -1766,6 +1837,7 @@ x11_create_gc:
     mov [rdi+20], eax        ; background
     mov eax, [font_id]
     mov [rdi+24], eax        ; font
+    mov [gc_current_font], eax
 
     lea rsi, [tmp_buf]
     mov rdx, 28
@@ -7441,6 +7513,15 @@ render_screen:
     xchg r14d, r15d             ; swap fg/bg for inverse
 .rs_no_inv_start:
 
+    ; Capture this run's bold + underline bits (cell[4] bits 0/1).
+    movzx edx, byte [rax + 4]
+    mov ecx, edx
+    and ecx, 1
+    mov [run_bold], cl
+    shr edx, 1
+    and edx, 1
+    mov [run_underline], dl
+
     ; Scan ahead for cells with same effective fg/bg, build CHAR2B text
     lea rdi, [tmp_buf + 20]  ; text buffer (2 bytes per char)
     mov rbx, r13             ; current col
@@ -7489,6 +7570,19 @@ render_screen:
     jne .rs_run_draw
     cmp esi, r15d
     jne .rs_run_draw
+    ; Also break on bold/underline change so we can switch GC font and
+    ; draw an underline rectangle that matches just this run.
+    movzx edx, byte [rax + 4]
+    mov esi, edx
+    and esi, 1                       ; this cell's bold
+    movzx r11d, byte [run_bold]
+    cmp esi, r11d
+    jne .rs_run_draw
+    shr edx, 1
+    and edx, 1                       ; this cell's underline
+    movzx r11d, byte [run_underline]
+    cmp edx, r11d
+    jne .rs_run_draw
     ; Same color, add to run as CHAR2B (big-endian: byte1=high, byte2=low)
     movzx edx, word [rax]           ; UCS-2 char (little-endian)
     mov [rdi + rcx*2 + 1], dl       ; low byte (byte2)
@@ -7502,6 +7596,37 @@ render_screen:
     ; ecx = run length, r13 = start col, r14 = fg, r15 = bg
     test ecx, ecx
     jz .rs_next_row
+
+    ; Pick desired font for this run (medium or bold). Only emit a
+    ; ChangeGC font request when the GC's current font actually needs
+    ; to change.
+    cmp byte [run_bold], 0
+    jne .rs_want_bold
+    mov eax, [font_id]
+    jmp .rs_have_font
+.rs_want_bold:
+    mov eax, [font_id_bold]
+.rs_have_font:
+    cmp eax, [gc_current_font]
+    je .rs_after_font
+    push rcx
+    push rax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4              ; 3 + 1 value
+    mov edx, [gc_id]
+    mov [rdi+4], edx
+    mov dword [rdi+8], GC_FONT
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rax
+    mov [gc_current_font], eax
+    pop rcx
+.rs_after_font:
 
     ; ChangeGC fg/bg (r14d/r15d already hold resolved 32-bit pixels)
     push rcx
@@ -7639,6 +7764,43 @@ render_screen:
     inc dword [x11_seq]
 
 .rs_after_text:
+    ; If this run had SGR 4 (underline), draw a 1px line under it using
+    ; the run's foreground color (already loaded in the GC). Use
+    ; PolyFillRectangle with one rectangle covering all run cells.
+    cmp byte [run_underline], 0
+    je .rs_no_underline
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5              ; 3 header + 2 (one rectangle)
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    ; x = start_col * char_width
+    mov rax, r13
+    movzx edx, word [char_width]
+    imul eax, edx
+    mov word [rdi+12], ax
+    ; y = row * char_height + font_ascent + 1 (just below the baseline)
+    movzx eax, word [char_height]
+    imul eax, r12d
+    movzx edx, word [font_ascent]
+    add eax, edx
+    inc eax
+    mov word [rdi+14], ax
+    ; width = (rbx - r13) * char_width
+    mov rax, rbx
+    sub rax, r13
+    movzx edx, word [char_width]
+    imul eax, edx
+    mov word [rdi+16], ax
+    mov word [rdi+18], 1             ; height
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_no_underline:
     ; Advance to next run
     mov r13, rbx
     jmp .rs_run_start
@@ -9416,6 +9578,64 @@ setup_font_name:
 .sfn_set_len:
     mov byte [rdi + rcx], 0  ; null-terminate
     mov [dyn_font_name_len], r12
+
+    ; Pick bold companion (skipped for sizes with no matching bold)
+    mov rax, [cfg_font_size]
+    cmp rax, 13
+    je .sfn_b13
+    cmp rax, 15
+    je .sfn_b15
+    cmp rax, 18
+    je .sfn_b18
+    cmp rax, 22
+    je .sfn_b22
+    cmp rax, 24
+    je .sfn_b24
+    cmp rax, 28
+    je .sfn_b28
+    cmp rax, 32
+    je .sfn_b32
+    jmp .sfn_done            ; no bold for this size
+.sfn_b13:
+    lea rsi, [font_13_bold]
+    mov r12, font_13_bold_len
+    jmp .sfn_bcopy
+.sfn_b15:
+    lea rsi, [font_15_bold]
+    mov r12, font_15_bold_len
+    jmp .sfn_bcopy
+.sfn_b18:
+    lea rsi, [font_18_bold]
+    mov r12, font_18_bold_len
+    jmp .sfn_bcopy
+.sfn_b22:
+    lea rsi, [font_22_bold]
+    mov r12, font_22_bold_len
+    jmp .sfn_bcopy
+.sfn_b24:
+    lea rsi, [font_24_bold]
+    mov r12, font_24_bold_len
+    jmp .sfn_bcopy
+.sfn_b28:
+    lea rsi, [font_28_bold]
+    mov r12, font_28_bold_len
+    jmp .sfn_bcopy
+.sfn_b32:
+    lea rsi, [font_32_bold]
+    mov r12, font_32_bold_len
+.sfn_bcopy:
+    lea rdi, [dyn_bold_font_name]
+    xor ecx, ecx
+.sfn_bcp:
+    cmp rcx, r12
+    jge .sfn_bset_len
+    movzx eax, byte [rsi + rcx]
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .sfn_bcp
+.sfn_bset_len:
+    mov byte [rdi + rcx], 0
+    mov [dyn_bold_font_name_len], r12
 
 .sfn_done:
     pop r12
