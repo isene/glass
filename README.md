@@ -52,6 +52,7 @@ cursor = #f7768e
 font_size = 13
 opacity = 80
 cursor_blink = 500
+bg_cycle = #000000,#001a33,#002200,#200033,#330011,#332200,#003333
 ```
 
 Available font sizes: 10, 13, 15, 18, 20 (misc-fixed, always present),
@@ -153,6 +154,11 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 | Shift+Insert | Paste from PRIMARY (selected text) |
 | Ctrl+Click | Open URL under cursor |
 | Ctrl+D | Exit (when shell line is empty) |
+| Alt+plus / Alt+= | Step font size up to next preset |
+| Alt+minus | Step font size down to previous preset |
+| Alt+_ / Alt+0 | Reset font size to the configured default |
+| Alt+b | Cycle through `bg_cycle` colors from `~/.glassrc` |
+| Alt+t | Toggle ~50% window opacity (requires a compositor) |
 
 ## Roadmap
 

@@ -53,6 +53,7 @@
 %define X11_INTERN_ATOM       16
 %define X11_CHANGE_PROPERTY   18
 %define X11_OPEN_FONT         45
+%define X11_CLOSE_FONT        46
 %define X11_QUERY_FONT        47
 %define X11_CREATE_GC         55
 %define X11_CHANGE_GC         56
@@ -274,6 +275,15 @@ font_28_bold_len equ $ - font_28_bold - 1
 font_32_bold: db "-xos4-terminus-bold-r-normal--32-320-72-72-c-160-iso10646-1", 0
 font_32_bold_len equ $ - font_32_bold - 1
 
+; Ordered preset table for Alt+plus / Alt+minus stepping.
+font_size_presets: dq 10, 13, 15, 18, 20, 22, 24, 28, 32
+FONT_SIZE_PRESET_COUNT equ 9
+DEFAULT_FONT_SIZE equ 13         ; fallback when no font_size in .glassrc
+
+; _NET_WM_WINDOW_OPACITY for Alt+t.
+opacity_atom_str: db "_NET_WM_WINDOW_OPACITY"
+opacity_atom_len equ $ - opacity_atom_str
+
 ; PTY paths
 ptmx_path:      db "/dev/ptmx", 0
 pts_prefix:     db "/dev/pts/", 0
@@ -459,6 +469,17 @@ cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
 cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
 cfg_opacity_set:    resb 1
+
+; Runtime-toggleable state (Alt+plus/minus/_, Alt+b, Alt+t)
+bg_cycle_pixels:    resd 16         ; up to 16 cycle colors
+bg_cycle_count:     resq 1          ; number of colors parsed from .glassrc
+bg_cycle_idx:       resq 1          ; current index in cycle (0 = first entry)
+saved_bg_pixel:     resd 1          ; configured cfg_bg before any cycling
+saved_bg_set:      resb 1          ; 1 if saved_bg_pixel is valid
+opacity_toggle:     resb 1          ; 0 = opaque (or untouched), 1 = ~50%
+opacity_atom:       resd 1          ; _NET_WM_WINDOW_OPACITY atom id
+opacity_atom_set:   resb 1          ; 1 once interned
+original_font_size: resq 1          ; cfg_font_size at startup (for reset)
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
 cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
 cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
@@ -639,6 +660,10 @@ _start:
 
     ; Load config from ~/.glassrc (before X11 connect)
     call load_config
+    ; Snapshot the configured font_size so Alt+_ (font reset) can
+    ; return to it later regardless of how often the user hit Alt+plus.
+    mov rax, [cfg_font_size]
+    mov [original_font_size], rax
 
     ; Read Xauthority
     call read_xauthority
@@ -4453,6 +4478,25 @@ handle_keypress:
     je .hkp_paste
 .hkp_no_paste:
 
+    ; Alt+key shortcuts (Mod1Mask = bit 3 of state)
+    test ebx, 8
+    jz .hkp_no_alt
+    cmp eax, 0x2B            ; '+' (font size step up)
+    je .hkp_font_inc
+    cmp eax, 0x3D            ; '=' alias for + on US-style layouts
+    je .hkp_font_inc
+    cmp eax, 0x2D            ; '-' (font size step down)
+    je .hkp_font_dec
+    cmp eax, 0x5F            ; '_' (font reset)
+    je .hkp_font_reset
+    cmp eax, 0x30            ; '0' (font reset alias)
+    je .hkp_font_reset
+    cmp eax, 0x62            ; 'b' (cycle bg color)
+    je .hkp_bg_cycle
+    cmp eax, 0x74            ; 't' (toggle 50% opacity)
+    je .hkp_opacity_toggle
+.hkp_no_alt:
+
     ; Dispatch on keysym ranges
     ; Special keys (0xFF00-0xFFFF)
     cmp eax, 0xFF00
@@ -4708,6 +4752,25 @@ handle_keypress:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
+    jmp .hkp_done
+
+.hkp_font_inc:
+    mov edi, 1
+    call font_change_step
+    jmp .hkp_done
+.hkp_font_dec:
+    mov edi, -1
+    call font_change_step
+    jmp .hkp_done
+.hkp_font_reset:
+    xor edi, edi
+    call font_change_step
+    jmp .hkp_done
+.hkp_bg_cycle:
+    call bg_cycle_advance
+    jmp .hkp_done
+.hkp_opacity_toggle:
+    call opacity_toggle_apply
     jmp .hkp_done
 
 .hkp_done:
@@ -8882,11 +8945,11 @@ load_config:
 .lc_try_opacity:
     ; Match "opacity"
     cmp dword [rsi], 'opac'
-    jne .lc_skip_line
+    jne .lc_try_bg_cycle
     cmp word [rsi+4], 'it'
-    jne .lc_skip_line
+    jne .lc_try_bg_cycle
     cmp byte [rsi+6], 'y'
-    jne .lc_skip_line
+    jne .lc_try_bg_cycle
     add rsi, 7
     call lc_skip_to_value
     ; Parse percentage 0..100
@@ -8914,6 +8977,66 @@ load_config:
     div ecx
     mov [cfg_opacity], al
     mov byte [cfg_opacity_set], 1
+    jmp .lc_skip_line
+
+.lc_try_bg_cycle:
+    ; Match "bg_cycle = #aaa,#bbb,#ccc,..."
+    cmp dword [rsi], 'bg_c'
+    jne .lc_skip_line
+    cmp dword [rsi+4], 'ycle'
+    jne .lc_skip_line
+    add rsi, 8
+    call lc_skip_to_value
+    xor r12, r12                    ; count of colors parsed
+.lc_bgc_one:
+    cmp byte [rsi], '#'
+    jne .lc_bgc_done
+    inc rsi
+    call hex_to_pixel
+    cmp r12, 16
+    jge .lc_bgc_skip                ; cap at 16 entries
+    mov [bg_cycle_pixels + r12*4], eax
+    inc r12
+.lc_bgc_skip:
+    ; Skip remaining hex chars
+.lc_bgc_skip_hex:
+    movzx eax, byte [rsi]
+    cmp al, '0'
+    jb .lc_bgc_after_hex
+    cmp al, '9'
+    jbe .lc_bgc_skip_hex_inc
+    cmp al, 'a'
+    jb .lc_bgc_chk_upper
+    cmp al, 'f'
+    jbe .lc_bgc_skip_hex_inc
+    jmp .lc_bgc_after_hex
+.lc_bgc_chk_upper:
+    cmp al, 'A'
+    jb .lc_bgc_after_hex
+    cmp al, 'F'
+    ja .lc_bgc_after_hex
+.lc_bgc_skip_hex_inc:
+    inc rsi
+    jmp .lc_bgc_skip_hex
+.lc_bgc_after_hex:
+    ; Skip whitespace + commas between entries
+.lc_bgc_skip_sep:
+    movzx eax, byte [rsi]
+    cmp al, ','
+    je .lc_bgc_sep_inc
+    cmp al, ' '
+    je .lc_bgc_sep_inc
+    cmp al, 9
+    je .lc_bgc_sep_inc
+    jmp .lc_bgc_check_more
+.lc_bgc_sep_inc:
+    inc rsi
+    jmp .lc_bgc_skip_sep
+.lc_bgc_check_more:
+    cmp byte [rsi], '#'
+    je .lc_bgc_one
+.lc_bgc_done:
+    mov [bg_cycle_count], r12
     jmp .lc_skip_line
 
 .lc_skip_line:
@@ -9503,6 +9626,13 @@ setup_font_name:
     push rbx
     push r12
 
+    ; Always clear stale font names before a (possibly repeat) build.
+    ; This matters for runtime size changes: e.g., a 13→10 jump must
+    ; not leave the previous bold companion (13-bold) in place since
+    ; 10 has no matching bold variant.
+    mov qword [dyn_font_name_len], 0
+    mov qword [dyn_bold_font_name_len], 0
+
     mov rax, [cfg_font_size]
     test rax, rax
     jz .sfn_done             ; no font_size configured, use default
@@ -9639,5 +9769,263 @@ setup_font_name:
 
 .sfn_done:
     pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Runtime font size change (Alt+plus / Alt+minus / Alt+_)
+; ══════════════════════════════════════════════════════════════════════
+; edi = direction: +1 step up, -1 step down, 0 reset to original
+font_change_step:
+    push rbx
+    push r12
+    push r13
+
+    mov r12d, edi                    ; save direction
+
+    ; Reset?
+    test r12d, r12d
+    jnz .fcs_step
+    mov rax, [original_font_size]
+    test rax, rax
+    jnz .fcs_have_size
+    mov rax, DEFAULT_FONT_SIZE
+    jmp .fcs_have_size
+
+.fcs_step:
+    ; Find current cfg_font_size in preset table
+    mov rax, [cfg_font_size]
+    test rax, rax
+    jnz .fcs_search
+    mov rax, DEFAULT_FONT_SIZE       ; treat unset as default
+.fcs_search:
+    xor ecx, ecx
+.fcs_search_loop:
+    cmp ecx, FONT_SIZE_PRESET_COUNT
+    jge .fcs_use_default_idx
+    cmp rax, [font_size_presets + rcx*8]
+    je .fcs_found_idx
+    inc ecx
+    jmp .fcs_search_loop
+.fcs_use_default_idx:
+    mov ecx, 1                       ; index of 13 in the table
+.fcs_found_idx:
+    ; Step
+    test r12d, r12d
+    js .fcs_step_down
+    inc ecx
+    cmp ecx, FONT_SIZE_PRESET_COUNT
+    jl .fcs_step_ok
+    mov ecx, FONT_SIZE_PRESET_COUNT - 1
+    jmp .fcs_step_ok
+.fcs_step_down:
+    dec ecx
+    jns .fcs_step_ok
+    xor ecx, ecx
+.fcs_step_ok:
+    mov rax, [font_size_presets + rcx*8]
+
+.fcs_have_size:
+    cmp rax, [cfg_font_size]
+    je .fcs_done                     ; nothing to do
+    mov [cfg_font_size], rax
+
+    ; Rebuild XLFDs and re-open. (We deliberately leak the previous
+    ; font IDs — CloseFont could race a queued ChangeGC; the leak is
+    ; tiny relative to the convenience.)
+    call setup_font_name
+    call x11_open_font
+    call x11_query_font
+
+    ; Tell the GC about the new font and refresh tracking.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4              ; 3 + 1 value
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FONT
+    mov eax, [font_id]
+    mov [rdi+12], eax
+    mov [gc_current_font], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Recompute grid_cols/grid_rows from current window pixels.
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .fcs_skip_resize
+    mov rax, [win_width]
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_COLS
+    jle .fcs_cols_ok
+    mov rax, MAX_COLS
+.fcs_cols_ok:
+    mov [grid_cols], rax
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .fcs_skip_resize
+    mov rax, [win_height]
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_ROWS
+    jle .fcs_rows_ok
+    mov rax, MAX_ROWS
+.fcs_rows_ok:
+    mov [grid_rows], rax
+
+    ; Tell PTY about the new size + signal the child to redraw.
+    sub rsp, 8
+    movzx eax, word [grid_rows]
+    mov word [rsp], ax
+    movzx eax, word [grid_cols]
+    mov word [rsp+2], ax
+    mov word [rsp+4], 0
+    mov word [rsp+6], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [pty_master]
+    mov rsi, TIOCSWINSZ
+    mov rdx, rsp
+    syscall
+    add rsp, 8
+    cmp qword [child_pid], 0
+    je .fcs_skip_signal
+    mov rax, SYS_KILL
+    mov rdi, [child_pid]
+    neg rdi                          ; process group
+    mov rsi, SIGWINCH
+    syscall
+.fcs_skip_signal:
+
+.fcs_skip_resize:
+    call render_screen
+    call x11_flush
+
+.fcs_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Background cycling (Alt+b)
+; ══════════════════════════════════════════════════════════════════════
+bg_cycle_advance:
+    push rbx
+    mov rax, [bg_cycle_count]
+    test rax, rax
+    jz .bca_done                     ; no cycle list configured
+
+    ; Save the original bg pixel once so we can later restore it if
+    ; we ever add a 'reset bg' command.
+    cmp byte [saved_bg_set], 0
+    jne .bca_have_save
+    mov eax, [cfg_bg_pixel]
+    mov [saved_bg_pixel], eax
+    mov byte [saved_bg_set], 1
+.bca_have_save:
+
+    mov rax, [bg_cycle_idx]
+    inc rax
+    cmp rax, [bg_cycle_count]
+    jb .bca_idx_ok
+    xor eax, eax
+.bca_idx_ok:
+    mov [bg_cycle_idx], rax
+
+    ; Apply: write the new pixel into the slots that drive rendering.
+    mov ebx, [bg_cycle_pixels + rax*4]
+    mov [cfg_bg_pixel], ebx
+    mov byte [cfg_bg_set], 1
+    mov [palette], ebx               ; default-bg cells re-route here
+
+    call render_screen
+    call x11_flush
+.bca_done:
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Opacity toggle (Alt+t) via _NET_WM_WINDOW_OPACITY
+; ══════════════════════════════════════════════════════════════════════
+; Visible only under a compositor (picom/compton/KWin/Mutter/etc.).
+opacity_toggle_apply:
+    push rbx
+    ; Lazily intern the atom on first use.
+    cmp byte [opacity_atom_set], 1
+    je .ota_have_atom
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0              ; only-if-exists = false
+    mov word [rdi+2], 2 + (opacity_atom_len + 3) / 4
+    mov word [rdi+4], opacity_atom_len
+    mov word [rdi+6], 0
+    lea rsi, [opacity_atom_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.ota_cp:
+    cmp ecx, opacity_atom_len
+    jge .ota_send_intern
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .ota_cp
+.ota_send_intern:
+    mov eax, opacity_atom_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    call x11_drain_until_reply
+    test rax, rax
+    js .ota_done
+    mov eax, [x11_buf + 8]           ; atom id at offset 8 of reply
+    test eax, eax
+    jz .ota_done
+    mov [opacity_atom], eax
+    mov byte [opacity_atom_set], 1
+
+.ota_have_atom:
+    ; Toggle state and pick the cardinal value.
+    movzx eax, byte [opacity_toggle]
+    xor eax, 1
+    mov [opacity_toggle], al
+    test al, al
+    jz .ota_opaque
+    mov ebx, 0x80000000              ; ~50% opacity
+    jmp .ota_have_value
+.ota_opaque:
+    mov ebx, 0xFFFFFFFF              ; fully opaque
+.ota_have_value:
+
+    ; ChangeProperty(window, _NET_WM_WINDOW_OPACITY, CARDINAL, 32, 1, [value])
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0              ; mode = Replace
+    mov word [rdi+2], 7              ; 6 header + 1 data word
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [opacity_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 6            ; XA_CARDINAL = 6
+    mov byte [rdi+16], 32            ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 1            ; data length (in 32-bit units)
+    mov [rdi+24], ebx                ; the cardinal value
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.ota_done:
     pop rbx
     ret
