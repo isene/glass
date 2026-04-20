@@ -11804,9 +11804,60 @@ bg_cycle_advance:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
-; Opacity toggle (Alt+t) via _NET_WM_WINDOW_OPACITY
+; Tear down pseudo-transparency: free the wallpaper-blended back-pixmap,
+; restore the window to a solid bg pixel, drop the pseudo_full flag so
+; the renderer goes back to ImageText16 (with bg fill).
 ; ══════════════════════════════════════════════════════════════════════
-; Visible only under a compositor (picom/compton/KWin/Mutter/etc.).
+pseudo_disable:
+    push rbx
+    mov ebx, [bg_pixmap_id]
+    test ebx, ebx
+    jz .pdis_skip_free
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_FREE_PIXMAP
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], ebx
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    mov dword [bg_pixmap_id], 0
+.pdis_skip_free:
+    ; ChangeWindowAttributes(window, BACK_PIXEL = cfg_bg)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 0x02          ; CW_BACK_PIXEL
+    cmp byte [cfg_bg_set], 1
+    jne .pdis_def_bg
+    mov eax, [cfg_bg_pixel]
+    jmp .pdis_set_pixel
+.pdis_def_bg:
+    mov eax, [x11_black_pixel]
+.pdis_set_pixel:
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov byte [pseudo_full], 0
+    mov byte [cfg_opacity], 255
+    mov byte [pseudo_setup_done], 0
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Opacity toggle (Alt+t)
+; ══════════════════════════════════════════════════════════════════════
+; Two paths run side-by-side so the binding does something visible
+; regardless of how the user's session is set up:
+;   * _NET_WM_WINDOW_OPACITY     — picked up by picom / KWin / Mutter
+;   * pseudo-transparency rebuild — wallpaper-blend BackPixmap when no
+;                                   compositor owns _NET_WM_CM_S0.
 opacity_toggle_apply:
     push rbx
     ; Lazily intern the atom on first use.
@@ -11880,6 +11931,25 @@ opacity_toggle_apply:
     mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
+    call x11_flush
+
+    ; If no compositor is running, _NET_WM_WINDOW_OPACITY is silently
+    ; ignored — fall through to glass's wallpaper-blend pseudo path so
+    ; the user sees something happen.
+    cmp byte [compositor_active], 1
+    je .ota_done
+    cmp byte [opacity_toggle], 1
+    je .ota_pseudo_on
+    call pseudo_disable
+    call render_screen
+    call x11_flush
+    jmp .ota_done
+.ota_pseudo_on:
+    mov byte [cfg_opacity], 128
+    mov byte [cfg_opacity_set], 1
+    mov byte [pseudo_setup_done], 0
+    call setup_pseudo_transparency
+    call render_screen
     call x11_flush
 .ota_done:
     pop rbx
