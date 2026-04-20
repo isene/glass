@@ -6591,6 +6591,20 @@ vt_process:
 ; Put character at cursor position
 ; ax = UCS-2 character (16-bit)
 grid_put_char:
+    ; Substitute a few BMP glyphs that the default xos4-terminus and
+    ; misc-fixed bitmap fonts don't ship — when a glyph is missing, the
+    ; X server falls back to the font's "default character" which is
+    ; usually a literal '?'. The pairs below pick the closest visually
+    ; equivalent glyph that IS present in terminus.
+    cmp ax, 0x25B3
+    jne .gpc_subst_25BD
+    mov ax, 0x25B2                   ; △ (outline) → ▲ (filled)
+    jmp .gpc_subst_done
+.gpc_subst_25BD:
+    cmp ax, 0x25BD
+    jne .gpc_subst_done
+    mov ax, 0x25BC                   ; ▽ (outline) → ▼ (filled)
+.gpc_subst_done:
     push rbx
     ; Honor any pending deferred wrap from the previous char written at
     ; the last column, but only if autowrap is still enabled. Apps like
@@ -11203,10 +11217,38 @@ handle_kitty_apc:
     jmp .hka_done
 
 .hka_delete:
+    ; Per kitty spec:
+    ;   d=i (lowercase) → delete placements of image i, KEEP image
+    ;   d=I (uppercase) → delete image data AND its placements
+    ;   d=a (lowercase) → delete all placements, KEEP all images
+    ;   d=A (uppercase) → delete all images and placements
+    ; Default when d= is missing is 'a' (with no id, the only sane
+    ; reading is "all placements").
     movzx eax, byte [apc_kv_d]
+    test al, al
+    jnz .hka_d_have
+    mov al, 'a'
+.hka_d_have:
     cmp al, 'a'
-    je .hka_delete_all
-    ; default 'i' or 'I' or any other — delete by id
+    je .hka_d_clear_all_placements
+    cmp al, 'A'
+    je .hka_d_release_all
+    cmp al, 'i'
+    je .hka_d_clear_one_placement
+    cmp al, 'I'
+    je .hka_d_release_one
+    jmp .hka_done
+
+.hka_d_clear_one_placement:
+    mov edi, [apc_kv_i]
+    test edi, edi
+    jz .hka_done
+    call place_clear_image
+    call render_screen
+    call x11_flush
+    jmp .hka_done
+
+.hka_d_release_one:
     mov edi, [apc_kv_i]
     test edi, edi
     jz .hka_done
@@ -11222,7 +11264,13 @@ handle_kitty_apc:
     call x11_flush
     jmp .hka_done
 
-.hka_delete_all:
+.hka_d_clear_all_placements:
+    call place_clear_all
+    call render_screen
+    call x11_flush
+    jmp .hka_done
+
+.hka_d_release_all:
     xor ecx, ecx
 .hka_da_loop:
     cmp ecx, IMG_SLOTS
