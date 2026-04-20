@@ -7499,7 +7499,16 @@ render_screen:
     mov edx, [rax + 12]
     test byte [rax + 3], 1
     cmovz r15d, edx
-    movzx edx, byte [rax + 4]   ; attrs
+    movzx edx, byte [rax + 4]   ; attrs (read before is_cell_selected
+                                ; clobbers rax — cell pointer dies there)
+    ; Capture this run's bold + underline bits (cell[4] bits 0/1).
+    mov ecx, edx
+    and ecx, 1
+    mov [run_bold], cl
+    mov ecx, edx
+    shr ecx, 1
+    and ecx, 1
+    mov [run_underline], cl
     and edx, 4                  ; inverse bit
     ; XOR with selection state at (r12, r13)
     push rbx
@@ -7512,15 +7521,6 @@ render_screen:
     jz .rs_no_inv_start
     xchg r14d, r15d             ; swap fg/bg for inverse
 .rs_no_inv_start:
-
-    ; Capture this run's bold + underline bits (cell[4] bits 0/1).
-    movzx edx, byte [rax + 4]
-    mov ecx, edx
-    and ecx, 1
-    mov [run_bold], cl
-    shr edx, 1
-    and edx, 1
-    mov [run_underline], dl
 
     ; Scan ahead for cells with same effective fg/bg, build CHAR2B text
     lea rdi, [tmp_buf + 20]  ; text buffer (2 bytes per char)
