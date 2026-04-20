@@ -23,6 +23,24 @@ make
 sudo make install
 ```
 
+`make install` also installs the bundled emoji cache (1170
+single-codepoint emoji pre-rendered at 12x13, the default font cell
+size) to `/usr/local/share/glass/emoji/`. First-time emoji rendering
+is instant; any not in the bundle are rasterized once via ImageMagick
+`convert` and written to `~/.cache/glass/emoji/`.
+
+To rebuild the bundled cache for a different cell size (e.g. if you
+use a larger font):
+
+```bash
+make emoji-cache W=20 H=20   # rebuild for 20x20 cells
+sudo make install-emoji
+```
+
+The `convert` command (ImageMagick) and the Noto Color Emoji font are
+only needed for rendering emoji NOT in the cache; glass itself has no
+runtime dependencies beyond an X11 server.
+
 ## Configuration
 
 Create `~/.glassrc` for custom colors:

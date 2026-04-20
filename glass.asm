@@ -23,6 +23,9 @@
 %define SYS_KILL        62
 %define SYS_SETSID      112
 %define SYS_CLOCK_GETTIME 228
+%define SYS_PIPE         22
+%define SYS_MKDIR        83
+%define SYS_CREAT        85
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Constants
@@ -31,6 +34,9 @@
 %define SOCK_STREAM     1
 %define O_RDWR          2
 %define O_RDONLY         0
+%define O_WRONLY         1
+%define O_CREAT          0o100
+%define O_TRUNC          0o1000
 %define POLLIN          1
 %define SIGWINCH        28
 
@@ -168,6 +174,33 @@ wm_delete_len   equ 16
 ; XRender extension name (used by QueryExtension)
 render_ext_str:   db "RENDER", 0
 render_ext_len    equ 6
+
+; Disk cache for rasterized emoji. Files live in
+; $HOME/.cache/glass/emoji/<HEX_CODEPOINT>-<W>x<H>.rgba and contain
+; raw RGBA bytes at the current cell size. Lookups skip the ~70ms
+; fork+exec convert pipeline; first-time renders write to the cache
+; so subsequent glass sessions are instant.
+emoji_cache_dir_suffix:  db "/.cache/glass/emoji", 0
+emoji_cache_glass:       db "/.cache/glass", 0
+emoji_cache_dotcache:    db "/.cache", 0
+
+; System-wide bundled cache installed by `make install`. Glass falls
+; back to this when a glyph isn't in the user's per-session cache yet,
+; so a fresh user gets instant rendering for the standard emoji set
+; without paying the convert fork cost on first sight.
+emoji_sys_cache_dir:     db "/usr/local/share/glass/emoji", 0
+
+; convert(1) command for emoji rasterization. Each emoji render forks
+; convert with these argv pointers patched per-codepoint (size_arg
+; and pango_arg are filled in BSS before fork). Output is raw RGBA
+; bytes on stdout (depth 8, 4 bytes per pixel).
+convert_path:     db "/usr/bin/convert", 0
+convert_arg_size: db "-size", 0
+convert_arg_bg:   db "-background", 0
+convert_arg_none: db "none", 0
+convert_arg_depth:db "-depth", 0
+convert_arg_8:    db "8", 0
+convert_arg_rgba: db "RGBA:-", 0
 
 ; Selection atom names
 clipboard_str:    db "CLIPBOARD", 0
@@ -318,11 +351,22 @@ render_window_picture:  resd 1     ; Picture wrapping the glass window
 render_temp_gc:         resd 1     ; GC used to PutImage onto pixmaps
 
 %define MAX_EMOJI 1024
+%define EMOJI_RASTER_MAX (64 * 64 * 4)   ; allow up to 64x64 ARGB
 emoji_codepoints:       resd MAX_EMOJI   ; 32-bit codepoints we've seen
 emoji_pictures:         resd MAX_EMOJI   ; XID of XRender Picture (0 = not yet rendered)
 emoji_pixmaps:          resd MAX_EMOJI   ; XID of backing Pixmap
 emoji_count:            resq 1
 cur_emoji_index:        resw 1     ; set by UTF-8 decoder before grid_put_char
+; Buffers for fork+exec convert (rebuilt per emoji)
+emoji_size_arg:         resb 16          ; "WxH\0"
+emoji_pango_arg:        resb 256         ; "pango:<span ...>UTF8</span>\0"
+emoji_argv:             resq 16          ; argv pointers passed to execve
+emoji_raster_buf:       resb EMOJI_RASTER_MAX
+emoji_cache_path:       resb 256         ; full path to disk cache file (user)
+emoji_sys_cache_path:   resb 256         ; full path to system bundled cache
+emoji_cache_dir:        resb 256         ; full path to cache directory
+emoji_cache_dirs_made:  resb 1           ; 1 after we've created the dirs
+render_gc_ready:        resb 1           ; 1 once render_temp_gc is created
 wm_delete_atom:     resd 1
 
 ; Font metrics
@@ -1823,12 +1867,15 @@ x11_setup_render:
     ; type must be Direct (1)
     cmp byte [rbx + 4], 1
     jne .xsr_fmt_next
+    ; PICTFORMINFO offsets (per RENDER spec):
+    ;   +5 depth, +8 r_shift, +10 r_mask, +12 g_shift, +14 g_mask,
+    ;   +16 b_shift, +18 b_mask, +20 a_shift, +22 a_mask
     movzx eax, byte [rbx + 5]           ; depth
     movzx edx, word [rbx + 8]           ; r_shift
-    movzx esi, word [rbx + 14]          ; g_shift
-    movzx edi, word [rbx + 20]          ; b_shift
-    movzx r8d, word [rbx + 22]          ; a_shift
-    movzx r9d, word [rbx + 24]          ; a_mask
+    movzx esi, word [rbx + 12]          ; g_shift
+    movzx edi, word [rbx + 16]          ; b_shift
+    movzx r8d, word [rbx + 20]          ; a_shift
+    movzx r9d, word [rbx + 22]          ; a_mask
     ; ARGB32: depth=32, r_shift=16, g_shift=8, b_shift=0, a_shift=24, a_mask=0xFF
     cmp eax, 32
     jne .xsr_check_window
@@ -1852,8 +1899,8 @@ x11_setup_render:
     ; ARGB transparency mode). RGB ordering R=16/G=8/B=0.
     movzx r12d, byte [rbx + 5]          ; depth
     movzx r13d, word [rbx + 8]          ; r_shift
-    movzx r14d, word [rbx + 14]         ; g_shift
-    movzx eax, word [rbx + 20]          ; b_shift
+    movzx r14d, word [rbx + 12]         ; g_shift
+    movzx eax, word [rbx + 16]          ; b_shift
     cmp r13d, 16
     jne .xsr_fmt_next
     cmp r14d, 8
@@ -1908,22 +1955,9 @@ x11_setup_render:
     call x11_buffer
     inc dword [x11_seq]
 
-    ; Allocate a GC for putting RGBA pixmaps. Reused across all emoji.
-    call alloc_xid
-    mov [render_temp_gc], eax
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_CREATE_GC
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 4
-    mov eax, [render_temp_gc]
-    mov [rdi+4], eax
-    mov eax, [win_id]
-    mov [rdi+8], eax
-    mov dword [rdi+12], 0               ; value-mask
-    lea rsi, [tmp_buf]
-    mov rdx, 16
-    call x11_buffer
-    inc dword [x11_seq]
+    ; render_temp_gc is created lazily on the first emoji render so its
+    ; depth matches the depth-32 emoji pixmap (a depth-24 GC can't
+    ; PutImage onto a depth-32 drawable).
     call x11_flush
 
     pop r14
@@ -1938,6 +1972,796 @@ x11_setup_render:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; find_or_alloc_emoji: edi = 32-bit codepoint. Returns rax = emoji
+; index (>= 0), or -1 if the cache is full. Linear search — N is
+; small (max 1024) and emoji are sticky (same set on each refresh).
+; ══════════════════════════════════════════════════════════════════════
+find_or_alloc_emoji:
+    push rbx
+    push r12
+    mov r12, [emoji_count]
+    xor rbx, rbx
+.foe_search:
+    cmp rbx, r12
+    jge .foe_alloc
+    cmp [emoji_codepoints + rbx*4], edi
+    je .foe_found
+    inc rbx
+    jmp .foe_search
+.foe_found:
+    mov rax, rbx
+    pop r12
+    pop rbx
+    ret
+.foe_alloc:
+    cmp r12, MAX_EMOJI
+    jge .foe_full
+    mov [emoji_codepoints + r12*4], edi
+    mov dword [emoji_pictures + r12*4], 0
+    mov dword [emoji_pixmaps + r12*4], 0
+    mov rax, r12
+    inc r12
+    mov [emoji_count], r12
+    pop r12
+    pop rbx
+    ret
+.foe_full:
+    mov rax, -1
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; itoa_decimal: rdi = unsigned value, rsi = output buffer.
+; Writes decimal digits (no terminator). Returns rax = number of bytes
+; written. Used for assembling the convert size argument.
+; ══════════════════════════════════════════════════════════════════════
+itoa_decimal:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi             ; output start
+    mov rax, rdi
+    mov ecx, 10
+    sub rsp, 24
+    mov r13, rsp             ; scratch (digits in reverse)
+    xor ebx, ebx
+.itd_loop:
+    xor edx, edx
+    div rcx
+    add dl, '0'
+    mov [r13 + rbx], dl
+    inc ebx
+    test rax, rax
+    jnz .itd_loop
+    ; Copy reversed
+    xor ecx, ecx
+.itd_copy:
+    cmp ecx, ebx
+    jge .itd_done
+    mov edx, ebx
+    sub edx, ecx
+    dec edx
+    mov al, [r13 + rdx]
+    mov [r12 + rcx], al
+    inc ecx
+    jmp .itd_copy
+.itd_done:
+    add rsp, 24
+    mov rax, rcx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; encode_utf8: edi = codepoint, rsi = output buffer. Writes 1-4 bytes.
+; Returns rax = bytes written.
+; ══════════════════════════════════════════════════════════════════════
+encode_utf8:
+    cmp edi, 0x80
+    jb .eu_1
+    cmp edi, 0x800
+    jb .eu_2
+    cmp edi, 0x10000
+    jb .eu_3
+.eu_4:
+    mov eax, edi
+    shr eax, 18
+    or al, 0xF0
+    mov [rsi], al
+    mov eax, edi
+    shr eax, 12
+    and eax, 0x3F
+    or al, 0x80
+    mov [rsi+1], al
+    mov eax, edi
+    shr eax, 6
+    and eax, 0x3F
+    or al, 0x80
+    mov [rsi+2], al
+    mov eax, edi
+    and eax, 0x3F
+    or al, 0x80
+    mov [rsi+3], al
+    mov eax, 4
+    ret
+.eu_3:
+    mov eax, edi
+    shr eax, 12
+    or al, 0xE0
+    mov [rsi], al
+    mov eax, edi
+    shr eax, 6
+    and eax, 0x3F
+    or al, 0x80
+    mov [rsi+1], al
+    mov eax, edi
+    and eax, 0x3F
+    or al, 0x80
+    mov [rsi+2], al
+    mov eax, 3
+    ret
+.eu_2:
+    mov eax, edi
+    shr eax, 6
+    or al, 0xC0
+    mov [rsi], al
+    mov eax, edi
+    and eax, 0x3F
+    or al, 0x80
+    mov [rsi+1], al
+    mov eax, 2
+    ret
+.eu_1:
+    mov al, dil
+    mov [rsi], al
+    mov eax, 1
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Emoji disk cache helpers. The first emoji render touches mkdir to
+; build $HOME/.cache/glass/emoji once; thereafter every glyph is
+; loaded from disk in a single read syscall instead of forking convert.
+; Cache key encodes both the codepoint and the cell-pixel dimensions
+; so a font/size change produces a separate cache file.
+; ══════════════════════════════════════════════════════════════════════
+
+; find_home: returns HOME string in rax (NULL if not found).
+emoji_find_home:
+    mov rdi, [envp]
+.efh_loop:
+    mov rax, [rdi]
+    test rax, rax
+    jz .efh_none
+    cmp dword [rax], 'HOME'
+    jne .efh_next
+    cmp byte [rax + 4], '='
+    jne .efh_next
+    lea rax, [rax + 5]
+    ret
+.efh_next:
+    add rdi, 8
+    jmp .efh_loop
+.efh_none:
+    xor eax, eax
+    ret
+
+; emoji_strcpy_advance: rdi=dst, rsi=src. Copies through (excluding)
+; the NUL. Returns rdi past last byte written.
+emoji_strcpy_advance:
+    push rax
+.esa_loop:
+    mov al, [rsi]
+    test al, al
+    jz .esa_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .esa_loop
+.esa_done:
+    pop rax
+    ret
+
+; emoji_hex8: rdi = 32-bit value, rsi = output buffer. Writes 8
+; uppercase hex digits, returns rax = 8.
+emoji_hex8:
+    push rbx
+    mov ebx, 7
+.eh8_loop:
+    mov ecx, ebx
+    shl ecx, 2
+    mov eax, edi
+    shr eax, cl
+    and eax, 0xF
+    cmp al, 10
+    jb .eh8_digit
+    add al, 'A' - 10
+    jmp .eh8_put
+.eh8_digit:
+    add al, '0'
+.eh8_put:
+    mov edx, 7
+    sub edx, ebx
+    mov [rsi + rdx], al
+    test ebx, ebx
+    jz .eh8_done
+    dec ebx
+    jmp .eh8_loop
+.eh8_done:
+    mov eax, 8
+    pop rbx
+    ret
+
+; emoji_build_cache_path: edi = codepoint, esi = width, edx = height.
+; Writes to emoji_cache_path. Also fills emoji_cache_dir with the
+; parent directory so ensure_cache_dir can mkdir it. Returns rax = 1
+; on success, 0 if HOME isn't set.
+emoji_build_cache_path:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi               ; codepoint
+    mov r13d, esi               ; width
+    mov r14d, edx               ; height
+    call emoji_find_home
+    test rax, rax
+    jz .ebcp_fail
+    mov rsi, rax
+    lea rdi, [emoji_cache_dir]
+    call emoji_strcpy_advance
+    lea rsi, [emoji_cache_dir_suffix]
+    call emoji_strcpy_advance
+    mov byte [rdi], 0
+    ; Now build the file path: dir + "/" + hex(codepoint) + "-WxH.rgba"
+    lea rdi, [emoji_cache_path]
+    lea rsi, [emoji_cache_dir]
+    call emoji_strcpy_advance
+    mov byte [rdi], '/'
+    inc rdi
+    mov rsi, rdi                 ; itoa/hex helpers want rsi=dst
+    mov edi, r12d
+    call emoji_hex8
+    add rsi, rax
+    mov byte [rsi], '-'
+    inc rsi
+    mov edi, r13d                ; width
+    call itoa_decimal
+    add rsi, rax
+    mov byte [rsi], 'x'
+    inc rsi
+    mov edi, r14d                ; height
+    call itoa_decimal
+    add rsi, rax
+    mov rdi, rsi
+    lea rsi, [.ebcp_ext]
+    call emoji_strcpy_advance
+    mov byte [rdi], 0
+
+    ; Also build the system-bundled cache path for fallback lookup.
+    ; Format: /usr/local/share/glass/emoji/<HEX>-WxH.rgba
+    lea rdi, [emoji_sys_cache_path]
+    lea rsi, [emoji_sys_cache_dir]
+    call emoji_strcpy_advance
+    mov byte [rdi], '/'
+    inc rdi
+    mov rsi, rdi
+    mov edi, r12d
+    call emoji_hex8
+    add rsi, rax
+    mov byte [rsi], '-'
+    inc rsi
+    mov edi, r13d
+    call itoa_decimal
+    add rsi, rax
+    mov byte [rsi], 'x'
+    inc rsi
+    mov edi, r14d
+    call itoa_decimal
+    add rsi, rax
+    mov rdi, rsi
+    lea rsi, [.ebcp_ext]
+    call emoji_strcpy_advance
+    mov byte [rdi], 0
+
+    mov eax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ebcp_fail:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ebcp_ext: db ".rgba", 0
+
+; emoji_ensure_cache_dir: mkdir's $HOME/.cache, /.cache/glass and
+; /.cache/glass/emoji. Idempotent; ignores EEXIST. Caller has filled
+; emoji_cache_dir as a side-effect of build_cache_path.
+emoji_ensure_cache_dir:
+    cmp byte [emoji_cache_dirs_made], 1
+    je .eecd_done
+    push rbx
+    push r12
+    ; Build $HOME/.cache then $HOME/.cache/glass then full dir.
+    call emoji_find_home
+    test rax, rax
+    jz .eecd_pop
+    mov rsi, rax
+    lea rdi, [tmp_buf]
+    call emoji_strcpy_advance
+    push rdi                     ; save cursor at end of HOME
+    lea rsi, [emoji_cache_dotcache]
+    call emoji_strcpy_advance
+    mov byte [rdi], 0
+    mov rax, SYS_MKDIR
+    lea rdi, [tmp_buf]
+    mov esi, 0o755
+    syscall                       ; ignore EEXIST
+    pop rdi
+    push rdi
+    lea rsi, [emoji_cache_glass]
+    call emoji_strcpy_advance
+    mov byte [rdi], 0
+    mov rax, SYS_MKDIR
+    lea rdi, [tmp_buf]
+    mov esi, 0o755
+    syscall
+    pop rdi
+    lea rsi, [emoji_cache_dir_suffix]
+    call emoji_strcpy_advance
+    mov byte [rdi], 0
+    mov rax, SYS_MKDIR
+    lea rdi, [tmp_buf]
+    mov esi, 0o755
+    syscall
+    mov byte [emoji_cache_dirs_made], 1
+.eecd_pop:
+    pop r12
+    pop rbx
+.eecd_done:
+    ret
+
+; emoji_try_load_cache: rdi = path, rsi = expected size in bytes.
+; Reads the file into emoji_raster_buf if it exists. Returns rax =
+; bytes read on success, 0 on miss.
+emoji_try_load_cache:
+    push rbx
+    push r12
+    mov r12, rsi                 ; expected size
+    mov rax, SYS_OPEN
+    ; rdi already = path
+    xor esi, esi                 ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .etlc_miss
+    mov ebx, eax
+    mov rax, SYS_READ
+    mov edi, ebx
+    lea rsi, [emoji_raster_buf]
+    mov rdx, r12
+    syscall
+    mov r12, rax                 ; bytes actually read
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, r12
+    pop r12
+    pop rbx
+    ret
+.etlc_miss:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; emoji_save_cache: rdi = byte count from emoji_raster_buf to write
+; to emoji_cache_path. Best-effort.
+emoji_save_cache:
+    push rbx
+    push r12
+    mov r12, rdi
+    call emoji_ensure_cache_dir
+    mov rax, SYS_OPEN
+    lea rdi, [emoji_cache_path]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js .esc_done
+    mov ebx, eax
+    mov rax, SYS_WRITE
+    mov edi, ebx
+    lea rsi, [emoji_raster_buf]
+    mov rdx, r12
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+.esc_done:
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; render_emoji_glyph: rdi = emoji index. Forks `convert` to rasterize
+; the emoji codepoint at cell size into RGBA, then uploads it as a
+; depth-32 Pixmap and wraps it in an XRender Picture. Stores the IDs
+; in emoji_pixmaps[index] / emoji_pictures[index]. No-op if the
+; picture is already cached.
+;
+; r12 = index, r13 = pixmap width, r14 = pixmap height throughout.
+; ══════════════════════════════════════════════════════════════════════
+render_emoji_glyph:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi             ; index
+    mov eax, [emoji_pictures + r12*4]
+    test eax, eax
+    jnz .reg_done
+
+    ; Pixmap dimensions: 2-cells wide (emoji at cell width are illegible)
+    movzx r13d, word [char_width]
+    add r13d, r13d
+    movzx r14d, word [char_height]
+
+    ; Try the on-disk caches first (user, then bundled system). A hit
+    ; skips the ~70ms convert fork entirely and proceeds straight to
+    ; PutImage with the cached RGBA.
+    mov edi, [emoji_codepoints + r12*4]
+    mov esi, r13d
+    mov edx, r14d
+    call emoji_build_cache_path
+    test eax, eax
+    jz .reg_no_cache
+    mov ebx, r13d
+    imul ebx, r14d
+    shl ebx, 2                            ; expected size = W*H*4
+    ; Try user cache
+    lea rdi, [emoji_cache_path]
+    mov esi, ebx
+    call emoji_try_load_cache
+    cmp rax, rbx
+    je .reg_have_raster
+    ; Try system bundled cache
+    lea rdi, [emoji_sys_cache_path]
+    mov esi, ebx
+    call emoji_try_load_cache
+    cmp rax, rbx
+    je .reg_have_raster
+
+.reg_no_cache:
+    ; Build "WxH\0" into emoji_size_arg
+    mov edi, r13d
+    lea rsi, [emoji_size_arg]
+    call itoa_decimal
+    mov ebx, eax
+    mov byte [emoji_size_arg + rbx], 'x'
+    inc ebx
+    mov edi, r14d
+    lea rsi, [emoji_size_arg + rbx]
+    call itoa_decimal
+    add ebx, eax
+    mov byte [emoji_size_arg + rbx], 0
+
+    ; Build the pango: argument incrementally so we never need strlen.
+    ; rdi tracks the write cursor; r15 saved across calls below.
+    lea rdi, [emoji_pango_arg]
+    lea rsi, [.reg_pango_prefix]
+    call .reg_strcpy_advance     ; rdi = end after copy
+    ; pointsize = char_height * 700 (Pango units of 1/1024 pt, fits cell)
+    mov eax, r14d
+    imul eax, 700
+    mov r15, rdi                  ; save dest
+    mov rsi, rdi
+    mov edi, eax
+    call itoa_decimal
+    mov rdi, r15
+    add rdi, rax
+    lea rsi, [.reg_pango_mid]
+    call .reg_strcpy_advance
+    ; UTF-8 bytes for the emoji codepoint. encode_utf8 takes edi as
+    ; the codepoint and rsi as the destination, returns bytes-written
+    ; in rax. Save the cursor in rsi first so we can advance after.
+    mov rsi, rdi                  ; rsi = current write cursor
+    mov edi, [emoji_codepoints + r12*4]
+    call encode_utf8
+    add rsi, rax
+    mov rdi, rsi                  ; rdi = cursor after the UTF-8 bytes
+    lea rsi, [.reg_pango_suffix]
+    call .reg_strcpy_advance
+    mov byte [rdi], 0
+
+    ; Build argv array
+    lea rax, [convert_path]
+    mov [emoji_argv + 0*8], rax
+    lea rax, [convert_arg_size]
+    mov [emoji_argv + 1*8], rax
+    lea rax, [emoji_size_arg]
+    mov [emoji_argv + 2*8], rax
+    lea rax, [convert_arg_bg]
+    mov [emoji_argv + 3*8], rax
+    lea rax, [convert_arg_none]
+    mov [emoji_argv + 4*8], rax
+    lea rax, [emoji_pango_arg]
+    mov [emoji_argv + 5*8], rax
+    lea rax, [convert_arg_depth]
+    mov [emoji_argv + 6*8], rax
+    lea rax, [convert_arg_8]
+    mov [emoji_argv + 7*8], rax
+    lea rax, [convert_arg_rgba]
+    mov [emoji_argv + 8*8], rax
+    mov qword [emoji_argv + 9*8], 0
+
+    ; Create pipe (read end goes to parent, write end to child stdout)
+    sub rsp, 16
+    mov rax, SYS_PIPE
+    mov rdi, rsp
+    syscall
+    test rax, rax
+    js .reg_pipe_fail
+    mov ebx, [rsp]              ; read fd
+    mov r15d, [rsp + 4]          ; write fd
+    add rsp, 16
+
+    ; Fork
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .reg_fork_fail
+    jnz .reg_parent
+
+    ; Child: dup2(write_fd, 1), close pipe ends, exec convert
+    mov rax, SYS_DUP2
+    mov edi, r15d
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [convert_path]
+    lea rsi, [emoji_argv]
+    mov rdx, [envp]
+    syscall
+    ; If exec fails, exit with error
+    mov rax, SYS_EXIT
+    mov rdi, 127
+    syscall
+
+.reg_parent:
+    ; rax = child pid; ebx = read fd, r15d = write fd.
+    ; Close write end so the pipe sees EOF after the child finishes.
+    push rax                       ; save child pid
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    pop r15                        ; r15 = child pid
+
+    ; Pre-compute expected raster size = (char_width*2) * char_height * 4
+    movzx eax, word [char_width]
+    add eax, eax
+    movzx edx, word [char_height]
+    imul eax, edx
+    shl eax, 2
+    mov r13, rax                   ; total bytes expected
+    xor r14, r14                   ; bytes received so far
+.reg_read_loop:
+    cmp r14, r13
+    jge .reg_read_done
+    cmp r14, EMOJI_RASTER_MAX
+    jge .reg_read_done
+    mov rax, SYS_READ
+    mov edi, ebx
+    lea rsi, [emoji_raster_buf + r14]
+    mov rdx, r13
+    sub rdx, r14
+    syscall
+    test rax, rax
+    jle .reg_read_done
+    add r14, rax
+    jmp .reg_read_loop
+.reg_read_done:
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+
+    ; Wait for child to avoid zombies. r14 holds bytes received and
+    ; must survive the syscall.
+    push r14
+    sub rsp, 8
+    mov rax, SYS_WAIT4
+    mov rdi, r15
+    mov rsi, rsp
+    xor edx, edx
+    xor r10, r10
+    syscall
+    add rsp, 8
+    pop r14
+
+    ; If we got no data, bail (child failed)
+    test r14, r14
+    jz .reg_done
+
+    ; Persist this glyph so the next glass session is instant.
+    mov rdi, r14
+    call emoji_save_cache
+
+.reg_have_raster:
+    ; Recompute pixmap dimensions (clobbered by reads above)
+    movzx r13d, word [char_width]
+    add r13d, r13d
+    movzx r14d, word [char_height]
+
+    ; CreatePixmap depth=32, w=r13, h=r14
+    call alloc_xid
+    mov [emoji_pixmaps + r12*4], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov byte [rdi+1], 32        ; depth
+    mov word [rdi+2], 4
+    mov [rdi+4], eax            ; pid
+    mov eax, [win_id]
+    mov [rdi+8], eax            ; drawable (visual relationship)
+    mov word [rdi+12], r13w     ; width
+    mov word [rdi+14], r14w     ; height
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Create render_temp_gc lazily on first emoji
+    cmp byte [render_gc_ready], 1
+    je .reg_gc_done
+    call alloc_xid
+    mov [render_temp_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [render_temp_gc]
+    mov [rdi+4], eax
+    mov eax, [emoji_pixmaps + r12*4]
+    mov [rdi+8], eax            ; depth-32 drawable
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov byte [render_gc_ready], 1
+.reg_gc_done:
+
+    ; PutImage: opcode=72, format=ZPixmap=2, length=(24+data+3)/4,
+    ; drawable, gc, w(2), h(2), dst-x(2), dst-y(2), left-pad, depth, pad(2)
+    ; data follows.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2          ; ZPixmap
+    mov eax, r14d                ; bytes
+    mov ecx, r13d
+    imul ecx, eax
+    shl ecx, 2                   ; w*h*4 bytes
+    add ecx, 24 + 3
+    shr ecx, 2
+    mov word [rdi+2], cx
+    mov eax, [emoji_pixmaps + r12*4]
+    mov [rdi+4], eax
+    mov eax, [render_temp_gc]
+    mov [rdi+8], eax
+    mov word [rdi+12], r13w
+    mov word [rdi+14], r14w
+    mov word [rdi+16], 0
+    mov word [rdi+18], 0
+    mov byte [rdi+20], 0
+    mov byte [rdi+21], 32
+    mov word [rdi+22], 0
+    ; Send header directly, then RGBA body
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    ; Send RGBA payload
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [emoji_raster_buf]
+    mov edx, r13d
+    imul edx, r14d
+    shl edx, 2
+    syscall
+    ; Pad to 4-byte boundary
+    mov ecx, r13d
+    imul ecx, r14d
+    shl ecx, 2
+    test ecx, 3
+    jz .reg_no_pad
+    mov edx, 4
+    sub edx, ecx
+    and edx, 3
+    sub rsp, 8
+    mov qword [rsp], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    mov rsi, rsp
+    syscall
+    add rsp, 8
+.reg_no_pad:
+    inc dword [x11_seq]
+
+    ; Create XRender Picture wrapping the pixmap
+    call alloc_xid
+    mov [emoji_pictures + r12*4], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5
+    mov eax, [emoji_pictures + r12*4]
+    mov [rdi+4], eax
+    mov eax, [emoji_pixmaps + r12*4]
+    mov [rdi+8], eax
+    mov eax, [render_format_argb32]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+
+.reg_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.reg_pipe_fail:
+    add rsp, 16
+    jmp .reg_done
+.reg_fork_fail:
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    jmp .reg_done
+
+.reg_pango_prefix: db "pango:<span font_family='Noto Color Emoji' size='", 0
+.reg_pango_mid:    db "'>", 0
+.reg_pango_suffix: db "</span>", 0
+
+; rdi = dst, rsi = src (NUL-terminated). Copies bytes (not the NUL),
+; returns with rdi pointing past the last copied byte.
+.reg_strcpy_advance:
+    push rax
+.regs_loop:
+    mov al, [rsi]
+    test al, al
+    jz .regs_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .regs_loop
+.regs_done:
+    pop rax
     ret
 
 ; Map window
@@ -3880,11 +4704,34 @@ vt_process:
     dec dword [utf8_remaining]
     cmp dword [utf8_remaining], 0
     jne .vtp_loop            ; more bytes coming
-    ; Complete: put the codepoint
-    movzx eax, word [utf8_char]  ; clamp to BMP (16-bit)
+    ; Complete: dispatch BMP to grid_put_char as before; route non-BMP
+    ; codepoints (the SMP emoji blocks) into the emoji cache so they
+    ; can be rendered via XRender Composite. Falls back to U+FFFD if
+    ; RENDER isn't available or the cache is full.
+    mov eax, [utf8_char]
     cmp eax, 0xFFFF
-    jle .vtp_put_char
-    mov eax, 0xFFFD              ; replacement char for non-BMP
+    jle .vtp_put_char_bmp
+    cmp dword [render_major], 0
+    je .vtp_put_emoji_fallback
+    push rax
+    mov edi, eax
+    call find_or_alloc_emoji
+    test rax, rax
+    js .vtp_put_emoji_fallback_pop
+    mov [cur_emoji_index], ax
+    or byte [cur_attrs], 8       ; ATTR_IS_EMOJI
+    pop rax
+    mov eax, 0x20                 ; cell glyph fallback (overlaid by emoji)
+    call grid_put_char
+    and byte [cur_attrs], ~8
+    jmp .vtp_loop
+.vtp_put_emoji_fallback_pop:
+    pop rax
+.vtp_put_emoji_fallback:
+    mov eax, 0xFFFD
+    jmp .vtp_put_char
+.vtp_put_char_bmp:
+    movzx eax, ax
     jmp .vtp_put_char
 
 .vtp_utf8_lead:
@@ -5456,7 +6303,17 @@ grid_put_char:
     mov [grid + rbx + 4], cl         ; [4] attrs
     movzx ecx, byte [cur_osc8_id]
     mov [grid + rbx + 5], cl         ; [5] OSC 8 link id
-    mov word [grid + rbx + 6], 0     ; [6-7] reserved
+    ; [6-7]: emoji cache index when ATTR_IS_EMOJI (0x08) is set in
+    ; cur_attrs, otherwise zero. The render path uses this to compose
+    ; the cached emoji Picture onto the cell.
+    test byte [cur_attrs], 8
+    jz .gpc_no_emoji
+    movzx ecx, word [cur_emoji_index]
+    mov [grid + rbx + 6], cx
+    jmp .gpc_after_emoji
+.gpc_no_emoji:
+    mov word [grid + rbx + 6], 0
+.gpc_after_emoji:
     mov ecx, [cur_fg_pixel]
     mov [grid + rbx + 8], ecx        ; [8-11] fg pixel
     mov ecx, [cur_bg_pixel]
@@ -6868,6 +7725,81 @@ render_screen:
     inc r12
     jmp .rs_link_row
 .rs_link_done:
+
+    ; Emoji pass: composite each ATTR_IS_EMOJI cell's cached Picture
+    ; onto the window via XRender. Lazy: any not-yet-rendered emoji
+    ; gets forked-and-rasterized here on first sight.
+    cmp dword [render_major], 0
+    je .rs_emoji_done
+    xor r12, r12
+.rs_emoji_row:
+    cmp r12, [grid_rows]
+    jge .rs_emoji_done
+    xor r13, r13
+.rs_emoji_col:
+    cmp r13, [grid_cols]
+    jge .rs_emoji_next_row
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    test byte [grid + rax + 4], 8       ; ATTR_IS_EMOJI
+    jz .rs_emoji_inc
+    movzx r14d, word [grid + rax + 6]   ; emoji index
+    cmp r14d, MAX_EMOJI
+    jae .rs_emoji_inc
+    mov edi, r14d
+    call render_emoji_glyph
+    mov eax, [emoji_pictures + r14*4]
+    test eax, eax
+    jz .rs_emoji_inc
+    ; Composite: src=picture, mask=0, dst=window_picture, op=Over
+    push rax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_COMPOSITE
+    mov word [rdi+2], 9
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    pop rax
+    mov [rdi+8], eax                    ; src
+    mov dword [rdi+12], 0               ; mask = None
+    mov eax, [render_window_picture]
+    mov [rdi+16], eax                   ; dst
+    mov word [rdi+20], 0                ; src x
+    mov word [rdi+22], 0                ; src y
+    mov word [rdi+24], 0                ; mask x
+    mov word [rdi+26], 0                ; mask y
+    ; dst x = col * char_width
+    mov rax, r13
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+28], ax
+    ; dst y = row * char_height
+    mov rax, r12
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+30], ax
+    ; width = char_width * 2 (emoji are double-cell wide)
+    movzx eax, word [char_width]
+    add eax, eax
+    mov word [rdi+32], ax
+    ; height = char_height
+    movzx eax, word [char_height]
+    mov word [rdi+34], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 36
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_emoji_inc:
+    inc r13
+    jmp .rs_emoji_col
+.rs_emoji_next_row:
+    inc r12
+    jmp .rs_emoji_row
+.rs_emoji_done:
 
 .rs_cursor:
     ; Skip cursor drawing if cursor_visible == 0
