@@ -53,12 +53,18 @@ font_size = 13
 opacity = 80
 cursor_blink = 500
 bg_cycle = #000000,#001a33,#002200,#200033,#330011,#332200,#003333
+font_weight = bold
 ```
 
 Available font sizes: 10, 13, 15, 18, 20 (misc-fixed, always present),
 22, 24, 28, 32 (xos4-terminus, requires the `xfonts-terminus` package
 on Debian/Ubuntu/Arch/Fedora — much more legible at large sizes).
 Colors are hex RGB.
+
+`font_weight = bold` aliases the regular font to the bold XLFD, so
+all text gets the heavier strokes that TTF terminals use by default.
+SGR 1 (bold) then has no further effect since terminus has no
+extra-bold beyond bold.
 `cursor_blink` is the toggle interval in milliseconds (omit or set
 to `0` for a steady cursor).
 `opacity` is a 0..100 percentage (100 = opaque, default). Values

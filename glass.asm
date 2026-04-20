@@ -469,6 +469,7 @@ cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
 cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
 cfg_opacity_set:    resb 1
+cfg_font_bold:      resb 1          ; 1 = use bold variant as the default font
 
 ; Runtime-toggleable state (Alt+plus/minus/_, Alt+b, Alt+t)
 bg_cycle_pixels:    resd 16         ; up to 16 cycle colors
@@ -8982,9 +8983,9 @@ load_config:
 .lc_try_bg_cycle:
     ; Match "bg_cycle = #aaa,#bbb,#ccc,..."
     cmp dword [rsi], 'bg_c'
-    jne .lc_skip_line
+    jne .lc_try_font_weight
     cmp dword [rsi+4], 'ycle'
-    jne .lc_skip_line
+    jne .lc_try_font_weight
     add rsi, 8
     call lc_skip_to_value
     xor r12, r12                    ; count of colors parsed
@@ -9037,6 +9038,23 @@ load_config:
     je .lc_bgc_one
 .lc_bgc_done:
     mov [bg_cycle_count], r12
+    jmp .lc_skip_line
+
+.lc_try_font_weight:
+    ; Match "font_weight = bold"
+    cmp dword [rsi], 'font'
+    jne .lc_skip_line
+    cmp dword [rsi+4], '_wei'
+    jne .lc_skip_line
+    cmp word [rsi+8], 'gh'
+    jne .lc_skip_line
+    cmp byte [rsi+10], 't'
+    jne .lc_skip_line
+    add rsi, 11
+    call lc_skip_to_value
+    cmp dword [rsi], 'bold'
+    jne .lc_skip_line
+    mov byte [cfg_font_bold], 1
     jmp .lc_skip_line
 
 .lc_skip_line:
@@ -9766,6 +9784,30 @@ setup_font_name:
 .sfn_bset_len:
     mov byte [rdi + rcx], 0
     mov [dyn_bold_font_name_len], r12
+
+    ; If the user set font_weight = bold, alias the regular font to
+    ; the bold XLFD. Bitmap "regular" is just a 1px stroke at 22pt
+    ; which feels thin next to TTF terminals; using the bold variant
+    ; everywhere thickens the baseline. (SGR 1 then has no further
+    ; effect since terminus has no extra-bold beyond bold.)
+    cmp byte [cfg_font_bold], 1
+    jne .sfn_done
+    mov rcx, [dyn_bold_font_name_len]
+    test rcx, rcx
+    jz .sfn_done
+    lea rsi, [dyn_bold_font_name]
+    lea rdi, [dyn_font_name]
+    xor edx, edx
+.sfn_alias_cp:
+    cmp rdx, rcx
+    jge .sfn_alias_term
+    movzx eax, byte [rsi + rdx]
+    mov [rdi + rdx], al
+    inc rdx
+    jmp .sfn_alias_cp
+.sfn_alias_term:
+    mov byte [rdi + rdx], 0
+    mov [dyn_font_name_len], rcx
 
 .sfn_done:
     pop r12
