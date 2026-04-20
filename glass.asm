@@ -11094,14 +11094,18 @@ handle_kitty_apc:
     jmp .hka_done
 
 .hka_transmit_place:
-    mov byte [apc_pending_place], 1
+    mov al, 1
     jmp .hka_xmit_common
 .hka_transmit:
-    mov byte [apc_pending_place], 0
+    xor al, al
 .hka_xmit_common:
-    ; If first chunk (not active), capture params.
+    ; al = "place after finalize" flag for THIS chunk's action.
+    ; Only honor it on the first chunk; on continuations the action
+    ; is inferred as 't', which would otherwise wipe the pending
+    ; place flag set by the original a=T.
     cmp byte [apc_pending_active], 1
     je .hka_append
+    mov [apc_pending_place], al
     mov eax, [apc_kv_i]
     mov [apc_pending_id], eax
     mov eax, [apc_kv_f]
