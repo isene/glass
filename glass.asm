@@ -5542,16 +5542,24 @@ vt_process:
     jb .vtp_csi_final
     cmp al, '9'
     ja .vtp_csi_sep
-    ; Digit: build param value
+    ; Digit: build param value, capped at 65535 so a hostile app
+    ; sending CSI 999999999999m can't wrap into a negative/garbage
+    ; value that downstream cursor / SGR / scroll handlers then act on.
     mov qword [vt_state], VT_CSI_PARAM
     mov rcx, [vt_param_count]
-    ; params[count] = params[count] * 10 + (al - '0')
     mov edx, [vt_params + rcx*4]
+    cmp edx, 65535
+    ja .vtp_csi_loop_skip            ; already saturated, ignore further digits
     imul edx, 10
     movzx ebx, al
     sub ebx, '0'
     add edx, ebx
+    cmp edx, 65535
+    jbe .vtp_csi_store
+    mov edx, 65535
+.vtp_csi_store:
     mov [vt_params + rcx*4], edx
+.vtp_csi_loop_skip:
     jmp .vtp_loop
 
 .vtp_csi_sep:
@@ -5907,6 +5915,9 @@ vt_process:
     jmp .vtp_loop
 
 ; CSI H - Cursor Position
+; Hostile apps can send \x1b[999999;999999H. Clamp BEFORE storing so a
+; malformed sequence can never write a huge cursor coord that
+; grid_put_char would translate into an OOB grid offset.
 .vtp_csi_cup:
     mov byte [pending_wrap], 0
     mov eax, [vt_params]     ; row (1-based)
@@ -5914,27 +5925,32 @@ vt_process:
     jnz .vtp_cup_row
     mov eax, 1
 .vtp_cup_row:
-    dec eax                  ; 0-based
-    mov [cursor_row], rax
-    ; Clamp
+    dec eax                  ; 0-based; eax always zero-extends to rax
     mov rcx, [grid_rows]
+    test rcx, rcx
+    jz .vtp_cup_col_init     ; grid not sized yet
     dec rcx
     cmp rax, rcx
-    jle .vtp_cup_col
-    mov [cursor_row], rcx
-.vtp_cup_col:
+    jbe .vtp_cup_row_ok      ; unsigned compare catches both huge and wrapped
+    mov rax, rcx
+.vtp_cup_row_ok:
+    mov [cursor_row], rax
+.vtp_cup_col_init:
     mov eax, [vt_params + 4] ; col (1-based)
     test eax, eax
     jnz .vtp_cup_c
     mov eax, 1
 .vtp_cup_c:
     dec eax
-    mov [cursor_col], rax
     mov rcx, [grid_cols]
+    test rcx, rcx
+    jz .vtp_loop
     dec rcx
     cmp rax, rcx
-    jle .vtp_loop
-    mov [cursor_col], rcx
+    jbe .vtp_cup_col_ok
+    mov rax, rcx
+.vtp_cup_col_ok:
+    mov [cursor_col], rax
     jmp .vtp_loop
 
 ; CSI J - Erase in Display
@@ -5965,7 +5981,7 @@ vt_process:
     call grid_clear_line
     jmp .vtp_loop
 
-; CSI G - Cursor Horizontal Absolute
+; CSI G - Cursor Horizontal Absolute (clamp first; see CUP note above)
 .vtp_csi_cha:
     mov byte [pending_wrap], 0
     mov eax, [vt_params]
@@ -5974,10 +5990,18 @@ vt_process:
     mov eax, 1
 .vtp_cha_go:
     dec eax
+    mov rcx, [grid_cols]
+    test rcx, rcx
+    jz .vtp_loop
+    dec rcx
+    cmp rax, rcx
+    jbe .vtp_cha_ok
+    mov rax, rcx
+.vtp_cha_ok:
     mov [cursor_col], rax
     jmp .vtp_loop
 
-; CSI d - Line Position Absolute
+; CSI d - Line Position Absolute (clamp first; see CUP note above)
 .vtp_csi_vpa:
     mov byte [pending_wrap], 0
     mov eax, [vt_params]
@@ -5986,6 +6010,14 @@ vt_process:
     mov eax, 1
 .vtp_vpa_go:
     dec eax
+    mov rcx, [grid_rows]
+    test rcx, rcx
+    jz .vtp_loop
+    dec rcx
+    cmp rax, rcx
+    jbe .vtp_vpa_ok
+    mov rax, rcx
+.vtp_vpa_ok:
     mov [cursor_row], rax
     jmp .vtp_loop
 
@@ -10573,7 +10605,7 @@ png_decode_to_rgba:
     lea rdi, [rsp]
     syscall
     test rax, rax
-    js .pdr_pipe_fail1
+    js .pdr_pipe_fail1               ; first pipe failed: nothing open yet
     mov eax, [rsp]
     mov [png_in_read], eax
     mov eax, [rsp + 4]
@@ -10582,7 +10614,7 @@ png_decode_to_rgba:
     lea rdi, [rsp]
     syscall
     test rax, rax
-    js .pdr_pipe_fail1
+    js .pdr_pipe_fail2               ; second pipe failed: must close first pair
     mov eax, [rsp]
     mov [png_out_read], eax
     mov eax, [rsp + 4]
@@ -10592,7 +10624,7 @@ png_decode_to_rgba:
     mov rax, SYS_FORK
     syscall
     test rax, rax
-    js .pdr_fail
+    js .pdr_fork_fail                ; fork failed: must close ALL four pipe fds
     jnz .pdr_parent
 
     ; ── Child ──
@@ -10696,6 +10728,27 @@ png_decode_to_rgba:
     pop rbx
     ret
 
+.pdr_fork_fail:
+    ; All four fds open; close them before returning.
+    mov rax, SYS_CLOSE
+    mov edi, [png_out_write]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_out_read]
+    syscall
+    jmp .pdr_close_inpair
+.pdr_pipe_fail2:
+    ; Second pipe failed: only first pair is open. rsp already had 16
+    ; reserved for the (failed) second pipe write — restore it.
+    add rsp, 16
+.pdr_close_inpair:
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_write]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_read]
+    syscall
+    jmp .pdr_fail
 .pdr_pipe_fail1:
     add rsp, 16
 .pdr_fail:
@@ -11358,16 +11411,23 @@ kitty_finalize_image:
     jz .kfi_unmap_decoded
     mov ebx, eax                     ; width
     mov r15d, edx                    ; height
+    test ebx, ebx
+    jz .kfi_unmap_decoded            ; reject 0-width
+    test r15d, r15d
+    jz .kfi_unmap_decoded            ; reject 0-height
     cmp ebx, MAX_IMG_DIM
     ja .kfi_unmap_decoded
     cmp r15d, MAX_IMG_DIM
     ja .kfi_unmap_decoded
 
-    ; Need width*height*4 bytes
-    mov eax, ebx
-    imul eax, r15d
-    shl eax, 2
-    cmp eax, IMG_DECODE_MAX
+    ; Need width*height*4 bytes. Compute in 64-bit so a hostile width
+    ; like 0x10000 with height 0x10000 can't wrap eax to 0 and slip
+    ; past the IMG_DECODE_MAX cap.
+    mov rax, rbx
+    mov rcx, r15
+    imul rax, rcx
+    shl rax, 2
+    cmp rax, IMG_DECODE_MAX
     ja .kfi_unmap_decoded
     mov rdi, r12                     ; PNG src
     mov rsi, r14                     ; PNG len
