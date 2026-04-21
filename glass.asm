@@ -408,9 +408,6 @@ gc_bg_id:           resd 1
 font_id:            resd 1
 font_id_bold:       resd 1          ; bold variant; equals font_id when none
 gc_current_font:    resd 1          ; tracks which font is loaded in gc_id
-gc_current_fg:      resd 1          ; last fg pixel pushed via ChangeGC
-gc_current_bg:      resd 1          ; last bg pixel pushed via ChangeGC
-gc_colors_valid:    resb 1          ; 1 once gc_current_fg/bg are seeded
 
 ; Kitty graphics protocol state
 apc_body:           resb APC_BODY_MAX
@@ -6772,53 +6769,31 @@ grid_put_char:
     pop rbx
     ret
 
-; Clear entire grid. Bound the work to the active grid_rows ×
-; grid_cols rather than walking the full MAX_ROWS × MAX_COLS slab
-; (51200 cells, 800KB written) every time. For an 80x24 window that
-; is a 27× speed-up on every CSI 2J / alt-screen toggle / startup.
-;
-; Cells past the current dims keep their old contents — that's safe
-; because the configure handler reclears the freshly-exposed area
-; whenever the grid grows (see .hxe_configure).
+; Clear entire grid.
 grid_clear:
     push rbx
     push r12
-    push r13
-    mov r13, [grid_rows]
-    mov r12, [grid_cols]
-    test r13, r13
-    jnz .gc_have_dims
-    ; Startup: dims not set yet. Clear the whole slab so the first
-    ; render doesn't show NUL chars in stale cells.
-    mov r13, MAX_ROWS
-    mov r12, MAX_COLS
-.gc_have_dims:
-    xor rbx, rbx                     ; row index
-    lea rdi, [grid]                  ; row base pointer
-.gc_row:
-    cmp rbx, r13
-    jge .gc_after_rows
-    mov rcx, r12                     ; cells in this row
-    mov rsi, rdi                     ; cell cursor (preserve row base)
-.gc_cell:
-    mov qword [rsi], DEFAULT_CELL_LO
-    mov qword [rsi + 8], 0
-    add rsi, CELL_SIZE
-    dec rcx
-    jnz .gc_cell
-    add rdi, MAX_COLS * CELL_SIZE    ; advance to next row's first cell
+    xor rbx, rbx
+    mov r12, MAX_COLS * MAX_ROWS
+.gc_loop:
+    cmp rbx, r12
+    jge .gc_done
+    mov rax, rbx
+    imul rax, CELL_SIZE
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
     inc rbx
-    jmp .gc_row
-.gc_after_rows:
+    jmp .gc_loop
+.gc_done:
+    ; Reset wrap flags for all rows
     xor rbx, rbx
 .gc_wrap_reset:
-    cmp rbx, r13
+    cmp rbx, MAX_ROWS
     jge .gc_wrap_done
     mov byte [row_wrapped + rbx], 0
     inc rbx
     jmp .gc_wrap_reset
 .gc_wrap_done:
-    pop r13
     pop r12
     pop rbx
     ret
@@ -7751,7 +7726,6 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
-    mov byte [gc_colors_valid], 0    ; bell flash trampled fg, invalidate cache
     ; PolyFillRectangle covering entire window
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
@@ -7990,17 +7964,6 @@ render_screen:
 .rs_after_font:
 
     ; ChangeGC fg/bg (r14d/r15d already hold resolved 32-bit pixels).
-    ; Skip the request entirely when both colors match the values we
-    ; already pushed — every avoided ChangeGC saves 20 bytes on the
-    ; X11 socket and one server-side request dispatch. Adjacent same-
-    ; colored runs are common (think a wall of dim grey text).
-    cmp byte [gc_colors_valid], 1
-    jne .rs_gc_color_send
-    cmp r14d, [gc_current_fg]
-    jne .rs_gc_color_send
-    cmp r15d, [gc_current_bg]
-    je .rs_gc_color_done
-.rs_gc_color_send:
     push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
@@ -8015,11 +7978,7 @@ render_screen:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
-    mov [gc_current_fg], r14d
-    mov [gc_current_bg], r15d
-    mov byte [gc_colors_valid], 1
     pop rcx
-.rs_gc_color_done:
 
     ; If pseudo-transparency is active and this run's effective bg pixel
     ; equals palette[0] (the see-through default), draw text without
@@ -8240,7 +8199,6 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
-    mov byte [gc_colors_valid], 0    ; URL underline changed fg
     ; PolyFillRect at (r14*char_w, (r12+1)*char_h - 1, span_w*char_w, 1)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
@@ -8450,7 +8408,6 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
-    mov byte [gc_colors_valid], 0    ; cursor draw changed fg
 
     ; PolyFillRectangle with shape based on cursor_style
     lea rdi, [tmp_buf]
