@@ -528,11 +528,16 @@ cfg_font_bold:      resb 1          ; 1 = use bold variant as the default font
 bg_cycle_pixels:    resd 16         ; up to 16 cycle colors
 bg_cycle_count:     resq 1          ; number of colors parsed from .glassrc
 bg_cycle_idx:       resq 1          ; current index in cycle (0 = first entry)
+opacity_cycle_vals: resb 16         ; 0..100 percent values from .glassrc
+opacity_cycle_count: resq 1
+opacity_cycle_idx:  resq 1
 saved_bg_pixel:     resd 1          ; configured cfg_bg before any cycling
 saved_bg_set:      resb 1          ; 1 if saved_bg_pixel is valid
 opacity_toggle:     resb 1          ; 0 = opaque (or untouched), 1 = ~50%
 opacity_atom:       resd 1          ; _NET_WM_WINDOW_OPACITY atom id
 opacity_atom_set:   resb 1          ; 1 once interned
+last_opacity_pct:   resb 1          ; last applied percent (0..100)
+last_opacity_init:  resb 1          ; 1 once last_opacity_pct holds a value
 original_font_size: resq 1          ; cfg_font_size at startup (for reset)
 
 ; Configurable keybinding table. Five slots, one per Alt-action.
@@ -9276,13 +9281,21 @@ load_config:
     jmp .lc_skip_line
 
 .lc_try_opacity:
-    ; Match "opacity"
+    ; Match "opacity" but NOT "opacity_cycle" (handled separately).
     cmp dword [rsi], 'opac'
-    jne .lc_try_bg_cycle
+    jne .lc_try_opacity_cycle
     cmp word [rsi+4], 'it'
-    jne .lc_try_bg_cycle
+    jne .lc_try_opacity_cycle
     cmp byte [rsi+6], 'y'
-    jne .lc_try_bg_cycle
+    jne .lc_try_opacity_cycle
+    movzx eax, byte [rsi+7]
+    cmp al, '_'
+    je .lc_try_opacity_cycle         ; this is opacity_cycle, not opacity
+    cmp al, 'a'
+    jb .lc_op_is_opacity
+    cmp al, 'z'
+    jbe .lc_try_opacity_cycle        ; some other "opacityXXX" key
+.lc_op_is_opacity:
     add rsi, 7
     call lc_skip_to_value
     ; Parse percentage 0..100
@@ -9310,6 +9323,63 @@ load_config:
     div ecx
     mov [cfg_opacity], al
     mov byte [cfg_opacity_set], 1
+    jmp .lc_skip_line
+
+.lc_try_opacity_cycle:
+    ; Match "opacity_cycle = 100,75,50,25,0" (decimal percentages).
+    cmp dword [rsi], 'opac'
+    jne .lc_try_bg_cycle
+    cmp dword [rsi+4], 'ity_'
+    jne .lc_try_bg_cycle
+    cmp dword [rsi+8], 'cycl'
+    jne .lc_try_bg_cycle
+    cmp byte [rsi+12], 'e'
+    jne .lc_try_bg_cycle
+    add rsi, 13
+    call lc_skip_to_value
+    xor r12, r12                    ; count
+.lc_oc_one:
+    movzx eax, byte [rsi]
+    cmp al, '0'
+    jb .lc_oc_done
+    cmp al, '9'
+    ja .lc_oc_done
+    ; Parse one decimal number into eax
+    xor eax, eax
+.lc_oc_digits:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_oc_have
+    cmp cl, '9'
+    ja .lc_oc_have
+    imul eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .lc_oc_digits
+.lc_oc_have:
+    cmp eax, 100
+    jbe .lc_oc_clamped
+    mov eax, 100
+.lc_oc_clamped:
+    cmp r12, 16
+    jge .lc_oc_skip_sep
+    mov [opacity_cycle_vals + r12], al
+    inc r12
+.lc_oc_skip_sep:
+    movzx ecx, byte [rsi]
+    cmp cl, ','
+    je .lc_oc_sep_inc
+    cmp cl, ' '
+    je .lc_oc_sep_inc
+    cmp cl, 9
+    je .lc_oc_sep_inc
+    jmp .lc_oc_done
+.lc_oc_sep_inc:
+    inc rsi
+    jmp .lc_oc_one
+.lc_oc_done:
+    mov [opacity_cycle_count], r12
     jmp .lc_skip_line
 
 .lc_try_bg_cycle:
@@ -11910,6 +11980,15 @@ bg_cycle_advance:
 ; the renderer goes back to ImageText16 (with bg fill).
 ; ══════════════════════════════════════════════════════════════════════
 pseudo_disable:
+    ; Fast path: nothing to tear down if pseudo isn't currently active.
+    ; Avoids any X11 traffic when the user toggles opacity at 100%
+    ; without ever having gone transparent.
+    cmp byte [pseudo_full], 0
+    jne .pdis_active
+    cmp dword [bg_pixmap_id], 0
+    jne .pdis_active
+    ret
+.pdis_active:
     push rbx
     mov ebx, [bg_pixmap_id]
     test ebx, ebx
@@ -11961,16 +12040,79 @@ pseudo_disable:
 ;                                   compositor owns _NET_WM_CM_S0.
 opacity_toggle_apply:
     push rbx
+    push r12
+
+    ; Pick target percent (r12d, 0..100). If opacity_cycle is set in
+    ; .glassrc, advance through the cycle list. Otherwise toggle
+    ; between 100 (opaque) and 50.
+    mov rax, [opacity_cycle_count]
+    test rax, rax
+    jz .ota_use_toggle
+    mov rax, [opacity_cycle_idx]
+    inc rax
+    cmp rax, [opacity_cycle_count]
+    jb .ota_cycle_ok
+    xor eax, eax
+.ota_cycle_ok:
+    mov [opacity_cycle_idx], rax
+    movzx r12d, byte [opacity_cycle_vals + rax]
+    jmp .ota_have_pct
+.ota_use_toggle:
+    movzx eax, byte [opacity_toggle]
+    xor eax, 1
+    mov [opacity_toggle], al
+    test al, al
+    mov r12d, 100
+    jz .ota_have_pct
+    mov r12d, 50
+.ota_have_pct:
+
+    ; Skip all transparency work when the target percent equals the
+    ; last one we applied — avoids any ChangeProperty / pseudo traffic
+    ; when the user happens to land on the same value (or, at startup
+    ; when pct=100 and we've never gone transparent, avoids touching
+    ; the X11 connection at all).
+    cmp byte [last_opacity_init], 1
+    jne .ota_first_apply
+    movzx eax, byte [last_opacity_pct]
+    cmp eax, r12d
+    je .ota_done
+.ota_first_apply:
+    mov [last_opacity_pct], r12b
+    mov byte [last_opacity_init], 1
+
+    ; Compute _NET_WM_WINDOW_OPACITY cardinal: pct * 0xFFFFFFFF / 100,
+    ; with exact fast-paths at the endpoints.
+    cmp r12d, 100
+    je .ota_card_full
+    test r12d, r12d
+    jnz .ota_card_scale
+    xor ebx, ebx
+    jmp .ota_card_done
+.ota_card_full:
+    mov ebx, 0xFFFFFFFF
+    jmp .ota_card_done
+.ota_card_scale:
+    mov rax, r12
+    mov rcx, 0xFFFFFFFF
+    imul rax, rcx
+    mov rcx, 100
+    xor edx, edx
+    div rcx
+    mov ebx, eax
+.ota_card_done:
+
     ; Lazily intern the atom on first use.
     cmp byte [opacity_atom_set], 1
     je .ota_have_atom
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_INTERN_ATOM
-    mov byte [rdi+1], 0              ; only-if-exists = false
+    mov byte [rdi+1], 0
     mov word [rdi+2], 2 + (opacity_atom_len + 3) / 4
     mov word [rdi+4], opacity_atom_len
     mov word [rdi+6], 0
     lea rsi, [opacity_atom_str]
+    push rbx
     lea rbx, [tmp_buf + 8]
     xor ecx, ecx
 .ota_cp:
@@ -11981,6 +12123,7 @@ opacity_toggle_apply:
     inc ecx
     jmp .ota_cp
 .ota_send_intern:
+    pop rbx
     mov eax, opacity_atom_len
     add eax, 3
     and eax, ~3
@@ -11994,64 +12137,60 @@ opacity_toggle_apply:
     call x11_drain_until_reply
     test rax, rax
     js .ota_done
-    mov eax, [x11_buf + 8]           ; atom id at offset 8 of reply
+    mov eax, [x11_buf + 8]
     test eax, eax
     jz .ota_done
     mov [opacity_atom], eax
     mov byte [opacity_atom_set], 1
-
 .ota_have_atom:
-    ; Toggle state and pick the cardinal value.
-    movzx eax, byte [opacity_toggle]
-    xor eax, 1
-    mov [opacity_toggle], al
-    test al, al
-    jz .ota_opaque
-    mov ebx, 0x80000000              ; ~50% opacity
-    jmp .ota_have_value
-.ota_opaque:
-    mov ebx, 0xFFFFFFFF              ; fully opaque
-.ota_have_value:
 
-    ; ChangeProperty(window, _NET_WM_WINDOW_OPACITY, CARDINAL, 32, 1, [value])
+    ; ChangeProperty(window, _NET_WM_WINDOW_OPACITY, CARDINAL, 32, 1, ebx)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_PROPERTY
-    mov byte [rdi+1], 0              ; mode = Replace
-    mov word [rdi+2], 7              ; 6 header + 1 data word
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7
     mov eax, [win_id]
     mov [rdi+4], eax
     mov eax, [opacity_atom]
     mov [rdi+8], eax
-    mov dword [rdi+12], 6            ; XA_CARDINAL = 6
-    mov byte [rdi+16], 32            ; format
+    mov dword [rdi+12], 6            ; XA_CARDINAL
+    mov byte [rdi+16], 32
     mov byte [rdi+17], 0
     mov word [rdi+18], 0
-    mov dword [rdi+20], 1            ; data length (in 32-bit units)
-    mov [rdi+24], ebx                ; the cardinal value
+    mov dword [rdi+20], 1
+    mov [rdi+24], ebx
     lea rsi, [tmp_buf]
     mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
 
-    ; If no compositor is running, _NET_WM_WINDOW_OPACITY is silently
-    ; ignored — fall through to glass's wallpaper-blend pseudo path so
-    ; the user sees something happen.
+    ; Without a compositor, _NET_WM_WINDOW_OPACITY is silently
+    ; ignored — drive glass's pseudo-transparency path so the user
+    ; still sees an effect.
     cmp byte [compositor_active], 1
     je .ota_done
-    cmp byte [opacity_toggle], 1
-    je .ota_pseudo_on
-    call pseudo_disable
-    call render_screen
-    call x11_flush
-    jmp .ota_done
-.ota_pseudo_on:
-    mov byte [cfg_opacity], 128
+    cmp r12d, 100
+    je .ota_pseudo_off
+
+    ; Pseudo on with target percent → cfg_opacity = pct * 255 / 100
+    mov rax, r12
+    imul rax, 255
+    xor edx, edx
+    mov rcx, 100
+    div rcx
+    mov [cfg_opacity], al
     mov byte [cfg_opacity_set], 1
     mov byte [pseudo_setup_done], 0
     call setup_pseudo_transparency
     call render_screen
     call x11_flush
+    jmp .ota_done
+.ota_pseudo_off:
+    call pseudo_disable
+    call render_screen
+    call x11_flush
 .ota_done:
+    pop r12
     pop rbx
     ret

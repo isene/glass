@@ -53,6 +53,7 @@ font_size = 13
 opacity = 80
 cursor_blink = 500
 bg_cycle = #000000,#001a33,#002200,#200033,#330011,#332200,#003333
+opacity_cycle = 100,75,50,25,0
 font_weight = bold
 ```
 
@@ -164,7 +165,7 @@ Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, o
 | Alt+minus | Step font size down to previous preset |
 | Alt+_ / Alt+0 | Reset font size to the configured default |
 | Alt+b | Cycle through `bg_cycle` colors from `~/.glassrc` |
-| Alt+t | Toggle ~50% window opacity (requires a compositor) |
+| Alt+t | Cycle through `opacity_cycle` percentages, or toggle 100↔50 if no cycle is set (compositor → `_NET_WM_WINDOW_OPACITY`; otherwise wallpaper-blend pseudo-transparency) |
 
 The five Alt-key shortcuts are rebindable via `~/.glassrc`:
 
