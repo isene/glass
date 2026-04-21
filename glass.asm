@@ -408,6 +408,9 @@ gc_bg_id:           resd 1
 font_id:            resd 1
 font_id_bold:       resd 1          ; bold variant; equals font_id when none
 gc_current_font:    resd 1          ; tracks which font is loaded in gc_id
+gc_current_fg:      resd 1          ; last fg pixel pushed via ChangeGC
+gc_current_bg:      resd 1          ; last bg pixel pushed via ChangeGC
+gc_colors_valid:    resb 1          ; 1 once gc_current_fg/bg are seeded
 
 ; Kitty graphics protocol state
 apc_body:           resb APC_BODY_MAX
@@ -5290,16 +5293,25 @@ vt_process:
     ; Semicolon ends the number, starts text
     cmp al, ';'
     je .vtp_osc_start_text
-    ; Digit: build number
+    ; Digit: build number, capped at 65535. The largest OSC code used
+    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/52, so
+    ; cap well above what any sane app emits while preventing 32-bit
+    ; wrap into garbage that could match a real opcode.
     cmp al, '0'
     jb .vtp_loop
     cmp al, '9'
     ja .vtp_loop
     mov rcx, [osc_num]
+    cmp rcx, 65535
+    ja .vtp_loop                     ; saturated; ignore further digits
     imul ecx, 10
     movzx edx, al
     sub edx, '0'
     add ecx, edx
+    cmp ecx, 65535
+    jbe .vtp_osc_num_store
+    mov ecx, 65535
+.vtp_osc_num_store:
     mov [osc_num], rcx
     jmp .vtp_loop
 
@@ -5507,21 +5519,34 @@ vt_process:
     ; If on alt screen, switch back to main
     cmp qword [alt_screen_active], 0
     je .vtp_full_reset_done
-    ; Restore main screen from alt_grid
+    ; Restore main screen from alt_grid. Bound the copy to the current
+    ; grid_rows × grid_cols using rep movsq instead of the previous
+    ; byte-by-byte walk over the full 800KB slab.
+    push rdi
+    push rsi
+    push rcx
     push r12
     push r13
-    xor r12, r12
-    mov r13, MAX_COLS * MAX_ROWS * CELL_SIZE
-.vtp_fr_restore:
+    xor r12, r12                     ; row index
+    mov r13, [grid_rows]
+.vtp_fr_row:
     cmp r12, r13
     jge .vtp_fr_restore_done
-    movzx eax, byte [alt_grid + r12]
-    mov [grid + r12], al
+    mov rax, r12
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rsi, [alt_grid + rax]
+    lea rdi, [grid + rax]
+    mov rcx, [grid_cols]
+    shl rcx, 1                       ; qwords per row (cells * 2)
+    rep movsq
     inc r12
-    jmp .vtp_fr_restore
+    jmp .vtp_fr_row
 .vtp_fr_restore_done:
     pop r13
     pop r12
+    pop rcx
+    pop rsi
+    pop rdi
     mov rax, [alt_cursor_row]
     mov [cursor_row], rax
     mov rax, [alt_cursor_col]
@@ -5728,23 +5753,33 @@ vt_process:
     mov [alt_cursor_row], rax
     mov rax, [cursor_col]
     mov [alt_cursor_col], rax
-    ; Copy main grid to alt_grid (save it) - 16 bytes per cell
+    ; Save main grid to alt_grid: only the active grid_rows × grid_cols
+    ; cells, copied a row at a time via rep movsq.
+    push rdi
+    push rsi
+    push rcx
     push r12
     push r13
     xor r12, r12
-    mov r13, MAX_COLS * MAX_ROWS * CELL_SIZE
-.vtp_alt_save:
+    mov r13, [grid_rows]
+.vtp_alt_save_row:
     cmp r12, r13
     jge .vtp_alt_save_done
-    mov rax, [grid + r12]
-    mov [alt_grid + r12], rax
-    mov rax, [grid + r12 + 8]
-    mov [alt_grid + r12 + 8], rax
-    add r12, CELL_SIZE
-    jmp .vtp_alt_save
+    mov rax, r12
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rsi, [grid + rax]
+    lea rdi, [alt_grid + rax]
+    mov rcx, [grid_cols]
+    shl rcx, 1
+    rep movsq
+    inc r12
+    jmp .vtp_alt_save_row
 .vtp_alt_save_done:
     pop r13
     pop r12
+    pop rcx
+    pop rsi
+    pop rdi
     ; Clear the grid for alt screen use
     call grid_clear
     mov qword [cursor_row], 0
@@ -5755,23 +5790,32 @@ vt_process:
 .vtp_alt_screen_off:
     cmp qword [alt_screen_active], 0
     je .vtp_loop                ; already on main screen
-    ; Copy alt_grid back to grid (restore main) - 16 bytes per cell
+    ; Restore main grid from alt_grid: only the active dims.
+    push rdi
+    push rsi
+    push rcx
     push r12
     push r13
     xor r12, r12
-    mov r13, MAX_COLS * MAX_ROWS * CELL_SIZE
-.vtp_alt_restore:
+    mov r13, [grid_rows]
+.vtp_alt_restore_row:
     cmp r12, r13
     jge .vtp_alt_restore_done
-    mov rax, [alt_grid + r12]
-    mov [grid + r12], rax
-    mov rax, [alt_grid + r12 + 8]
-    mov [grid + r12 + 8], rax
-    add r12, CELL_SIZE
-    jmp .vtp_alt_restore
+    mov rax, r12
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rsi, [alt_grid + rax]
+    lea rdi, [grid + rax]
+    mov rcx, [grid_cols]
+    shl rcx, 1
+    rep movsq
+    inc r12
+    jmp .vtp_alt_restore_row
 .vtp_alt_restore_done:
     pop r13
     pop r12
+    pop rcx
+    pop rsi
+    pop rdi
     ; Restore cursor position
     mov rax, [alt_cursor_row]
     mov [cursor_row], rax
@@ -6728,31 +6772,53 @@ grid_put_char:
     pop rbx
     ret
 
-; Clear entire grid
+; Clear entire grid. Bound the work to the active grid_rows ×
+; grid_cols rather than walking the full MAX_ROWS × MAX_COLS slab
+; (51200 cells, 800KB written) every time. For an 80x24 window that
+; is a 27× speed-up on every CSI 2J / alt-screen toggle / startup.
+;
+; Cells past the current dims keep their old contents — that's safe
+; because the configure handler reclears the freshly-exposed area
+; whenever the grid grows (see .hxe_configure).
 grid_clear:
     push rbx
     push r12
-    xor rbx, rbx
-    mov r12, MAX_COLS * MAX_ROWS
-.gc_loop:
-    cmp rbx, r12
-    jge .gc_done
-    mov rax, rbx
-    imul rax, CELL_SIZE
-    mov qword [grid + rax], DEFAULT_CELL_LO
-    mov qword [grid + rax + 8], 0
+    push r13
+    mov r13, [grid_rows]
+    mov r12, [grid_cols]
+    test r13, r13
+    jnz .gc_have_dims
+    ; Startup: dims not set yet. Clear the whole slab so the first
+    ; render doesn't show NUL chars in stale cells.
+    mov r13, MAX_ROWS
+    mov r12, MAX_COLS
+.gc_have_dims:
+    xor rbx, rbx                     ; row index
+    lea rdi, [grid]                  ; row base pointer
+.gc_row:
+    cmp rbx, r13
+    jge .gc_after_rows
+    mov rcx, r12                     ; cells in this row
+    mov rsi, rdi                     ; cell cursor (preserve row base)
+.gc_cell:
+    mov qword [rsi], DEFAULT_CELL_LO
+    mov qword [rsi + 8], 0
+    add rsi, CELL_SIZE
+    dec rcx
+    jnz .gc_cell
+    add rdi, MAX_COLS * CELL_SIZE    ; advance to next row's first cell
     inc rbx
-    jmp .gc_loop
-.gc_done:
-    ; Reset wrap flags for all rows
+    jmp .gc_row
+.gc_after_rows:
     xor rbx, rbx
 .gc_wrap_reset:
-    cmp rbx, MAX_ROWS
+    cmp rbx, r13
     jge .gc_wrap_done
     mov byte [row_wrapped + rbx], 0
     inc rbx
     jmp .gc_wrap_reset
 .gc_wrap_done:
+    pop r13
     pop r12
     pop rbx
     ret
@@ -7685,6 +7751,7 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov byte [gc_colors_valid], 0    ; bell flash trampled fg, invalidate cache
     ; PolyFillRectangle covering entire window
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
@@ -7922,12 +7989,23 @@ render_screen:
     pop rcx
 .rs_after_font:
 
-    ; ChangeGC fg/bg (r14d/r15d already hold resolved 32-bit pixels)
+    ; ChangeGC fg/bg (r14d/r15d already hold resolved 32-bit pixels).
+    ; Skip the request entirely when both colors match the values we
+    ; already pushed — every avoided ChangeGC saves 20 bytes on the
+    ; X11 socket and one server-side request dispatch. Adjacent same-
+    ; colored runs are common (think a wall of dim grey text).
+    cmp byte [gc_colors_valid], 1
+    jne .rs_gc_color_send
+    cmp r14d, [gc_current_fg]
+    jne .rs_gc_color_send
+    cmp r15d, [gc_current_bg]
+    je .rs_gc_color_done
+.rs_gc_color_send:
     push rcx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
     mov byte [rdi+1], 0
-    mov word [rdi+2], 5      ; length (3 + 2 values)
+    mov word [rdi+2], 5
     mov eax, [gc_id]
     mov [rdi+4], eax
     mov dword [rdi+8], GC_FOREGROUND | GC_BACKGROUND
@@ -7937,7 +8015,11 @@ render_screen:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], r14d
+    mov [gc_current_bg], r15d
+    mov byte [gc_colors_valid], 1
     pop rcx
+.rs_gc_color_done:
 
     ; If pseudo-transparency is active and this run's effective bg pixel
     ; equals palette[0] (the see-through default), draw text without
@@ -8158,6 +8240,7 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov byte [gc_colors_valid], 0    ; URL underline changed fg
     ; PolyFillRect at (r14*char_w, (r12+1)*char_h - 1, span_w*char_w, 1)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
@@ -8367,6 +8450,7 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov byte [gc_colors_valid], 0    ; cursor draw changed fg
 
     ; PolyFillRectangle with shape based on cursor_style
     lea rdi, [tmp_buf]
