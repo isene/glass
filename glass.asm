@@ -538,6 +538,7 @@ opacity_atom:       resd 1          ; _NET_WM_WINDOW_OPACITY atom id
 opacity_atom_set:   resb 1          ; 1 once interned
 last_opacity_pct:   resb 1          ; last applied percent (0..100)
 last_opacity_init:  resb 1          ; 1 once last_opacity_pct holds a value
+opacity_prop_set:   resb 1          ; 1 if _NET_WM_WINDOW_OPACITY ever set
 original_font_size: resq 1          ; cfg_font_size at startup (for reset)
 
 ; Configurable keybinding table. Five slots, one per Alt-action.
@@ -12081,6 +12082,15 @@ opacity_toggle_apply:
     mov [last_opacity_pct], r12b
     mov byte [last_opacity_init], 1
 
+    ; Skip the ChangeProperty entirely when going to 100% AND we
+    ; never set the property in the first place — the compositor's
+    ; default is fully opaque, so writing 0xFFFFFFFF is a no-op.
+    cmp r12d, 100
+    jne .ota_must_set_prop
+    cmp byte [opacity_prop_set], 0
+    je .ota_skip_prop
+.ota_must_set_prop:
+
     ; Compute _NET_WM_WINDOW_OPACITY cardinal: pct * 0xFFFFFFFF / 100,
     ; with exact fast-paths at the endpoints.
     cmp r12d, 100
@@ -12164,6 +12174,8 @@ opacity_toggle_apply:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
+    mov byte [opacity_prop_set], 1
+.ota_skip_prop:
 
     ; Without a compositor, _NET_WM_WINDOW_OPACITY is silently
     ; ignored — drive glass's pseudo-transparency path so the user
