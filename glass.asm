@@ -3660,8 +3660,15 @@ event_loop:
     pop rax
 .ev_check_x11:
 
-    ; Check X11 events
+    ; Check X11 events. POLLHUP/POLLERR on the X11 socket means the
+    ; X server has gone away; without the explicit exit below, poll
+    ; would keep returning immediately with those bits set and we'd
+    ; spin at 100% CPU forever (this happened repeatedly when xephyr
+    ; was killed during tile/glass development — and at 8 stale glass
+    ; instances the laptop's battery drained noticeably faster).
     movzx eax, word [poll_fds + 6]
+    test eax, 0x18                ; POLLERR(8) | POLLHUP(16)
+    jnz .ev_x11_dead
     test eax, POLLIN
     jz .ev_check_pty
     call handle_x11_events
@@ -3703,6 +3710,13 @@ event_loop:
 
 .ev_child_died:
     ; Child process exited
+    mov rdi, 0
+    mov rax, SYS_EXIT
+    syscall
+
+.ev_x11_dead:
+    ; X server connection lost (e.g. tile/Xephyr was killed under us).
+    ; Exit cleanly rather than spin on a dead socket.
     mov rdi, 0
     mov rax, SYS_EXIT
     syscall
