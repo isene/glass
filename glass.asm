@@ -186,6 +186,8 @@ wm_protocols_str: db "WM_PROTOCOLS", 0
 wm_protocols_len  equ 12
 wm_delete_str:  db "WM_DELETE_WINDOW", 0
 wm_delete_len   equ 16
+tile_shell_pid_str: db "_TILE_SHELL_PID", 0
+tile_shell_pid_len  equ 15
 
 ; XRender extension name (used by QueryExtension)
 render_ext_str:   db "RENDER", 0
@@ -466,6 +468,7 @@ emoji_cache_dir:        resb 256         ; full path to cache directory
 emoji_cache_dirs_made:  resb 1           ; 1 after we've created the dirs
 render_gc_ready:        resb 1           ; 1 once render_temp_gc is created
 wm_delete_atom:     resd 1
+tile_shell_pid_atom: resd 1
 
 ; Font metrics
 font_ascent:        resw 1
@@ -3118,6 +3121,43 @@ x11_set_wm_hints:
     mov eax, [x11_buf + 8]
     mov [wm_delete_atom], eax
 
+    ; InternAtom _TILE_SHELL_PID — used by tile to learn each glass's
+    ; bare child PID for "spawn-here" (cwd-of-focused) workflows.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (tile_shell_pid_len + 3) / 4
+    mov word [rdi+4], tile_shell_pid_len
+    mov word [rdi+6], 0
+    lea rsi, [tile_shell_pid_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xwm_cp_tsp:
+    cmp ecx, tile_shell_pid_len
+    jge .xwm_pad_tsp
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xwm_cp_tsp
+.xwm_pad_tsp:
+    mov eax, tile_shell_pid_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_buf + 8]
+    mov [tile_shell_pid_atom], eax
+
     ; ChangeProperty: WM_PROTOCOLS = [WM_DELETE_WINDOW]
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_PROPERTY
@@ -3396,6 +3436,39 @@ pty_open:
     pop rbx
     ret
 
+; Publish the bare child's PID on win_id as the _TILE_SHELL_PID
+; CARDINAL property. tile reads this on Mod4+Shift+Return so it can
+; resolve /proc/PID/cwd and spawn a sibling glass starting in the same
+; directory. No-op (writes garbage) is harmless if tile isn't running;
+; the property just sits on the window.
+publish_shell_pid:
+    cmp dword [tile_shell_pid_atom], 0
+    je .psp_done
+    cmp dword [win_id], 0
+    je .psp_done
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                ; mode = Replace
+    mov word [rdi+2], 7                ; length in 4-byte words
+    mov eax, [win_id]
+    mov [rdi+4], eax                   ; window
+    mov eax, [tile_shell_pid_atom]
+    mov [rdi+8], eax                   ; property
+    mov dword [rdi+12], 6              ; type = CARDINAL
+    mov byte [rdi+16], 32              ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 1              ; data length (1 CARD32)
+    mov rax, [child_pid]
+    mov [rdi+24], eax                  ; PID (low 32 bits is plenty for Linux)
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.psp_done:
+    ret
+
 pty_fork:
     push rbx
     push r12
@@ -3408,6 +3481,7 @@ pty_fork:
 
     ; Parent
     mov [child_pid], rax
+    call publish_shell_pid
     xor eax, eax
     pop r12
     pop rbx
