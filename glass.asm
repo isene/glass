@@ -857,6 +857,12 @@ osc_in_num:         resq 1          ; 1 = still parsing OSC number
 
 ; Font configuration
 cfg_font_size:      resq 1          ; 0 = default, else pixel size
+
+; ---- TTF font (glyph engine) ----
+cfg_font_path:      resb 512        ; null-terminated path to TTF file (empty = use X core font)
+cfg_font_path_set:  resq 1          ; 1 if cfg_font_path is populated
+cfg_ttf_weight:     resq 1          ; variation weight (0 = font's fvar default)
+ttf_active:         resq 1          ; 1 once glyph_load_font succeeds
 dyn_font_name:      resb 128
 dyn_font_name_len:  resq 1
 dyn_bold_font_name: resb 128
@@ -1003,6 +1009,24 @@ _start:
     ; return to it later regardless of how often the user hit Alt+plus.
     mov rax, [cfg_font_size]
     mov [original_font_size], rax
+
+    ; If font_path is configured, load the TTF via the embedded glyph
+    ; engine. On failure we silently fall back to X core fonts so a
+    ; bad path never bricks glass.
+    cmp qword [cfg_font_path_set], 0
+    je .ttf_skip
+    lea rdi, [cfg_font_path]
+    call glyph_load_font
+    test rax, rax
+    jnz .ttf_failed
+    mov rdi, [cfg_ttf_weight]
+    call glyph_set_weight
+    mov qword [ttf_active], 1
+    jmp .ttf_skip
+.ttf_failed:
+    ; Leave ttf_active = 0; fall through to X core font init.
+    mov qword [ttf_active], 0
+.ttf_skip:
 
     ; Read Xauthority
     call read_xauthority
@@ -10342,16 +10366,27 @@ load_config:
     jmp .lc_skip_line
 
 .lc_try_font_size:
-    ; Match "font_size"
+    ; Keys starting with "font_": dispatch on the 6th character.
     cmp dword [rsi], 'font'
     jne .lc_try_blink
+    cmp byte [rsi+4], '_'
+    jne .lc_try_blink
+    movzx eax, byte [rsi+5]
+    cmp al, 's'
+    je .lc_handle_font_size
+    cmp al, 'p'
+    je .lc_handle_font_path
+    cmp al, 'w'
+    je .lc_handle_font_weight
+    jmp .lc_try_blink
+
+.lc_handle_font_size:
     cmp dword [rsi+4], '_siz'
     jne .lc_try_blink
     cmp byte [rsi+8], 'e'
     jne .lc_try_blink
     add rsi, 9
     call lc_skip_to_value
-    ; Parse decimal number
     xor eax, eax
 .lc_fs_digit:
     movzx ecx, byte [rsi]
@@ -10367,6 +10402,77 @@ load_config:
 .lc_fs_done:
     mov [cfg_font_size], rax
     jmp .lc_skip_line
+
+.lc_handle_font_path:
+    ; "font_path = /full/path/to/font.ttf"
+    cmp dword [rsi+4], '_pat'
+    jne .lc_try_blink
+    cmp byte [rsi+8], 'h'
+    jne .lc_try_blink
+    add rsi, 9
+    call lc_skip_to_value
+    lea rdi, [cfg_font_path]
+    xor rcx, rcx
+.lc_fp_copy:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .lc_fp_done
+    cmp al, 10
+    je .lc_fp_done
+    cmp al, 13
+    je .lc_fp_done
+    cmp rcx, 510
+    jge .lc_fp_done
+    mov [rdi + rcx], al
+    inc rsi
+    inc rcx
+    jmp .lc_fp_copy
+.lc_fp_done:
+    mov byte [rdi + rcx], 0
+    test rcx, rcx
+    jz .lc_skip_line
+    mov qword [cfg_font_path_set], 1
+    jmp .lc_skip_line
+
+.lc_handle_font_weight:
+    ; "font_weight = 100..900" (variable-font axis position)
+    ; Note: glass also has a different cfg_font_bold "font_weight = bold"
+    ; key — we re-use the same key but only consume it when the value
+    ; starts with a digit (so "font_weight = bold" still falls through
+    ; to the existing string-parsing block).
+    cmp dword [rsi+4], '_wei'
+    jne .lc_try_blink
+    cmp word [rsi+8], 'gh'
+    jne .lc_try_blink
+    cmp byte [rsi+10], 't'
+    jne .lc_try_blink
+    push rsi                          ; remember key start so we can fall through
+    add rsi, 11
+    call lc_skip_to_value
+    movzx eax, byte [rsi]
+    cmp al, '0'
+    jb .lc_fw_fall
+    cmp al, '9'
+    ja .lc_fw_fall
+    xor eax, eax
+.lc_fw_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_fw_done
+    cmp cl, '9'
+    ja .lc_fw_done
+    imul eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .lc_fw_digit
+.lc_fw_done:
+    mov [cfg_ttf_weight], rax
+    pop rsi                           ; (discard saved start)
+    jmp .lc_skip_line
+.lc_fw_fall:
+    pop rsi                           ; restore for the legacy "bold" matcher
+    jmp .lc_try_blink
 
 .lc_try_blink:
     ; Match "cursor_blink"
