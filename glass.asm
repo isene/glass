@@ -177,6 +177,25 @@
 ; ══════════════════════════════════════════════════════════════════════
 section .data
 
+; --- TTF debug strings (temporary) ---
+dbg_msg_loaded:     db "[ttf] config loaded; font_path = ", 0
+dbg_msg_loaded_len  equ $ - dbg_msg_loaded - 1
+dbg_msg_load_rc:    db "[ttf] glyph_load_font rc=", 0
+dbg_msg_load_rc_len equ $ - dbg_msg_load_rc - 1
+dbg_xri_msg:        db "[ttf] xrender_init: a8 nonzero? ", 0
+dbg_xri_msg_len     equ $ - dbg_xri_msg - 1
+dbg_render_hit:     db "[ttf] render hit", 10
+dbg_render_hit_len  equ $ - dbg_render_hit
+dbg_glyph_msg:      db "[ttf] W/H/bx/by/adv = ", 0
+dbg_glyph_msg_len   equ $ - dbg_glyph_msg - 1
+dbg_pre_msg:        db "[ttf] pre-render cp/size = ", 0
+dbg_pre_msg_len     equ $ - dbg_pre_msg - 1
+dbg_addglyphs_msg:  db "[ttf] AddGlyphs hex32: ", 0
+dbg_addglyphs_msg_len equ $ - dbg_addglyphs_msg - 1
+dbg_compglyph_msg:  db "[ttf] CompositeGlyphs hex40: ", 0
+dbg_compglyph_msg_len equ $ - dbg_compglyph_msg - 1
+dbg_nl:             db 10
+
 ; X11 auth
 auth_name:      db "MIT-MAGIC-COOKIE-1"
 auth_name_len   equ 18
@@ -871,6 +890,9 @@ osc_in_num:         resq 1          ; 1 = still parsing OSC number
 ; Font configuration
 cfg_font_size:      resq 1          ; 0 = default, else pixel size
 
+; debug bytes for stderr prints
+dbg_byte:           resb 4
+
 ; ---- TTF font (glyph engine) ----
 cfg_font_path:      resb 512        ; null-terminated path to TTF file (empty = use X core font)
 cfg_font_path_set:  resq 1          ; 1 if cfg_font_path is populated
@@ -1026,10 +1048,52 @@ _start:
     ; If font_path is configured, load the TTF via the embedded glyph
     ; engine. On failure we silently fall back to X core fonts so a
     ; bad path never bricks glass.
+    ; --- DEBUG: dump status to stderr ---
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_msg_loaded]
+    mov rdx, dbg_msg_loaded_len
+    syscall
+
+    cmp qword [cfg_font_path_set], 0
+    je .ttf_skip_dbg
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [cfg_font_path]
+    mov rdx, 64
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_nl]
+    mov rdx, 1
+    syscall
+.ttf_skip_dbg:
+
     cmp qword [cfg_font_path_set], 0
     je .ttf_skip
     lea rdi, [cfg_font_path]
     call glyph_load_font
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_msg_load_rc]
+    mov rdx, dbg_msg_load_rc_len
+    syscall
+    pop rax
+    push rax
+    add rax, '0'
+    mov [dbg_byte], al
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_byte]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_nl]
+    mov rdx, 1
+    syscall
+    pop rax
     test rax, rax
     jnz .ttf_failed
     mov rdi, [cfg_ttf_weight]
@@ -9665,11 +9729,27 @@ render_screen:
     ; ---- TTF proof-of-life: render 'A' on top at (50, 50) in red ----
     cmp qword [ttf_active], 0
     je .rs_ttf_skip
+    ; --- DEBUG: count this hit ---
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_render_hit]
+    mov rdx, dbg_render_hit_len
+    syscall
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    ; --- END DEBUG ---
     mov rdi, 65                         ; 'A'
-    mov rsi, 50                         ; pen x
-    mov rdx, 50                         ; pen y (baseline)
+    mov rsi, 200                        ; pen x
+    mov rdx, 200                        ; pen y (baseline)
     mov rcx, 0xFFFF0000                 ; ARGB red
     call ttf_render_cp
+    call x11_flush
 .rs_ttf_skip:
 
     pop r15
@@ -13556,7 +13636,81 @@ ttf_glyph_uploaded:     resb 65536
 section .text
 
 ; ---------------------------------------------------------------------
+; dbg_dec — print rax as decimal to stderr.
+dbg_dec:
+    push rbx
+    push r12
+    lea r12, [dec_buf + 31]
+    mov rbx, 10
+    test rax, rax
+    jnz .l
+    dec r12
+    mov byte [r12], '0'
+    jmp .emit
+.l:
+    xor edx, edx
+    div rbx
+    dec r12
+    add dl, '0'
+    mov [r12], dl
+    test rax, rax
+    jnz .l
+.emit:
+    lea rax, [dec_buf + 31]
+    sub rax, r12
+    mov edx, eax
+    mov rsi, r12
+    mov edi, 2
+    mov eax, 1
+    syscall
+    pop r12
+    pop rbx
+    ret
+
+; dbg_putc — print al as one byte to stderr.
+dbg_putc:
+    mov [dbg_byte], al
+    mov rax, 1
+    mov rdi, 2
+    lea rsi, [dbg_byte]
+    mov rdx, 1
+    syscall
+    ret
+
+; ---------------------------------------------------------------------
 ttf_xrender_init:
+    ; --- DEBUG ---
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r11
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_xri_msg]
+    mov rdx, dbg_xri_msg_len
+    syscall
+    mov edi, [render_format_a8]
+    add edi, '0'
+    mov [dbg_byte], dil
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_byte]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_nl]
+    mov rdx, 1
+    syscall
+    pop r11
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ; --- END DEBUG ---
     cmp dword [render_format_a8], 0
     je .skip
     cmp dword [render_format_argb32], 0
@@ -13634,21 +13788,26 @@ ttf_set_pen_color:
     cmp edi, [ttf_pen_color]
     je .ret
     mov [ttf_pen_color], edi
-    ; PutImage: format=ZPixmap=2, depth=32, w=1, h=1, dst-x=0, dst-y=0,
-    ;           left-pad=0, depth, gc, then 4 bytes of data
-    ; Length = (24 + 4) / 4 = 7
+
+    ; Make sure we have a depth-32 GC. ensure_render_gc reuses tmp_buf,
+    ; so call it BEFORE we start building PutImage in tmp_buf — otherwise
+    ; the CreateGC bytes clobber our half-built PutImage header.
+    cmp dword [render_temp_gc], 0
+    jne .gc_ok
+    push rdi
+    call ensure_render_gc
+    pop rdi
+.gc_ok:
+
+    ; PutImage: format=ZPixmap, depth=32, w=1, h=1, dst-x/y=0, then 4
+    ; bytes ARGB. Length = (24 + 4) / 4 = 7 dwords.
     lea rsi, [tmp_buf]
     mov byte [rsi], X11_PUT_IMAGE
     mov byte [rsi+1], 2                ; ZPixmap
     mov word [rsi+2], 7
     mov eax, [ttf_pen_pixmap]
     mov [rsi+4], eax
-    mov eax, [render_temp_gc]       ; depth-32 GC (created lazily)
-    test eax, eax
-    jnz .have_gc
-    call ensure_render_gc              ; lazy-create depth-32 GC
     mov eax, [render_temp_gc]
-.have_gc:
     mov [rsi+8], eax
     mov word [rsi+12], 1               ; width
     mov word [rsi+14], 1               ; height
@@ -13689,6 +13848,33 @@ ttf_upload_glyph:
     jnz .have_size
     mov rsi, DEFAULT_FONT_SIZE
 .have_size:
+    ; --- DEBUG: dump cp, size before render ---
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r11
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_pre_msg]
+    mov rdx, dbg_pre_msg_len
+    syscall
+    mov rax, [rsp + 8]                 ; rdi (cp); after 6 pushes rdi at +8
+    call dbg_dec
+    mov al, '/'
+    call dbg_putc
+    mov rax, [rsp + 16]                ; rsi (size) at +16
+    call dbg_dec
+    mov al, 10
+    call dbg_putc
+    pop r11
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ; --- END DEBUG ---
     call glyph_render_to_alpha
     test eax, eax
     jnz .skip                          ; missing/oversize → just skip
@@ -13700,20 +13886,97 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
-    ; bytes_per_row in the alpha bitmap: per RENDER spec, alpha stride
-    ; is (width + 3) & ~3 — pad each row to 4-byte boundary.
+    ; --- DEBUG: dump metrics for the glyph we're about to upload ---
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r11
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_glyph_msg]
+    mov rdx, dbg_glyph_msg_len
+    syscall
+    ; print W H bx by adv as 4 hex bytes joined by '/'
     mov rax, r12
+    call dbg_dec
+    mov al, '/'
+    call dbg_putc
+    mov rax, r13
+    call dbg_dec
+    mov al, '/'
+    call dbg_putc
+    mov rax, r14
+    call dbg_dec
+    mov al, '/'
+    call dbg_putc
+    mov rax, r15
+    call dbg_dec
+    mov al, '/'
+    call dbg_putc
+    mov rax, rbp
+    call dbg_dec
+    mov al, ' '
+    call dbg_putc
+    ; Now dump engine globals: arg_size, out_xMin, out_xMax, out_yMax, head_unitsPerEm
+    mov al, 'a'
+    call dbg_putc
+    mov al, '='
+    call dbg_putc
+    mov rax, [arg_size]
+    call dbg_dec
+    mov al, ' '
+    call dbg_putc
+    mov al, 'x'
+    call dbg_putc
+    mov al, '='
+    call dbg_putc
+    mov rax, [out_xMax]
+    sub rax, [out_xMin]
+    call dbg_dec
+    mov al, ' '
+    call dbg_putc
+    mov al, 'y'
+    call dbg_putc
+    mov al, '='
+    call dbg_putc
+    mov rax, [out_yMax]
+    sub rax, [out_yMin]
+    call dbg_dec
+    mov al, ' '
+    call dbg_putc
+    mov al, 'u'
+    call dbg_putc
+    mov al, '='
+    call dbg_putc
+    mov rax, [head_unitsPerEm]
+    call dbg_dec
+    mov al, 10
+    call dbg_putc
+    pop r11
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ; --- END DEBUG ---
+
+    ; XRender expects alpha image data per glyph laid out W*H bytes
+    ; tightly (NO per-row padding); the total alpha block (sum over
+    ; glyphs) is then padded to 4 bytes. We have a single glyph here.
+    mov rax, r12                        ; W
+    imul rax, r13                       ; W*H = unpadded alpha bytes
+    mov rcx, rax                        ; remember unpadded size for the copy loop
     add rax, 3
     and rax, ~3
-    mov rcx, rax                        ; padded row stride
-    mov rax, rcx
-    imul rax, r13                       ; total alpha bytes
+    mov r8, rax                         ; padded total alpha
+    sub rax, rcx
+    mov r9, rax                         ; trailing pad bytes
 
-    ; Total request length in bytes:
-    ;   header(4) + glyphset(4) + num(4) + gid(4) + glyphInfo(12) + alpha
-    ; = 32 + alpha bytes (already 4-byte aligned)
-    mov rdx, rax
-    add rdx, 32                         ; total bytes
+    ; Total request length: 28 (fixed) + padded alpha
+    mov rdx, r8
+    add rdx, 28
     mov rsi, rdx
     shr rsi, 2                          ; length in 4-byte units
 
@@ -13737,40 +14000,87 @@ ttf_upload_glyph:
     mov [rdi+22], r15w                  ; y = +bearing_y
     mov [rdi+24], bp                    ; off-x = advance (low 16 bits)
     mov word [rdi+26], 0                ; off-y = 0
-    ; Alpha rows: copy from output_buf (W bytes per row, no padding) into
-    ; the request buffer with padding to `rcx` bytes per row.
-    lea r8, [rdi + 28]                  ; dest cursor
-    lea r9, [output_buf]                ; src cursor
-    mov r11, r13                        ; rows remaining
-.row:
-    test r11, r11
-    jz .rows_done
-    push rcx
-    mov rcx, r12                        ; W bytes
-    mov rdi, r8
-    mov rsi, r9
-    rep movsb
-    pop rcx
-    add r9, r12                         ; src advance = W
-    mov rax, rcx
-    sub rax, r12                        ; padding bytes
-.pad:
-    test rax, rax
+    ; Alpha bytes: copy W*H bytes tightly from output_buf, then
+    ; r9 trailing bytes of zero padding.
+    push r8                             ; save padded total
+    push r9                             ; save trailing pad count
+    lea rdi, [rdi + 28]                 ; destination
+    ; --- DEBUG: fill with 0xFF instead of copying from output_buf ---
+    mov al, 0xFF
+    rep stosb                           ; rcx bytes of 0xFF
+    pop r9                              ; pad count
+    pop r8                              ; padded total
+    test r9, r9
     jz .pad_done
+.pad_loop:
     mov byte [rdi], 0
     inc rdi
-    dec rax
-    jmp .pad
+    dec r9
+    jnz .pad_loop
 .pad_done:
-    mov r8, rdi
-    dec r11
-    jmp .row
-.rows_done:
 
-    ; Send the request. Total = 28 + (rcx * h)
-    mov rdx, rcx
-    imul rdx, r13
+    ; Send the request. Total bytes = 28 + r8.
+    mov rdx, r8
     add rdx, 28
+
+    ; --- DEBUG: dump first 32 bytes as hex to stderr ---
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r11
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_addglyphs_msg]
+    mov rdx, dbg_addglyphs_msg_len
+    syscall
+    xor rcx, rcx
+.dbgh_loop:
+    cmp rcx, 32
+    jge .dbgh_done
+    movzx eax, byte [tmp_buf + rcx]
+    push rcx
+    push rax
+    shr eax, 4
+    cmp al, 10
+    jl .h1
+    add al, 'a' - 10
+    jmp .h1d
+.h1:
+    add al, '0'
+.h1d:
+    call dbg_putc
+    pop rax
+    push rax
+    and eax, 0x0f
+    cmp al, 10
+    jl .h2
+    add al, 'a' - 10
+    jmp .h2d
+.h2:
+    add al, '0'
+.h2d:
+    call dbg_putc
+    mov al, ' '
+    call dbg_putc
+    pop rax
+    pop rcx
+    inc rcx
+    jmp .dbgh_loop
+.dbgh_done:
+    mov al, 10
+    call dbg_putc
+    pop r11
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ; --- END DEBUG ---
+
     lea rsi, [tmp_buf]
     call x11_buffer
     inc dword [x11_seq]
@@ -13827,14 +14137,15 @@ ttf_render_cp:
     mov [rdi], al
     mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS_32
     mov word [rdi+2], 10                ; length
-    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+4], RENDER_OP_SRC
     mov byte [rdi+5], 0
     mov word [rdi+6], 0
     mov eax, [ttf_pen_picture]
     mov [rdi+8], eax                    ; src
     mov eax, [render_window_picture]
     mov [rdi+12], eax                   ; dst
-    mov dword [rdi+16], 0               ; maskFormat = use glyphset's
+    mov eax, [render_format_a8]
+    mov [rdi+16], eax                   ; maskFormat (explicit alpha8)
     mov eax, [ttf_glyphset]
     mov [rdi+20], eax
     mov word [rdi+24], 0                ; src x
@@ -13846,6 +14157,62 @@ ttf_render_cp:
     mov [rdi+32], r13w                  ; dx (pen x)
     mov [rdi+34], r14w                  ; dy (pen y)
     mov [rdi+36], r12d                  ; glyph id
+
+    ; --- DEBUG: dump first 40 bytes of CompositeGlyphs ---
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r11
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [dbg_compglyph_msg]
+    mov rdx, dbg_compglyph_msg_len
+    syscall
+    xor rcx, rcx
+.dbgc_loop:
+    cmp rcx, 40
+    jge .dbgc_done
+    movzx eax, byte [tmp_buf + rcx]
+    push rcx
+    push rax
+    shr eax, 4
+    cmp al, 10
+    jl .ch1
+    add al, 'a' - 10
+    jmp .ch1d
+.ch1:
+    add al, '0'
+.ch1d:
+    call dbg_putc
+    pop rax
+    push rax
+    and eax, 0x0f
+    cmp al, 10
+    jl .ch2
+    add al, 'a' - 10
+    jmp .ch2d
+.ch2:
+    add al, '0'
+.ch2d:
+    call dbg_putc
+    mov al, ' '
+    call dbg_putc
+    pop rax
+    pop rcx
+    inc rcx
+    jmp .dbgc_loop
+.dbgc_done:
+    mov al, 10
+    call dbg_putc
+    pop r11
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ; --- END DEBUG ---
 
     lea rsi, [tmp_buf]
     mov rdx, 40
