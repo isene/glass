@@ -86,6 +86,7 @@
 %define RENDER_CREATE_PICTURE        4
 %define RENDER_FREE_PICTURE          7
 %define RENDER_COMPOSITE             8
+%define RENDER_SET_PICTURE_TRANSFORM 28
 %define RENDER_OP_OVER               3
 
 ; Kitty graphics protocol
@@ -246,6 +247,149 @@ xrootpmap_len     equ 13
 netwm_cm_str:     db "_NET_WM_CM_S0", 0
 netwm_cm_len      equ 13
 
+; Dead-keysym → printable Unicode codepoint table. Indexed by
+; (keysym - 0xFE50). Values are UCS-2 codepoints (all fit in 16 bits
+; — the spacing equivalents live in U+0060..U+037A). Zero means "no
+; printable equivalent, drop the keystroke".
+dead_to_ucs:
+    dw 0x0060   ; FE50 dead_grave            → `
+    dw 0x00B4   ; FE51 dead_acute            → ´
+    dw 0x005E   ; FE52 dead_circumflex       → ^
+    dw 0x007E   ; FE53 dead_tilde            → ~
+    dw 0x00AF   ; FE54 dead_macron           → ¯
+    dw 0x02D8   ; FE55 dead_breve            → ˘
+    dw 0x02D9   ; FE56 dead_abovedot         → ˙
+    dw 0x00A8   ; FE57 dead_diaeresis        → ¨
+    dw 0x02DA   ; FE58 dead_abovering        → ˚
+    dw 0x02DD   ; FE59 dead_doubleacute      → ˝
+    dw 0x02C7   ; FE5A dead_caron            → ˇ
+    dw 0x00B8   ; FE5B dead_cedilla          → ¸
+    dw 0x02DB   ; FE5C dead_ogonek           → ˛
+    dw 0x037A   ; FE5D dead_iota             → ͺ
+    dw 0       ; FE5E dead_voiced_sound      (no spacing equivalent)
+    dw 0       ; FE5F dead_semivoiced_sound  (no spacing equivalent)
+    dw 0       ; FE60 dead_belowdot          (combining only)
+    dw 0       ; FE61 dead_hook
+    dw 0       ; FE62 dead_horn
+    dw 0       ; FE63
+    dw 0       ; FE64
+    dw 0       ; FE65
+    dw 0       ; FE66
+    dw 0       ; FE67
+    dw 0       ; FE68
+    dw 0       ; FE69
+    dw 0       ; FE6A
+    dw 0       ; FE6B
+    dw 0       ; FE6C
+    dw 0       ; FE6D
+    dw 0       ; FE6E
+    dw 0       ; FE6F
+    dw 0       ; FE70
+    dw 0       ; FE71
+    dw 0       ; FE72
+    dw 0       ; FE73
+    dw 0       ; FE74
+    dw 0       ; FE75
+    dw 0       ; FE76
+    dw 0       ; FE77
+    dw 0       ; FE78
+    dw 0       ; FE79
+    dw 0       ; FE7A
+    dw 0       ; FE7B
+    dw 0       ; FE7C
+    dw 0       ; FE7D
+    dw 0       ; FE7E
+    dw 0       ; FE7F
+
+; Dead-key composition table. Each entry is one dword:
+;   bits  0..7  = dead-key offset (keysym - 0xFE50)
+;   bits  8..15 = base ASCII keysym (e.g. 'a', 'O', ' ')
+;   bits 16..31 = composed Unicode codepoint (UCS-2)
+; Sentinel (0) terminates. Linear scan — fast enough at ~50 entries.
+;
+; Format helper macro: dead_off + base<<8 + composed<<16.
+%define COMP(d,b,c)  (d) | ((b) << 8) | ((c) << 16)
+compose_table:
+    ; ─── dead_diaeresis (0x07): ¨ ───────────────────────────────
+    dd COMP(0x07, 'a', 0x00E4)      ; ä
+    dd COMP(0x07, 'A', 0x00C4)      ; Ä
+    dd COMP(0x07, 'e', 0x00EB)      ; ë
+    dd COMP(0x07, 'E', 0x00CB)      ; Ë
+    dd COMP(0x07, 'i', 0x00EF)      ; ï
+    dd COMP(0x07, 'I', 0x00CF)      ; Ï
+    dd COMP(0x07, 'o', 0x00F6)      ; ö
+    dd COMP(0x07, 'O', 0x00D6)      ; Ö
+    dd COMP(0x07, 'u', 0x00FC)      ; ü
+    dd COMP(0x07, 'U', 0x00DC)      ; Ü
+    dd COMP(0x07, 'y', 0x00FF)      ; ÿ
+    dd COMP(0x07, 'Y', 0x0178)      ; Ÿ
+    ; ─── dead_acute (0x01): ´ ──────────────────────────────────
+    dd COMP(0x01, 'a', 0x00E1)      ; á
+    dd COMP(0x01, 'A', 0x00C1)      ; Á
+    dd COMP(0x01, 'e', 0x00E9)      ; é
+    dd COMP(0x01, 'E', 0x00C9)      ; É
+    dd COMP(0x01, 'i', 0x00ED)      ; í
+    dd COMP(0x01, 'I', 0x00CD)      ; Í
+    dd COMP(0x01, 'o', 0x00F3)      ; ó
+    dd COMP(0x01, 'O', 0x00D3)      ; Ó
+    dd COMP(0x01, 'u', 0x00FA)      ; ú
+    dd COMP(0x01, 'U', 0x00DA)      ; Ú
+    dd COMP(0x01, 'y', 0x00FD)      ; ý
+    dd COMP(0x01, 'Y', 0x00DD)      ; Ý
+    dd COMP(0x01, 'c', 0x0107)      ; ć
+    dd COMP(0x01, 'C', 0x0106)      ; Ć
+    dd COMP(0x01, 'n', 0x0144)      ; ń
+    dd COMP(0x01, 'N', 0x0143)      ; Ń
+    dd COMP(0x01, 's', 0x015B)      ; ś
+    dd COMP(0x01, 'S', 0x015A)      ; Ś
+    dd COMP(0x01, 'z', 0x017A)      ; ź
+    dd COMP(0x01, 'Z', 0x0179)      ; Ź
+    ; ─── dead_grave (0x00): ` ──────────────────────────────────
+    dd COMP(0x00, 'a', 0x00E0)      ; à
+    dd COMP(0x00, 'A', 0x00C0)      ; À
+    dd COMP(0x00, 'e', 0x00E8)      ; è
+    dd COMP(0x00, 'E', 0x00C8)      ; È
+    dd COMP(0x00, 'i', 0x00EC)      ; ì
+    dd COMP(0x00, 'I', 0x00CC)      ; Ì
+    dd COMP(0x00, 'o', 0x00F2)      ; ò
+    dd COMP(0x00, 'O', 0x00D2)      ; Ò
+    dd COMP(0x00, 'u', 0x00F9)      ; ù
+    dd COMP(0x00, 'U', 0x00D9)      ; Ù
+    ; ─── dead_circumflex (0x02): ^ ─────────────────────────────
+    dd COMP(0x02, 'a', 0x00E2)      ; â
+    dd COMP(0x02, 'A', 0x00C2)      ; Â
+    dd COMP(0x02, 'e', 0x00EA)      ; ê
+    dd COMP(0x02, 'E', 0x00CA)      ; Ê
+    dd COMP(0x02, 'i', 0x00EE)      ; î
+    dd COMP(0x02, 'I', 0x00CE)      ; Î
+    dd COMP(0x02, 'o', 0x00F4)      ; ô
+    dd COMP(0x02, 'O', 0x00D4)      ; Ô
+    dd COMP(0x02, 'u', 0x00FB)      ; û
+    dd COMP(0x02, 'U', 0x00DB)      ; Û
+    ; ─── dead_tilde (0x03): ~ ──────────────────────────────────
+    dd COMP(0x03, 'a', 0x00E3)      ; ã
+    dd COMP(0x03, 'A', 0x00C3)      ; Ã
+    dd COMP(0x03, 'n', 0x00F1)      ; ñ
+    dd COMP(0x03, 'N', 0x00D1)      ; Ñ
+    dd COMP(0x03, 'o', 0x00F5)      ; õ
+    dd COMP(0x03, 'O', 0x00D5)      ; Õ
+    ; ─── dead_caron (0x0A): ˇ ──────────────────────────────────
+    dd COMP(0x0A, 'c', 0x010D)      ; č
+    dd COMP(0x0A, 'C', 0x010C)      ; Č
+    dd COMP(0x0A, 's', 0x0161)      ; š
+    dd COMP(0x0A, 'S', 0x0160)      ; Š
+    dd COMP(0x0A, 'z', 0x017E)      ; ž
+    dd COMP(0x0A, 'Z', 0x017D)      ; Ž
+    ; ─── dead_doubleacute (0x09): ˝ ────────────────────────────
+    dd COMP(0x09, 'o', 0x0151)      ; ő
+    dd COMP(0x09, 'O', 0x0150)      ; Ő
+    dd COMP(0x09, 'u', 0x0171)      ; ű
+    dd COMP(0x09, 'U', 0x0170)      ; Ű
+    ; ─── dead_cedilla (0x0B): ¸ ────────────────────────────────
+    dd COMP(0x0B, 'c', 0x00E7)      ; ç
+    dd COMP(0x0B, 'C', 0x00C7)      ; Ç
+    dd 0                              ; sentinel
+
 ; Window title
 win_title:      db "glass", 0
 win_title_len   equ 5
@@ -309,6 +453,13 @@ font_size_presets: dq 10, 13, 15, 18, 20, 22, 24, 28, 32
 FONT_SIZE_PRESET_COUNT equ 9
 DEFAULT_FONT_SIZE equ 13         ; fallback when no font_size in .glassrc
 
+; Fallback font: covers the entire Unicode BMP (16x16 PCF from
+; xfonts-unifont). Used per-cell when the primary font lacks the
+; codepoint, so CC's emoji-ish symbols / CJK / math glyphs render as
+; actual characters instead of the X server's substitute glyph.
+fallback_font_xlfd: db "-gnu-unifont-medium-r-normal-sans-16-160-75-75-c-80-iso10646-1", 0
+fallback_font_xlfd_len equ $ - fallback_font_xlfd - 1
+
 ; _NET_WM_WINDOW_OPACITY for Alt+t.
 opacity_atom_str: db "_NET_WM_WINDOW_OPACITY"
 opacity_atom_len equ $ - opacity_atom_str
@@ -365,6 +516,21 @@ std_colors:
 ; ══════════════════════════════════════════════════════════════════════
 section .bss
 
+; CLI exec override: when started with `glass -e CMD ARGS...` (or
+; `glass -- CMD ARGS...`), pty_fork's child execve()s these argv
+; pointers instead of the default bare/sh chain. exec_argv[0] is
+; the command, rest are its args, NULL-terminated. exec_argv[0]==0
+; means no -e was passed; use the default shell.
+exec_argv:           resq 32
+
+; Dead-key composition state. Holds the dead-key offset (0..0x2f,
+; relative to 0xFE50) of the most-recent dead-keysym press; 0xFF means
+; "no dead key pending". When the next keypress arrives we look up
+; (pending_dead, key) in compose_table; on a hit we emit the composed
+; codepoint, on a miss we emit the dead key's spacing equivalent and
+; then process the new key normally.
+pending_dead:        resb 1
+
 ; X11 connection
 x11_fd:             resq 1
 x11_seq:            resd 1
@@ -409,6 +575,17 @@ gc_id:              resd 1
 gc_bg_id:           resd 1
 font_id:            resd 1
 font_id_bold:       resd 1          ; bold variant; equals font_id when none
+fallback_font_id:   resd 1          ; Unifont, 0 = not loaded
+fallback_gc_id:     resd 1          ; GC bound to the fallback font
+fallback_char_w:    resw 1          ; max char width of fallback font
+fallback_ascent:    resw 1          ; baseline of fallback font
+; Glyph-coverage bitmap of the PRIMARY font: 1 bit per BMP codepoint
+; (65536 / 8 = 8192 bytes). 1 = primary font has a glyph for this
+; codepoint; 0 = fall back to fallback_font_id. Built from QueryFont
+; reply at startup (see build_primary_glyph_map). All-zero by default,
+; so a missing fallback font means everything tries primary (existing
+; behaviour) — graceful degradation.
+glyph_present:      resb 8192
 gc_current_font:    resd 1          ; tracks which font is loaded in gc_id
 
 ; Kitty graphics protocol state
@@ -526,6 +703,11 @@ cfg_cursor_set:     resb 1
 cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
 cfg_opacity_set:    resb 1
 cfg_font_bold:      resb 1          ; 1 = use bold variant as the default font
+cfg_osc8_underline: resb 1          ; 1 = underline OSC 8 hyperlink spans, 0 = don't
+                                    ; (some apps — notably Claude Code — open
+                                    ; OSC 8 spans that never close cleanly,
+                                    ; making large parts of the screen appear
+                                    ; underlined; this lets the user opt out)
 
 ; Runtime-toggleable state (Alt+plus/minus/_, Alt+b, Alt+t)
 bg_cycle_pixels:    resd 16         ; up to 16 cycle colors
@@ -695,6 +877,39 @@ rs_row_base:        resq 1          ; pointer to current row's cell data
 section .text
 global _start
 
+; Emit a single UCS-2 codepoint (eax) as UTF-8 to the pty master.
+; Used by the dead-key composition fallback when no match is found —
+; the dead char is written first, then the caller continues processing
+; the new key. Preserves no caller registers; caller saves what it needs.
+emit_ucs_inline:
+    push rax                              ; preserve codepoint for callers that need it
+    cmp eax, 0x80
+    jb .eui_1b
+    ; 2-byte UTF-8
+    mov ecx, eax
+    shr ecx, 6
+    or ecx, 0xC0
+    mov [key_out_buf], cl
+    and eax, 0x3F
+    or eax, 0x80
+    mov [key_out_buf+1], al
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 2
+    syscall
+    pop rax
+    ret
+.eui_1b:
+    mov [key_out_buf], al
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 1
+    syscall
+    pop rax
+    ret
+
 _start:
     ; Save envp
     mov rdi, [rsp]          ; argc
@@ -702,6 +917,50 @@ _start:
     lea rax, [rdi + 1]
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
+
+    ; Parse argv for `-e CMD [ARGS...]` or `-- CMD [ARGS...]`. Anything
+    ; after the marker becomes exec_argv (capped at 31 args + NULL).
+    ; Argv before the marker is silently ignored — we don't have any
+    ; other CLI flags yet.
+    mov r8, rdi             ; argc
+    mov r9, rsi             ; argv
+    xor r10, r10            ; iterator
+.es_arg_loop:
+    inc r10                 ; skip argv[0]
+    cmp r10, r8
+    jge .es_arg_done
+    mov rax, [r9 + r10*8]
+    test rax, rax
+    jz .es_arg_done
+    cmp word [rax], 0x652d  ; "-e" little-endian (0x65 0x2d wrong way → "-e" is bytes 0x2d 0x65)
+    je .es_check_e
+    cmp dword [rax], 0x002d2d ; "--\0" → length 2
+    jne .es_arg_loop
+    jmp .es_collect
+.es_check_e:
+    cmp byte [rax+2], 0
+    jne .es_arg_loop
+.es_collect:
+    inc r10                 ; advance past the marker
+    xor r11, r11            ; dest index
+.es_collect_loop:
+    cmp r10, r8
+    jge .es_collect_done
+    cmp r11, 31
+    jge .es_collect_done
+    mov rax, [r9 + r10*8]
+    test rax, rax
+    jz .es_collect_done
+    mov [exec_argv + r11*8], rax
+    inc r10
+    inc r11
+    jmp .es_collect_loop
+.es_collect_done:
+    mov qword [exec_argv + r11*8], 0
+.es_arg_done:
+
+    ; No dead key pending at startup.
+    mov byte [pending_dead], 0xFF
 
     ; Initialize palette
     call init_palette
@@ -724,6 +983,7 @@ _start:
     mov qword [scroll_top], 0
     mov qword [scroll_bottom], 0      ; 0 = use grid_rows-1
     mov qword [bracketed_paste], 0
+    mov byte [cfg_osc8_underline], 1   ; standard terminal default; ~/.glassrc can disable
     mov qword [cursor_style], 0
     mov qword [cfg_font_size], 0
 
@@ -777,6 +1037,13 @@ _start:
 
     ; Query font metrics
     call x11_query_font
+
+    ; (Fallback font init disabled until rewritten — earlier version
+    ; left undrained QueryFont reply bytes in the X socket which
+    ; corrupted the InternAtom replies in x11_set_wm_hints, breaking
+    ; WM_PROTOCOLS / WM_DELETE_WINDOW so glass couldn't be closed via
+    ; the WM. Keeping the build_primary_glyph_map / init_fallback_font
+    ; bodies in place but unreferenced.)
 
     ; Create window
     call x11_create_window
@@ -1737,6 +2004,338 @@ x11_query_font:
     add eax, ecx
     mov [char_height], ax
 
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────────
+; Fallback font (Unifont) — covers everything the primary font lacks.
+;
+; build_primary_glyph_map sends QueryFont for the primary font and
+; streams the per-character info, setting one bit per BMP codepoint
+; in glyph_present. The render path tests this bit per cell and routes
+; the cell through the fallback GC when missing.
+;
+; init_fallback_font opens the Unifont XLFD, queries its metrics, and
+; allocates a dedicated GC bound to it. Fails silently (leaves
+; fallback_font_id = 0) if Unifont isn't installed; the renderer then
+; degrades to the X server's default-glyph behaviour as before.
+; ──────────────────────────────────────────────────────────────────────
+
+; Build glyph_present from primary font's QueryFont reply. Reads the
+; reply in chunks via SYS_READ so we don't need to buffer arbitrarily-
+; large CHARINFO arrays (Unifont's reply is ~800KB, won't fit in
+; x11_buf). Stream-parses each CHARINFO and marks its codepoint bit
+; when any metric is non-zero (X11 spec: "all-zero = nonexistent").
+build_primary_glyph_map:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Send QueryFont for primary font.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_FONT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [font_id]
+    mov [rdi+4], eax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+
+    ; Read 32-byte reply header.
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .bpgm_done
+    ; Bail if not a reply.
+    cmp byte [x11_buf], 1
+    jne .bpgm_done
+
+    ; Read the next 28 bytes (header bytes 32..59) so we have through
+    ; the CHARINFO count at offset 56 in the WHOLE reply (which is
+    ; offset 24 from the start of this chunk if we re-anchor — easier
+    ; to just keep the header at x11_buf and read these next bytes
+    ; into x11_buf+32).
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf + 32]
+    mov rdx, 28
+    syscall
+    cmp rax, 28
+    jl .bpgm_done
+
+    ; Pull out what we need:
+    ;   offset 40: min-char-or-byte2 (CARD16) → r12d (later)
+    ;   offset 42: max-char-or-byte2 (CARD16) → r13d (later)
+    ;   offset 46: number of FONTPROPs (n, CARD16)
+    ;   offset 49: min-byte1 (CARD8)
+    ;   offset 50: max-byte1 (CARD8)
+    ;   offset 56: number of CHARINFOs (m, CARD32)
+    movzx r12d, word [x11_buf + 40]    ; min-char-or-byte2
+    movzx r13d, word [x11_buf + 42]    ; max-char-or-byte2
+    movzx r14d, word [x11_buf + 46]    ; n
+    movzx r15d, byte [x11_buf + 49]    ; min-byte1
+    ; (max-byte1 unused for index→codepoint mapping; m drives loop)
+
+    ; Skip 8*n bytes of FONTPROPs by reading & discarding.
+    shl r14, 3                          ; n * 8
+.bpgm_skip_props:
+    test r14, r14
+    jz .bpgm_props_done
+    mov rax, r14
+    cmp rax, 65536
+    jbe .bpgm_props_chunk_ok
+    mov rax, 65536
+.bpgm_props_chunk_ok:
+    mov rdx, rax
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    syscall
+    test rax, rax
+    jle .bpgm_done
+    sub r14, rax
+    jmp .bpgm_skip_props
+.bpgm_props_done:
+
+    ; Number of CHARINFOs (m, CARD32). mov of a 32-bit operand into a
+    ; 32-bit register zero-extends into the 64-bit register, so this
+    ; safely caps any garbage in the upper bits.
+    mov ebx, [x11_buf + 56]             ; m
+    test rbx, rbx
+    jz .bpgm_done                       ; no chars
+
+    ; chars per row = max-char-or-byte2 - min-char-or-byte2 + 1
+    mov rcx, r13
+    sub rcx, r12
+    inc rcx                             ; rcx = chars-per-row (byte2 stride)
+    test rcx, rcx
+    jz .bpgm_done
+
+    ; Stream-read CHARINFOs in 1200-byte chunks (= 100 entries each).
+    xor r14, r14                        ; iterator i = 0..m-1
+.bpgm_ci_loop:
+    cmp r14, rbx
+    jge .bpgm_done
+    ; Read up to 1200 bytes at a time.
+    mov rax, rbx
+    sub rax, r14
+    mov rdx, 100
+    cmp rax, rdx
+    jge .bpgm_have_chunk
+    mov rdx, rax                        ; less than 100 left
+.bpgm_have_chunk:
+    mov r8, rdx                         ; r8 = chunk count
+    imul rdx, 12                        ; bytes
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    syscall
+    test rax, rax
+    jle .bpgm_done
+    ; Walk r8 entries.
+    xor r9, r9                          ; entry index in chunk
+.bpgm_ci_walk:
+    cmp r9, r8
+    jge .bpgm_chunk_done
+    ; ptr = x11_buf + r9 * 12
+    mov rax, r9
+    imul rax, 12
+    lea rdi, [x11_buf + rax]
+    ; Test if any of left-sb, right-sb, width, ascent, descent, attrs
+    ; is non-zero. They're 6 consecutive CARD16s = 12 bytes.
+    mov rax, [rdi]                      ; bytes 0..7
+    or rax, [rdi + 4]                   ; OR in bytes 4..11 (overlap doesn't matter)
+    test rax, rax
+    jz .bpgm_ci_zero                    ; absent → leave bit clear
+    ; Compute codepoint from i = r14+r9.
+    mov rax, r14
+    add rax, r9
+    xor edx, edx
+    div rcx                             ; rax = byte1 offset, rdx = byte2 offset
+    add rax, r15                        ; + min-byte1
+    add rdx, r12                        ; + min-char-or-byte2
+    ; codepoint = (byte1 << 8) | byte2
+    shl rax, 8
+    or rax, rdx
+    cmp rax, 0xFFFF
+    ja .bpgm_ci_zero                    ; non-BMP, ignore
+    ; Set bit: glyph_present[cp >> 3] |= 1 << (cp & 7)
+    mov rsi, rax
+    shr rsi, 3
+    mov dl, al
+    and dl, 7
+    mov bh, 1
+    shl bh, cl                          ; can't, cl already used. Redo.
+    ; Recompute shift in cl explicitly.
+    mov cl, dl
+    mov dl, 1
+    shl dl, cl
+    or [glyph_present + rsi], dl
+    ; Restore rcx for the divide loop's next round.
+    mov rcx, r13
+    sub rcx, r12
+    inc rcx
+.bpgm_ci_zero:
+    inc r9
+    jmp .bpgm_ci_walk
+.bpgm_chunk_done:
+    add r14, r8
+    jmp .bpgm_ci_loop
+.bpgm_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Open the Unifont XLFD as the fallback font, query its char_width
+; and ascent (used for centering the fallback glyph in the primary
+; cell), and allocate a dedicated GC. Failure leaves fallback_font_id
+; = 0; the renderer then skips the fallback path entirely.
+init_fallback_font:
+    push rbx
+    push r12
+    push r13
+
+    ; OpenFont
+    call alloc_xid
+    mov [fallback_font_id], eax
+    mov r12d, eax                       ; r12 = fallback fid
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_OPEN_FONT
+    mov byte [rdi+1], 0
+    ; length = 3 + (name_len + 3)/4 words
+    mov ecx, fallback_font_xlfd_len
+    add ecx, 3
+    and ecx, ~3
+    shr ecx, 2
+    add ecx, 3
+    mov word [rdi+2], cx
+    mov [rdi+4], r12d
+    mov word [rdi+8], fallback_font_xlfd_len
+    mov word [rdi+10], 0
+    ; Copy name
+    lea rbx, [rdi + 12]
+    xor ecx, ecx
+.iff_cp:
+    cmp ecx, fallback_font_xlfd_len
+    jge .iff_pad
+    movzx eax, byte [fallback_font_xlfd + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .iff_cp
+.iff_pad:
+    mov eax, fallback_font_xlfd_len
+    add eax, 3
+    and eax, ~3
+    add eax, 12
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; QueryFont — extract metrics. If this fails (no glyphs / font not
+    ; available), the X server returns an error which we'd see as a
+    ; non-reply byte; treat as "no fallback".
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_FONT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], r12d
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 60
+    syscall
+    cmp rax, 60
+    jl .iff_no_font
+    cmp byte [x11_buf], 1
+    jne .iff_no_font
+
+    ; Drain the rest of the QueryFont reply (we don't need its
+    ; per-char info, just the metrics already captured).
+    mov eax, [x11_buf + 4]
+    shl eax, 2
+    add eax, 32
+    sub eax, 60                         ; bytes still to drain
+    mov r13d, eax
+.iff_drain:
+    test r13d, r13d
+    jle .iff_drained
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 65536
+    cmp r13, rdx
+    jbe .iff_drain_chunk_ok
+    mov rdx, 65536
+    jmp .iff_drain_do
+.iff_drain_chunk_ok:
+    mov rdx, r13
+.iff_drain_do:
+    syscall
+    test rax, rax
+    jle .iff_drained
+    sub r13d, eax
+    jmp .iff_drain
+.iff_drained:
+
+    ; max-bounds character-width at offset 24+4 = 28
+    movzx eax, word [x11_buf + 28]
+    mov [fallback_char_w], ax
+    ; font-ascent at offset 52
+    movzx eax, word [x11_buf + 52]
+    mov [fallback_ascent], ax
+
+    ; CreateGC bound to the fallback font.
+    call alloc_xid
+    mov [fallback_gc_id], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6                 ; 4 base + 2 value words
+    mov eax, [fallback_gc_id]
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax
+    ; value-mask: GCFont (bit 14 = 0x4000) | GCForeground (bit 2 = 0x4)
+    ; — set foreground later per-draw via ChangeGC.
+    mov dword [rdi+12], 0x4004
+    mov dword [rdi+16], 0xFFFFFFFF      ; foreground placeholder (set per-draw)
+    mov [rdi+20], r12d                  ; font
+    mov rdx, 24
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.iff_no_font:
+    ; Failure: zero out the fallback so the renderer skips it.
+    mov dword [fallback_font_id], 0
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -3514,14 +4113,22 @@ pty_fork:
     xor edx, edx
     syscall
 
-    ; Set window size from current grid dimensions (set by x11_get_geometry)
+    ; Set window size from current grid dimensions (set by x11_get_geometry).
+    ; Fill ws_xpixel/ws_ypixel so kitty-graphics clients (pointer, etc.)
+    ; can size images to the actual pane in pixels.
     sub rsp, 8
     movzx eax, word [grid_rows]
     mov word [rsp], ax
     movzx eax, word [grid_cols]
     mov word [rsp+2], ax
-    mov word [rsp+4], 0
-    mov word [rsp+6], 0
+    movzx eax, word [grid_cols]
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rsp+4], ax
+    movzx eax, word [grid_rows]
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rsp+6], ax
     mov rax, SYS_IOCTL
     mov rdi, rbx
     mov rsi, TIOCSWINSZ
@@ -3605,6 +4212,21 @@ pty_fork:
 .ptf_env_done:
     mov qword [rdi + rcx*8], 0  ; null terminate
 
+    ; If -e CMD ARGS… was passed on the command line, exec that
+    ; instead of the default shell. Useful for `glass -e mutt`,
+    ; `glass -- ssh user@host …`, etc. Falls through to the bare/sh
+    ; chain on exec failure (PATH miss, etc.) so the user still gets
+    ; a usable shell rather than a vanished window.
+    mov rax, [exec_argv]
+    test rax, rax
+    jz .ptf_default_shell
+    mov rdi, rax
+    lea rsi, [exec_argv]
+    lea rdx, [child_envp]
+    mov rax, SYS_EXECVE
+    syscall
+
+.ptf_default_shell:
     ; Find shell in PATH
     sub rsp, 32
     lea rax, [.ptf_shell1]
@@ -3919,14 +4541,21 @@ handle_x11_events:
     mov [prev_grid_cols], rax
     mov rax, [grid_rows]
     mov [prev_grid_rows], rax
-    ; Resize PTY
+    ; Resize PTY. Fill ws_xpixel/ws_ypixel so kitty-graphics clients
+    ; (pointer, etc.) can size images to the actual pane in pixels.
     sub rsp, 8
     movzx eax, word [grid_rows]
     mov word [rsp], ax        ; ws_row
     movzx eax, word [grid_cols]
     mov word [rsp+2], ax      ; ws_col
-    mov word [rsp+4], 0
-    mov word [rsp+6], 0
+    movzx eax, word [grid_cols]
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rsp+4], ax      ; ws_xpixel
+    movzx eax, word [grid_rows]
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rsp+6], ax      ; ws_ypixel
     mov rax, SYS_IOCTL
     mov rdi, [pty_master]
     mov rsi, TIOCSWINSZ
@@ -3951,17 +4580,22 @@ handle_x11_events:
     mov rsi, SIGWINCH
     syscall
 .hxe_cfg_done:
-    ; First ConfigureNotify: do the wallpaper sample + blend. WMs often
-    ; emit a burst of CNs at startup (initial map plus reparenting); we
-    ; don't want to re-run this expensive path for each, otherwise we
-    ; starve the PTY read in the event loop.
+    ; ConfigureNotify: (re)sample the wallpaper for pseudo-transparency.
+    ; Tile may MOVE us when cycling layouts (without changing our size),
+    ; so resampling on every CN is required — otherwise the bg pixmap
+    ; still holds the slice from the previous root position and the
+    ; transparency looks broken until the user toggles opacity.
     cmp byte [cfg_opacity_set], 1
     jne .hxe_cfg_no_pseudo
     cmp byte [compositor_active], 1
     je .hxe_cfg_no_pseudo
+    ; First time only: mark setup done so the rest of the codebase
+    ; (palette tinting, etc.) knows the pseudo path is in play. After
+    ; that, every CN unconditionally re-samples.
     cmp byte [pseudo_setup_done], 0
-    jne .hxe_cfg_no_pseudo
+    jne .hxe_cfg_resample
     mov byte [pseudo_setup_done], 1
+.hxe_cfg_resample:
     call setup_pseudo_transparency
     call render_screen
     call x11_flush
@@ -4695,19 +5329,119 @@ handle_keypress:
     jmp .hkp_kbd_loop
 .hkp_no_alt:
 
+    ; Dead-key composition. Two cases:
+    ;   1. The current keysym IS a dead key (0xFE50..0xFE7F): stash it
+    ;      in pending_dead and emit nothing. The user's *next* keypress
+    ;      decides what to produce.
+    ;   2. A dead key is already pending: try to compose (pending, key)
+    ;      via compose_table. On hit emit the composed codepoint;
+    ;      on miss emit the pending dead key's spacing equivalent
+    ;      first, then fall through to handle the new key normally.
+    ;      Special case: pending + space → just the spacing char (lets
+    ;      the user produce a bare ¨/´/^/~ when they don't want to
+    ;      compose).
+    cmp eax, 0xFE50
+    jb .hkp_check_pending
+    cmp eax, 0xFE7F
+    ja .hkp_check_pending
+    sub eax, 0xFE50
+    mov [pending_dead], al                ; stash dead-key offset
+    jmp .hkp_done                         ; do not emit yet
+.hkp_check_pending:
+    movzx ecx, byte [pending_dead]
+    cmp cl, 0xFF
+    je .hkp_no_dead                       ; nothing pending
+    mov byte [pending_dead], 0xFF         ; consume regardless of outcome
+
+    ; pending + space → emit just the spacing dead-char.
+    cmp eax, 0x20
+    jne .hkp_compose_lookup
+    movzx eax, word [dead_to_ucs + rcx*2]
+    test eax, eax
+    jz .hkp_done
+    jmp .hkp_emit_ucs
+
+.hkp_compose_lookup:
+    ; Walk compose_table for (cl, al-low-byte). edx scratches over entries.
+    push rax                              ; preserve current keysym
+    xor ebx, ebx
+.hkp_cl_loop:
+    mov edx, [compose_table + rbx*4]
+    test edx, edx
+    jz .hkp_cl_miss
+    cmp dl, cl
+    jne .hkp_cl_next
+    pop rax                               ; restore key (also into al)
+    push rax
+    mov dh, al                            ; key low byte
+    shr edx, 8
+    cmp dl, dh
+    jne .hkp_cl_next
+    ; Match — composed UCS-2 sits in the high 16 bits of the original
+    ; entry. Re-load it cleanly.
+    mov edx, [compose_table + rbx*4]
+    shr edx, 16
+    movzx eax, dx
+    add rsp, 8                            ; drop saved keysym (consumed)
+    jmp .hkp_emit_ucs
+.hkp_cl_next:
+    inc ebx
+    jmp .hkp_cl_loop
+
+.hkp_cl_miss:
+    ; No composition. Emit the dead char's spacing equivalent first,
+    ; then fall through to process the new key normally below.
+    movzx eax, word [dead_to_ucs + rcx*2]
+    test eax, eax
+    jz .hkp_cl_miss_no_dead_char
+    call emit_ucs_inline
+.hkp_cl_miss_no_dead_char:
+    pop rax                               ; restore the new key
+    jmp .hkp_no_dead
+
+.hkp_emit_ucs:
+    ; eax = composed/spacing codepoint. Emit as UTF-8 and finish.
+    cmp eax, 0x80
+    jb .hkp_eu_1b
+    ; 2-byte UTF-8 (U+0080..U+07FF covers everything we compose).
+    mov ecx, eax
+    shr ecx, 6
+    or ecx, 0xC0
+    mov [key_out_buf], cl
+    and eax, 0x3F
+    or eax, 0x80
+    mov [key_out_buf+1], al
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 2
+    syscall
+    jmp .hkp_done
+.hkp_eu_1b:
+    mov [key_out_buf], al
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 1
+    syscall
+    jmp .hkp_done
+
+.hkp_no_dead:
+
     ; Dispatch on keysym ranges
     ; Special keys (0xFF00-0xFFFF)
     cmp eax, 0xFF00
     jge .hkp_special
 
-    ; Latin-1 supplement (0x00A0-0x00FF) - encode as UTF-8 2-byte
-    cmp eax, 0xA0
+    ; Anything in U+0080..U+07FF (Latin-1 supplement, Latin Extended-A,
+    ; spacing modifier letters incl. dead-key equivalents) → 2-byte UTF-8.
+    cmp eax, 0x80
     jb .hkp_check_ascii
-    cmp eax, 0xFF
+    cmp eax, 0x07FF
     ja .hkp_done
     ; 2-byte UTF-8: 110xxxxx 10xxxxxx
     mov ecx, eax
-    shr ecx, 6               ; high 2 bits → first byte low bits
+    shr ecx, 6               ; high 5 bits → first byte low bits
     or ecx, 0xC0
     mov [key_out_buf], cl
     and eax, 0x3F            ; low 6 bits
@@ -5600,6 +6334,7 @@ vt_process:
     mov dword [cur_fg_pixel], 0
     mov dword [cur_bg_pixel], 0
     mov byte [cur_attrs], 0
+    mov byte [cur_osc8_id], 0           ; clear stale hyperlink span
     ; Reset DECSET modes
     mov qword [cursor_visible], 1
     mov qword [autowrap], 1
@@ -5652,6 +6387,8 @@ vt_process:
     je .vtp_csi_private
     cmp al, '>'
     je .vtp_csi_private_gt
+    cmp al, '<'
+    je .vtp_csi_private_lt
     cmp al, '='
     je .vtp_csi_private_eq
     cmp al, '0'
@@ -5680,8 +6417,16 @@ vt_process:
 
 .vtp_csi_sep:
     cmp al, ';'
+    je .vtp_csi_next_param
+    ; ':' is the ITU-T sub-parameter separator (e.g. CC's \e[4:3m for
+    ; curly underline, \e[38:2:R:G:Bm for truecolor). Most terminals
+    ; just split on it like ';'. Without this, params after ':' get
+    ; lost and the trailing 'm' falls through to .vtp_csi_final → the
+    ; intended SGR (e.g. \e[24m to clear underline encoded as \e[4:0m)
+    ; never fires, leaving everything underlined.
+    cmp al, ':'
     jne .vtp_csi_final
-    ; Next parameter
+.vtp_csi_next_param:
     inc qword [vt_param_count]
     mov rcx, [vt_param_count]
     cmp rcx, 15
@@ -5695,6 +6440,9 @@ vt_process:
 .vtp_csi_private_gt:
     mov byte [vt_private], '>'
     jmp .vtp_loop
+.vtp_csi_private_lt:
+    mov byte [vt_private], '<'
+    jmp .vtp_loop
 .vtp_csi_private_eq:
     mov byte [vt_private], '='
     jmp .vtp_loop
@@ -5707,6 +6455,20 @@ vt_process:
     inc rcx
     mov [vt_param_count], rcx
 
+    ; Private-prefix sequences with '>', '<', or '=' are xterm/kitty
+    ; extensions glass doesn't implement (modifyOtherKeys, kitty
+    ; keyboard protocol, etc.). Without this guard, e.g. CC's
+    ; \e[>1u (kitty keyboard set) would dispatch as 'u' = restore
+    ; cursor → cursor lands at whatever was last DECSC'd, completely
+    ; out of place. '?' private (DEC modes) DOES dispatch (h/l for
+    ; ?25h, ?2004h, etc.) — those handlers themselves still need to
+    ; check vt_private to distinguish DEC modes from standard ones.
+    movzx ecx, byte [vt_private]
+    test ecx, ecx
+    jz .vtp_csi_dispatch_open
+    cmp ecx, '?'
+    jne .vtp_loop
+.vtp_csi_dispatch_open:
     cmp al, 'A'
     je .vtp_csi_cuu
     cmp al, 'B'
@@ -5871,16 +6633,27 @@ vt_process:
     pop rcx
     pop rsi
     pop rdi
-    ; Clear the grid for alt screen use
+    ; Clear the grid for alt screen use. Also drop any in-progress
+    ; hyperlink + colour span from the main screen so the alt-screen
+    ; app starts with a clean attribute baseline.
     call grid_clear
     mov qword [cursor_row], 0
     mov qword [cursor_col], 0
+    mov byte [cur_attrs], 0
+    mov byte [cur_osc8_id], 0
+    mov byte [cur_fg_default], 1
+    mov byte [cur_bg_default], 1
     mov qword [alt_screen_active], 1
+    mov qword [all_dirty], 1               ; force full redraw post-clear
     jmp .vtp_loop
 
 .vtp_alt_screen_off:
     cmp qword [alt_screen_active], 0
     je .vtp_loop                ; already on main screen
+    ; Drop any kitty-graphics placements from the alt screen so they
+    ; don't bleed onto the restored main screen (e.g. pointer leaving
+    ; an image visible after exit).
+    call place_clear_all
     ; Restore main grid from alt_grid: only the active dims.
     push rdi
     push rsi
@@ -5925,7 +6698,21 @@ vt_process:
     mov dword [cur_fg_pixel], 0
     mov dword [cur_bg_pixel], 0
     mov byte [cur_attrs], 0
+    ; Clear any in-progress OSC 8 hyperlink span. A long-lived terminal
+    ; can otherwise inherit a stale cur_osc8_id from the previous app
+    ; (vim, CC, etc. that opened a link and never sent the
+    ; \e]8;;\e\\ close), causing every subsequently written cell to
+    ; render with a hyperlink underline.
+    mov byte [cur_osc8_id], 0
     mov qword [cursor_style], 0
+    ; Force a full redraw — without this, glass's per-row dirty tracker
+    ; sees the restored cells as "the same" as what was just on screen
+    ; (because we copied alt_grid → grid wholesale rather than via the
+    ; usual write-cell-and-mark-row-dirty path), so the alt-screen
+    ; pixels stay visible until the user types something that updates
+    ; a row. all_dirty=1 makes the next render_screen repaint
+    ; everything.
+    mov qword [all_dirty], 1
     jmp .vtp_loop
 
 .vtp_cursor_show:
@@ -6531,6 +7318,14 @@ vt_process:
 
 ; CSI m - Select Graphic Rendition (SGR)
 .vtp_csi_sgr:
+    ; A leading private prefix changes 'm' from SGR to something else
+    ; entirely. The classic case is `\e[>4m` (xterm modifyOtherKeys),
+    ; which CC and other modern apps send to enable extended keyboard
+    ; encoding. Without this guard, glass treats `>4m` as SGR 4 →
+    ; underline ON, with no matching clear, leaving the entire screen
+    ; underlined for the rest of the session.
+    cmp byte [vt_private], 0
+    jne .vtp_loop
     xor ebx, ebx            ; param index
 .vtp_sgr_loop:
     cmp rbx, [vt_param_count]
@@ -8239,9 +9034,14 @@ render_screen:
     jmp .rs_row
 
 .rs_after_rows:
-    ; OSC 8 hyperlink underline pass: scan grid for cells whose link id
-    ; is non-zero and draw an underline per contiguous span. Done as
-    ; a separate pass so it doesn't perturb the per-color text-run logic.
+    ; OSC 8 hyperlink underline pass — gated by cfg_osc8_underline so
+    ; the user can disable it for apps that abuse OSC 8 (CC opens
+    ; spans that effectively never close).
+    cmp byte [cfg_osc8_underline], 0
+    je .rs_link_done
+    ; Scan grid for cells whose link id is non-zero and draw an
+    ; underline per contiguous span. Done as a separate pass so it
+    ; doesn't perturb the per-color text-run logic.
     xor r12, r12
 .rs_link_row:
     cmp r12, [grid_rows]
@@ -8328,6 +9128,181 @@ render_screen:
     inc r12
     jmp .rs_link_row
 .rs_link_done:
+
+    ; ─── Fallback-glyph pass (DISABLED) ───────────────────────────────
+    ; First-cut fallback had two cell-byte-order bugs that mis-marked
+    ; codepoints in glyph_present and sent wrong CHAR2B to ImageText16.
+    ; Skipping the whole pass until the rewrite lands; the X server's
+    ; default-glyph behaviour (the prior status quo) is restored.
+    jmp .rs_fb_done
+    cmp dword [fallback_font_id], 0
+    je .rs_fb_done
+    xor r12, r12                           ; row
+.rs_fb_row:
+    cmp r12, [grid_rows]
+    jge .rs_fb_done
+    xor r13, r13                           ; col
+.rs_fb_col:
+    cmp r13, [grid_cols]
+    jge .rs_fb_row_done
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    lea rdi, [grid + rax]
+    ; Codepoint = (cell[0] << 8) | cell[1]
+    movzx ecx, byte [rdi]
+    shl ecx, 8
+    movzx edx, byte [rdi + 1]
+    or ecx, edx                            ; ecx = codepoint
+    ; Skip blanks: codepoint 0 and SPACE (0x20) — primary handles them.
+    test ecx, ecx
+    jz .rs_fb_next
+    cmp ecx, 0x20
+    je .rs_fb_next
+    ; Skip if primary has the glyph: bit set in glyph_present[cp/8].
+    mov rax, rcx
+    shr rax, 3
+    mov bl, cl
+    and bl, 7
+    mov dl, 1
+    push rcx
+    mov cl, bl
+    shl dl, cl
+    pop rcx
+    test [glyph_present + rax], dl
+    jnz .rs_fb_next
+    ; Skip emoji cells (already handled by the emoji pass below).
+    test byte [rdi + 4], 8                  ; ATTR_IS_EMOJI
+    jnz .rs_fb_next
+    ; Resolve effective fg / bg for this cell, accounting for default
+    ; flags and the inverse attribute.
+    movzx eax, byte [rdi + 2]               ; fg_default flag
+    test eax, eax
+    jnz .rs_fb_fg_default
+    mov r14d, [rdi + 8]                     ; explicit fg pixel
+    jmp .rs_fb_have_fg
+.rs_fb_fg_default:
+    movzx eax, byte [default_fg]
+    mov r14d, [palette + rax*4]
+.rs_fb_have_fg:
+    movzx eax, byte [rdi + 3]               ; bg_default flag
+    test eax, eax
+    jnz .rs_fb_bg_default
+    mov r15d, [rdi + 12]                    ; explicit bg pixel
+    jmp .rs_fb_have_bg
+.rs_fb_bg_default:
+    movzx eax, byte [default_bg]
+    mov r15d, [palette + rax*4]
+.rs_fb_have_bg:
+    ; Inverse swap (bit 2 of attrs).
+    test byte [rdi + 4], 4
+    jz .rs_fb_no_inv
+    xchg r14d, r15d
+.rs_fb_no_inv:
+    ; Clear the cell area with bg (PolyFillRectangle on gc_id with
+    ; foreground temporarily set to r15 = bg). Saves us caring about
+    ; whether the fallback glyph's natural box covers the full cell.
+    push rcx
+    push rdi
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    mov [rdi+12], r15d
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    mov rax, r13
+    movzx edx, word [char_width]
+    imul eax, edx
+    mov word [rdi+12], ax
+    mov rax, r12
+    movzx edx, word [char_height]
+    imul eax, edx
+    mov word [rdi+14], ax
+    movzx eax, word [char_width]
+    mov word [rdi+16], ax
+    movzx eax, word [char_height]
+    mov word [rdi+18], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rdi
+    pop rcx
+    ; Set fallback GC fg + bg.
+    push rcx
+    push rdi
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5                     ; 3 base + 2 value words
+    mov eax, [fallback_gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND | GC_BACKGROUND
+    mov [rdi+12], r14d                      ; foreground
+    mov [rdi+16], r15d                      ; background
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rdi
+    pop rcx
+    ; ImageText16 the fallback glyph at the cell's baseline. Big-endian
+    ; CHAR2B = the codepoint bytes already in cell[0..1] in the right
+    ; order.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_IMAGE_TEXT16
+    mov byte [rdi+1], 1                     ; n = 1 char
+    mov word [rdi+2], 5                     ; 4 base + 1 data word (2 bytes char + 2 bytes pad)
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [fallback_gc_id]
+    mov [rdi+8], eax
+    mov rax, r13
+    movzx edx, word [char_width]
+    imul eax, edx
+    mov word [rdi+12], ax                   ; x
+    mov rax, r12
+    movzx edx, word [char_height]
+    imul eax, edx
+    movzx edx, word [font_ascent]           ; baseline at primary's ascent so
+    add eax, edx                            ; fallback aligns with primary text
+    mov word [rdi+14], ax                   ; y (baseline)
+    ; Copy the CHAR2B codepoint bytes from the cell directly.
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx ecx, byte [grid + rax]
+    movzx edx, byte [grid + rax + 1]
+    mov [rdi+16], cl
+    mov [rdi+17], dl
+    mov word [rdi+18], 0                    ; pad
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_fb_next:
+    inc r13
+    jmp .rs_fb_col
+.rs_fb_row_done:
+    inc r12
+    jmp .rs_fb_row
+.rs_fb_done:
 
     ; Emoji pass: composite each ATTR_IS_EMOJI cell's cached Picture
     ; onto the window via XRender. Lazy: any not-yet-rendered emoji
@@ -8424,6 +9399,58 @@ render_screen:
     mov r14d, [rsi + 16]             ; picture id (r14 callee-saved)
     test r14d, r14d
     jz .rs_imgs_next
+
+    ; SetPictureTransform: rescale the source picture so Composite's
+    ; 1:1 sampling maps the full source into the destination cell
+    ; rectangle. Matrix is
+    ;   ( src_w/dst_w   0             0 )
+    ;   ( 0             src_h/dst_h   0 )
+    ;   ( 0             0             1 )
+    ; in 16.16 fixed-point. Values are stored big-endian per RENDER.
+    mov ebx, [rsi + 4]               ; src_w
+    mov r15d, [rsi + 8]              ; src_h
+    movzx eax, word [r13 + 8]        ; cell_w
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov r9d, eax                     ; dst_w
+    test r9d, r9d
+    jz .rs_imgs_skip_xform
+    movzx eax, word [r13 + 10]       ; cell_h
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov r10d, eax                    ; dst_h
+    test r10d, r10d
+    jz .rs_imgs_skip_xform
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_SET_PICTURE_TRANSFORM
+    mov word [rdi+2], 11
+    mov [rdi+4], r14d                ; source picture
+    ; m11 = (src_w << 16) / dst_w
+    mov eax, ebx
+    shl rax, 16
+    xor edx, edx
+    div r9d
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0            ; m12
+    mov dword [rdi+16], 0            ; m13
+    mov dword [rdi+20], 0            ; m21
+    ; m22 = (src_h << 16) / dst_h
+    mov eax, r15d
+    shl rax, 16
+    xor edx, edx
+    div r10d
+    mov [rdi+24], eax
+    mov dword [rdi+28], 0            ; m23
+    mov dword [rdi+32], 0            ; m31
+    mov dword [rdi+36], 0            ; m32
+    mov dword [rdi+40], 0x00010000   ; m33 = 1.0
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_imgs_skip_xform:
     lea rdi, [tmp_buf]
     mov al, [render_major]
     mov [rdi], al
@@ -9534,7 +10561,7 @@ load_config:
 .lc_try_font_weight:
     ; Match "font_weight = bold"
     cmp dword [rsi], 'font'
-    jne .lc_try_keybind
+    jne .lc_try_osc8_underline
     cmp dword [rsi+4], '_wei'
     jne .lc_skip_line
     cmp word [rsi+8], 'gh'
@@ -9546,6 +10573,28 @@ load_config:
     cmp dword [rsi], 'bold'
     jne .lc_skip_line
     mov byte [cfg_font_bold], 1
+    jmp .lc_skip_line
+
+.lc_try_osc8_underline:
+    ; Match "osc8_underline = 0" or "osc8_underline = 1". Default 1
+    ; (matches the de-facto terminal convention). Set to 0 if you use
+    ; an app that abuses OSC 8 — e.g. CC opens spans that effectively
+    ; never close, leaving the whole screen visually underlined.
+    cmp dword [rsi], 'osc8'
+    jne .lc_try_keybind
+    cmp dword [rsi+4], '_und'
+    jne .lc_skip_line
+    cmp dword [rsi+8], 'erli'
+    jne .lc_skip_line
+    cmp word [rsi+12], 'ne'
+    jne .lc_skip_line
+    add rsi, 14
+    call lc_skip_to_value
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 1
+    ja .lc_skip_line
+    mov [cfg_osc8_underline], al
     jmp .lc_skip_line
 
 .lc_try_keybind:
@@ -11079,6 +12128,28 @@ img_upload_rsi:
     mov r14, rdx                     ; height
     mov r15, r8                      ; bytes
 
+    ; Swap R and B bytes in img_decode_buf. ARGB32 picture format has
+    ; R=bit16, G=bit8, B=bit0, so on a little-endian server the bytes
+    ; in memory are [B, G, R, A]. Kitty wire format and `convert
+    ; rgba:-` both deliver [R, G, B, A], so the red and blue channels
+    ; would be swapped on screen without this pass.
+    mov rdi, [img_decode_buf]
+    test rdi, rdi
+    jz .iur_swap_done
+    mov rcx, r15
+    shr rcx, 2                       ; pixel count
+    test rcx, rcx
+    jz .iur_swap_done
+.iur_swap:
+    mov al, [rdi]
+    mov dl, [rdi+2]
+    mov [rdi], dl
+    mov [rdi+2], al
+    add rdi, 4
+    dec rcx
+    jnz .iur_swap
+.iur_swap_done:
+
     ; Sanity check
     cmp dword [render_major], 0
     je .iur_fail
@@ -11992,14 +13063,22 @@ font_change_step:
 .fcs_rows_ok:
     mov [grid_rows], rax
 
-    ; Tell PTY about the new size + signal the child to redraw.
+    ; Tell PTY about the new size + signal the child to redraw. Fill
+    ; ws_xpixel/ws_ypixel so kitty-graphics clients (pointer, etc.)
+    ; can size images to the actual pane in pixels.
     sub rsp, 8
     movzx eax, word [grid_rows]
     mov word [rsp], ax
     movzx eax, word [grid_cols]
     mov word [rsp+2], ax
-    mov word [rsp+4], 0
-    mov word [rsp+6], 0
+    movzx eax, word [grid_cols]
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rsp+4], ax
+    movzx eax, word [grid_rows]
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rsp+6], ax
     mov rax, SYS_IOCTL
     mov rdi, [pty_master]
     mov rsi, TIOCSWINSZ
@@ -12294,3 +13373,12 @@ opacity_toggle_apply:
     pop r12
     pop rbx
     ret
+
+; ---------------------------------------------------------------------
+; glyph TTF rasterizer engine — embedded for high-quality TTF text
+; rendering via XRender CompositeGlyphs32. GLYPH_LIB suppresses the
+; CLI parts so only the engine procedures (glyph_load_font,
+; glyph_set_weight, glyph_render_to_alpha) come along — no _start,
+; no PGM emit, no argv/CLI helpers. See ../glyph/README.md for the API.
+%define GLYPH_LIB
+%include "../glyph/glyph.asm"
