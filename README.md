@@ -162,6 +162,30 @@ It opens a PTY, forks a child shell ([bare](https://github.com/isene/bare) by de
 
 Selection works via the X11 PRIMARY mechanism: drag-select to claim ownership, other apps' middle-click or Shift+Insert sends a ConvertSelection request to glass which responds with the selection text via ChangeProperty + SelectionNotify.
 
+### Disconnect handling
+
+glass polls the X11 socket and the PTY master with `poll(2)`. The
+event loop tests `revents` for `POLLERR | POLLHUP` (mask `0x18`) on
+the X11 fd and exits cleanly when the X server goes away — see
+`.ev_check_x11` in `glass.asm`. The PTY side is handled the same way
+so that closing bare via Ctrl+D shuts glass down. There is no
+spin-loop on a dead socket; this was caught and fixed during early
+development against Xephyr (see the inline comment in the same code).
+
+### Why no XCB or Xlib
+
+CHasm's premise is "what's the smallest set of dependencies a real
+desktop tool actually needs?" Linking XCB would mean dynamic linking,
+libxcb's ~140KB of code, libxau, and a transitive dependency on libc
+— all to wrap a wire protocol that's a few KB to write yourself. The
+benefit XCB *does* give you (XML-generated request encoders) is real
+when you're consuming the whole protocol; glass only uses ~25
+opcodes and the wire format is stable and small enough to write by
+hand once. So we did. The same logic applies to libfontconfig (we
+embed [glyph](https://github.com/isene/glyph) for TTF instead) and
+to the X core text path (PolyText16 + ImageText16 are 4 lines of
+serialisation each). This is a stylistic choice, not a defect.
+
 ## Key Bindings
 
 | Key | Action |
