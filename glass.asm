@@ -86,8 +86,14 @@
 %define RENDER_CREATE_PICTURE        4
 %define RENDER_FREE_PICTURE          7
 %define RENDER_COMPOSITE             8
+%define RENDER_CREATE_GLYPH_SET      17
+%define RENDER_FREE_GLYPH_SET        19
+%define RENDER_ADD_GLYPHS            20
+%define RENDER_COMPOSITE_GLYPHS_32   25
+%define RENDER_FILL_RECTANGLES       26
 %define RENDER_SET_PICTURE_TRANSFORM 28
 %define RENDER_OP_OVER               3
+%define RENDER_OP_SRC                1
 
 ; Kitty graphics protocol
 %define APC_BODY_MAX        16384            ; one APC body cap (glow chunks ~4K)
@@ -624,6 +630,13 @@ wm_protocols_atom:  resd 1
 render_major:           resd 1     ; major opcode, 0 = unavailable
 render_format_argb32:   resd 1     ; PictFormat ID for ARGB32 source
 render_format_window:   resd 1     ; PictFormat ID matching our visual
+render_format_a8:       resd 1     ; PictFormat ID for 8-bit alpha (TTF glyphs)
+
+; ---- TTF rendering (XRender CompositeGlyphs32) ----
+ttf_glyphset:           resd 1     ; XID of GlyphSet for this font
+ttf_pen_pixmap:         resd 1     ; 1×1 ARGB32 pixmap (foreground source)
+ttf_pen_picture:        resd 1     ; Picture wrapping ttf_pen_pixmap (Repeat=true)
+ttf_pen_color:          resd 1     ; current pen ARGB (cached so we skip redundant fills)
 render_window_picture:  resd 1     ; Picture wrapping the glass window
 render_temp_gc:         resd 1     ; GC used to PutImage onto pixmaps
 
@@ -1084,6 +1097,10 @@ _start:
     ; Probe for the RENDER extension and set up Picture for our window.
     ; Required for color emoji rendering. Silently skipped if not present.
     call x11_setup_render
+
+    ; If TTF font loaded, set up the XRender GlyphSet + pen Picture for
+    ; CompositeGlyphs32 text rendering.
+    call ttf_xrender_init
 
     ; Map window
     call x11_map_window
@@ -2689,21 +2706,41 @@ x11_setup_render:
     movzx r9d, word [rbx + 22]          ; a_mask
     ; ARGB32: depth=32, r_shift=16, g_shift=8, b_shift=0, a_shift=24, a_mask=0xFF
     cmp eax, 32
-    jne .xsr_check_window
+    jne .xsr_check_a8
     cmp edx, 16
-    jne .xsr_check_window
+    jne .xsr_check_a8
     cmp esi, 8
-    jne .xsr_check_window
+    jne .xsr_check_a8
     test edi, edi
-    jnz .xsr_check_window
+    jnz .xsr_check_a8
     cmp r8d, 24
-    jne .xsr_check_window
+    jne .xsr_check_a8
     cmp r9d, 0xFF
-    jne .xsr_check_window
+    jne .xsr_check_a8
     cmp dword [render_format_argb32], 0
-    jne .xsr_check_window               ; already found
+    jne .xsr_check_a8                   ; already found
     mov eax, [rbx]
     mov [render_format_argb32], eax
+    jmp .xsr_check_a8
+.xsr_check_a8:
+    ; Alpha8: depth=8, RGB shifts=0/0/0, a_shift=0, a_mask=0xFF
+    movzx eax, byte [rbx + 5]
+    cmp eax, 8
+    jne .xsr_check_window
+    test edx, edx                       ; r_shift = 0
+    jnz .xsr_check_window
+    test esi, esi                       ; g_shift = 0
+    jnz .xsr_check_window
+    test edi, edi                       ; b_shift = 0
+    jnz .xsr_check_window
+    test r8d, r8d                       ; a_shift = 0
+    jnz .xsr_check_window
+    cmp r9d, 0xFF                       ; a_mask = 0xFF
+    jne .xsr_check_window
+    cmp dword [render_format_a8], 0
+    jne .xsr_check_window
+    mov eax, [rbx]
+    mov [render_format_a8], eax
     jmp .xsr_check_window
 .xsr_check_window:
     ; Window format: matches our window's depth (24 normally, 32 in
@@ -9625,6 +9662,16 @@ render_screen:
     inc dword [x11_seq]
 
 .rs_cursor_done:
+    ; ---- TTF proof-of-life: render 'A' on top at (50, 50) in red ----
+    cmp qword [ttf_active], 0
+    je .rs_ttf_skip
+    mov rdi, 65                         ; 'A'
+    mov rsi, 50                         ; pen x
+    mov rdx, 50                         ; pen y (baseline)
+    mov rcx, 0xFFFF0000                 ; ARGB red
+    call ttf_render_cp
+.rs_ttf_skip:
+
     pop r15
     pop r14
     pop r13
@@ -13478,6 +13525,364 @@ opacity_toggle_apply:
 .ota_done:
     pop r12
     pop rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════════
+; TTF rendering via XRender CompositeGlyphs32
+; ════════════════════════════════════════════════════════════════════
+; Wire-protocol helpers that bridge glass's render path to the embedded
+; glyph engine. Activated only when ttf_active = 1 (which happens iff
+; ~/.glassrc has a working font_path).
+;
+;   ttf_xrender_init       — once, after x11_setup_render. Creates
+;                             GlyphSet + a 1×1 ARGB Picture used as
+;                             the foreground "pen" source.
+;   ttf_set_pen_color      — rdi = ARGB. Updates the pen pixmap.
+;                             Cached so back-to-back same-color cells
+;                             are free.
+;   ttf_upload_glyph       — rdi = codepoint. Renders via
+;                             glyph_render_to_alpha, sends AddGlyphs.
+;                             Marks ttf_glyph_uploaded[cp] = 1.
+;   ttf_render_cp          — rdi = cp, rsi = x, rdx = y, rcx = ARGB
+;                             Composites one glyph at (x, y).
+; ---------------------------------------------------------------------
+
+; Per-codepoint upload state. Linear bitmap: 1 byte per BMP cp.
+; 64KB BSS; only touched pages cost RAM (typically a handful of KB).
+
+section .bss
+ttf_glyph_uploaded:     resb 65536
+
+section .text
+
+; ---------------------------------------------------------------------
+ttf_xrender_init:
+    cmp dword [render_format_a8], 0
+    je .skip
+    cmp dword [render_format_argb32], 0
+    je .skip
+    cmp qword [ttf_active], 0
+    je .skip
+    cmp dword [render_major], 0
+    je .skip
+
+    ; CreateGlyphSet: gsid, format
+    call alloc_xid
+    mov [ttf_glyphset], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_GLYPH_SET
+    mov word [rdi+2], 3
+    mov eax, [ttf_glyphset]
+    mov [rdi+4], eax
+    mov eax, [render_format_a8]
+    mov [rdi+8], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; CreatePixmap (depth=32, 1×1)
+    call alloc_xid
+    mov [ttf_pen_pixmap], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov byte [rdi+1], 32
+    mov word [rdi+2], 4
+    mov eax, [ttf_pen_pixmap]
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], 1
+    mov word [rdi+14], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; CreatePicture (pen_picture, pen_pixmap, ARGB32, value-mask=CPRepeat)
+    call alloc_xid
+    mov [ttf_pen_picture], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 6
+    mov eax, [ttf_pen_picture]
+    mov [rdi+4], eax
+    mov eax, [ttf_pen_pixmap]
+    mov [rdi+8], eax
+    mov eax, [render_format_argb32]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 1               ; CPRepeat = bit 0
+    mov dword [rdi+20], 1               ; Repeat = Normal
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    call x11_buffer
+    inc dword [x11_seq]
+
+    mov dword [ttf_pen_color], 0xFFFFFFFE  ; force first set_pen_color
+    call x11_flush
+.skip:
+    ret
+
+; ---------------------------------------------------------------------
+; ttf_set_pen_color — rdi = ARGB (0xAARRGGBB). Updates the 1×1 pen
+; pixmap if the colour changed.
+ttf_set_pen_color:
+    cmp edi, [ttf_pen_color]
+    je .ret
+    mov [ttf_pen_color], edi
+    ; PutImage: format=ZPixmap=2, depth=32, w=1, h=1, dst-x=0, dst-y=0,
+    ;           left-pad=0, depth, gc, then 4 bytes of data
+    ; Length = (24 + 4) / 4 = 7
+    lea rsi, [tmp_buf]
+    mov byte [rsi], X11_PUT_IMAGE
+    mov byte [rsi+1], 2                ; ZPixmap
+    mov word [rsi+2], 7
+    mov eax, [ttf_pen_pixmap]
+    mov [rsi+4], eax
+    mov eax, [render_temp_gc]       ; depth-32 GC (created lazily)
+    test eax, eax
+    jnz .have_gc
+    call ensure_render_gc              ; lazy-create depth-32 GC
+    mov eax, [render_temp_gc]
+.have_gc:
+    mov [rsi+8], eax
+    mov word [rsi+12], 1               ; width
+    mov word [rsi+14], 1               ; height
+    mov word [rsi+16], 0               ; dst-x
+    mov word [rsi+18], 0               ; dst-y
+    mov byte [rsi+20], 0               ; left-pad
+    mov byte [rsi+21], 32              ; depth
+    mov word [rsi+22], 0               ; pad
+    mov eax, edi                       ; the ARGB pixel
+    mov [rsi+24], eax
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.ret:
+    ret
+
+; ---------------------------------------------------------------------
+; ttf_upload_glyph — rdi = codepoint. Renders the glyph via the
+; embedded engine, then sends AddGlyphs to install it in the glyphset.
+; Marks ttf_glyph_uploaded[cp]. No-op if already uploaded.
+ttf_upload_glyph:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+
+    cmp rdi, 65536
+    jge .ret
+    cmp byte [ttf_glyph_uploaded + rdi], 0
+    jne .ret
+    mov rbx, rdi                       ; remember cp
+
+    ; Render via engine.
+    mov rsi, [cfg_font_size]
+    test rsi, rsi
+    jnz .have_size
+    mov rsi, DEFAULT_FONT_SIZE
+.have_size:
+    call glyph_render_to_alpha
+    test eax, eax
+    jnz .skip                          ; missing/oversize → just skip
+
+    ; rcx=W rdx=H r8=bearing_x r9=bearing_y r10=advance
+    mov r12, rcx                        ; W
+    mov r13, rdx                        ; H
+    mov r14, r8                         ; bearing_x (signed)
+    mov r15, r9                         ; bearing_y
+    mov rbp, r10                        ; advance
+
+    ; bytes_per_row in the alpha bitmap: per RENDER spec, alpha stride
+    ; is (width + 3) & ~3 — pad each row to 4-byte boundary.
+    mov rax, r12
+    add rax, 3
+    and rax, ~3
+    mov rcx, rax                        ; padded row stride
+    mov rax, rcx
+    imul rax, r13                       ; total alpha bytes
+
+    ; Total request length in bytes:
+    ;   header(4) + glyphset(4) + num(4) + gid(4) + glyphInfo(12) + alpha
+    ; = 32 + alpha bytes (already 4-byte aligned)
+    mov rdx, rax
+    add rdx, 32                         ; total bytes
+    mov rsi, rdx
+    shr rsi, 2                          ; length in 4-byte units
+
+    ; Build into tmp_buf (assumed large enough; cell glyphs at typical
+    ; sizes are well under 4KB).
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_ADD_GLYPHS
+    mov [rdi+2], si                     ; length (16-bit)
+    mov eax, [ttf_glyphset]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 1                ; num_glyphs
+    mov [rdi+12], ebx                   ; gid = cp
+    ; glyphInfo
+    mov [rdi+16], r12w                  ; w
+    mov [rdi+18], r13w                  ; h
+    mov rax, r14
+    neg rax                             ; x = -bearing_x
+    mov [rdi+20], ax
+    mov [rdi+22], r15w                  ; y = +bearing_y
+    mov [rdi+24], bp                    ; off-x = advance (low 16 bits)
+    mov word [rdi+26], 0                ; off-y = 0
+    ; Alpha rows: copy from output_buf (W bytes per row, no padding) into
+    ; the request buffer with padding to `rcx` bytes per row.
+    lea r8, [rdi + 28]                  ; dest cursor
+    lea r9, [output_buf]                ; src cursor
+    mov r11, r13                        ; rows remaining
+.row:
+    test r11, r11
+    jz .rows_done
+    push rcx
+    mov rcx, r12                        ; W bytes
+    mov rdi, r8
+    mov rsi, r9
+    rep movsb
+    pop rcx
+    add r9, r12                         ; src advance = W
+    mov rax, rcx
+    sub rax, r12                        ; padding bytes
+.pad:
+    test rax, rax
+    jz .pad_done
+    mov byte [rdi], 0
+    inc rdi
+    dec rax
+    jmp .pad
+.pad_done:
+    mov r8, rdi
+    dec r11
+    jmp .row
+.rows_done:
+
+    ; Send the request. Total = 28 + (rcx * h)
+    mov rdx, rcx
+    imul rdx, r13
+    add rdx, 28
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+
+.skip:
+    mov byte [ttf_glyph_uploaded + rbx], 1
+.ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---------------------------------------------------------------------
+; ttf_render_cp — composite a single TTF glyph onto the window.
+;   rdi = codepoint
+;   rsi = x (pen position, i.e. left edge / baseline x)
+;   rdx = y (baseline y)
+;   rcx = ARGB foreground colour
+;
+; Performance-aware path: caller batches by colour where possible
+; (we still skip the pen update if the colour matches the cached one).
+ttf_render_cp:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+
+    mov r12, rdi                       ; cp
+    mov r13, rsi                       ; pen x
+    mov r14, rdx                       ; pen y
+    mov r15, rcx                       ; colour
+
+    ; Upload glyph if first sighting.
+    mov rdi, r12
+    call ttf_upload_glyph
+
+    ; Set pen colour.
+    mov rdi, r15
+    call ttf_set_pen_color
+
+    ; Build CompositeGlyphs32 request:
+    ;   header(4) + op(1)+pad(3) + src(4) + dst(4) + maskFmt(4) + gset(4)
+    ;   + srcX(2) + srcY(2)  = 28 bytes fixed
+    ; + element list:
+    ;   numGlyphs(1) + pad(3) + dx(2) + dy(2) + glyphIds[1](4) = 12
+    ; Total 40 bytes, length = 10 dwords.
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS_32
+    mov word [rdi+2], 10                ; length
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov eax, [ttf_pen_picture]
+    mov [rdi+8], eax                    ; src
+    mov eax, [render_window_picture]
+    mov [rdi+12], eax                   ; dst
+    mov dword [rdi+16], 0               ; maskFormat = use glyphset's
+    mov eax, [ttf_glyphset]
+    mov [rdi+20], eax
+    mov word [rdi+24], 0                ; src x
+    mov word [rdi+26], 0                ; src y
+    ; element list:
+    mov byte [rdi+28], 1                ; numGlyphs
+    mov byte [rdi+29], 0
+    mov word [rdi+30], 0
+    mov [rdi+32], r13w                  ; dx (pen x)
+    mov [rdi+34], r14w                  ; dy (pen y)
+    mov [rdi+36], r12d                  ; glyph id
+
+    lea rsi, [tmp_buf]
+    mov rdx, 40
+    call x11_buffer
+    inc dword [x11_seq]
+
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---------------------------------------------------------------------
+; ensure_render_gc — lazy-create a depth-32 GC bound to the pen pixmap.
+; Only called from ttf_set_pen_color when render_temp_gc is still 0.
+; The same GC is reused thereafter for all PutImage uploads to the pen.
+ensure_render_gc:
+    cmp dword [render_temp_gc], 0
+    jne .ret
+    call alloc_xid
+    mov [render_temp_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], 55                  ; CreateGC opcode
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                 ; length=4 (no values)
+    mov eax, [render_temp_gc]
+    mov [rdi+4], eax
+    mov eax, [ttf_pen_pixmap]
+    mov [rdi+8], eax                    ; drawable (depth-32)
+    mov dword [rdi+12], 0               ; value-mask = 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.ret:
     ret
 
 ; ---------------------------------------------------------------------

@@ -12,6 +12,17 @@ Part of the **CHasm** (CHange to ASM) suite: [bare](https://github.com/isene/bar
 
 <br clear="left"/>
 
+![glass under tile](img/screenshot.png)
+
+glass driving every pane in the
+[CHasm](https://github.com/isene/chasm) desktop, with
+pseudo-transparency picking up the wallpaper. Every binary on
+screen is x86_64 assembly — tile holds the layout, strip + asmites
+(the per-segment programs in
+[chasm-bits](https://github.com/isene/chasm-bits)) drive the status
+row, show is rendering syntax-highlighted source in the left and
+bottom-right panes, bare is the shell.
+
 ## Install
 
 ### From source (requires nasm and ld)
