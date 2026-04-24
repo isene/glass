@@ -478,6 +478,7 @@ pts_prefix:     db "/dev/pts/", 0
 shell_name:     db "bare", 0
 shell_flag:     db "-l", 0
 term_env:       db "TERM=xterm-kitty", 0
+colorterm_env:  db "COLORTERM=truecolor", 0
 hkp_dbg_path:   db "/tmp/glass_keys.log", 0
 hkp_paste_marker: db "*** PASTE HANDLER REACHED ***", 10
 hkp_paste_marker_len equ $ - hkp_paste_marker
@@ -498,24 +499,75 @@ xdg_open:       db "/usr/bin/xdg-open", 0
 ; Config file suffix
 glassrc_suffix: db "/.glassrc", 0
 
-; Standard 16-color palette (0x00RRGGBB)
+; Standard 16-color palette (0x00RRGGBB). Default is kitty's palette —
+; modern terminal apps are tuned against these values, so the diff
+; backgrounds, syntax highlighting, etc. land where the upstream
+; designer intended. Override with `palette = NAME` or
+; `colorN = #RRGGBB` in ~/.glassrc.
 std_colors:
+theme_kitty:
     dd 0x00000000  ; 0  black
-    dd 0x00AA0000  ; 1  red
-    dd 0x0000AA00  ; 2  green
-    dd 0x00AA5500  ; 3  yellow/brown
-    dd 0x000000AA  ; 4  blue
-    dd 0x00AA00AA  ; 5  magenta
-    dd 0x0000AAAA  ; 6  cyan
-    dd 0x00AAAAAA  ; 7  white
-    dd 0x00555555  ; 8  bright black
-    dd 0x00FF5555  ; 9  bright red
-    dd 0x0055FF55  ; 10 bright green
-    dd 0x00FFFF55  ; 11 bright yellow
-    dd 0x005555FF  ; 12 bright blue
-    dd 0x00FF55FF  ; 13 bright magenta
-    dd 0x0055FFFF  ; 14 bright cyan
+    dd 0x00CC0403  ; 1  red
+    dd 0x0019CB00  ; 2  green
+    dd 0x00CECB00  ; 3  yellow
+    dd 0x000D73CC  ; 4  blue
+    dd 0x00CB1ED1  ; 5  magenta
+    dd 0x000DCDCD  ; 6  cyan
+    dd 0x00DDDDDD  ; 7  white
+    dd 0x00767676  ; 8  bright black
+    dd 0x00F2201F  ; 9  bright red
+    dd 0x0023FD00  ; 10 bright green
+    dd 0x00FFFD00  ; 11 bright yellow
+    dd 0x001A8FFF  ; 12 bright blue
+    dd 0x00FD28FF  ; 13 bright magenta
+    dd 0x0014FFFF  ; 14 bright cyan
     dd 0x00FFFFFF  ; 15 bright white
+
+; Bundled named palettes — selected via `palette = NAME` in ~/.glassrc.
+; Each block is 16 dwords (slots 0..15). Slot 0 is bg-default, slot 7
+; is fg-default; explicit `bg = ...` / `fg = ...` lines re-override after
+; the theme is applied so the user's preferred bg never gets clobbered.
+theme_vga:                                          ; the historical default
+    dd 0x00000000, 0x00AA0000, 0x0000AA00, 0x00AA5500
+    dd 0x000000AA, 0x00AA00AA, 0x0000AAAA, 0x00AAAAAA
+    dd 0x00555555, 0x00FF5555, 0x0055FF55, 0x00FFFF55
+    dd 0x005555FF, 0x00FF55FF, 0x0055FFFF, 0x00FFFFFF
+
+theme_solarized_dark:
+    dd 0x00073642, 0x00DC322F, 0x00859900, 0x00B58900
+    dd 0x00268BD2, 0x00D33682, 0x002AA198, 0x00EEE8D5
+    dd 0x00002B36, 0x00CB4B16, 0x00586E75, 0x00657B83
+    dd 0x00839496, 0x006C71C4, 0x0093A1A1, 0x00FDF6E3
+
+theme_dracula:
+    dd 0x0021222C, 0x00FF5555, 0x0050FA7B, 0x00F1FA8C
+    dd 0x00BD93F9, 0x00FF79C6, 0x008BE9FD, 0x00F8F8F2
+    dd 0x006272A4, 0x00FF6E6E, 0x0069FF94, 0x00FFFFA5
+    dd 0x00D6ACFF, 0x00FF92DF, 0x00A4FFFF, 0x00FFFFFF
+
+theme_gruvbox_dark:
+    dd 0x00282828, 0x00CC241D, 0x0098971A, 0x00D79921
+    dd 0x00458588, 0x00B16286, 0x00689D6A, 0x00A89984
+    dd 0x00928374, 0x00FB4934, 0x00B8BB26, 0x00FABD2F
+    dd 0x0083A598, 0x00D3869B, 0x008EC07C, 0x00EBDBB2
+
+theme_nord:
+    dd 0x003B4252, 0x00BF616A, 0x00A3BE8C, 0x00EBCB8B
+    dd 0x0081A1C1, 0x00B48EAD, 0x0088C0D0, 0x00E5E9F0
+    dd 0x004C566A, 0x00BF616A, 0x00A3BE8C, 0x00EBCB8B
+    dd 0x0081A1C1, 0x00B48EAD, 0x008FBCBB, 0x00ECEFF4
+
+theme_tokyonight:
+    dd 0x0015161E, 0x00F7768E, 0x009ECE6A, 0x00E0AF68
+    dd 0x007AA2F7, 0x00BB9AF7, 0x007DCFFF, 0x00A9B1D6
+    dd 0x00414868, 0x00F7768E, 0x009ECE6A, 0x00E0AF68
+    dd 0x007AA2F7, 0x00BB9AF7, 0x007DCFFF, 0x00C0CAF5
+
+theme_monokai:
+    dd 0x00272822, 0x00F92672, 0x00A6E22E, 0x00F4BF75
+    dd 0x0066D9EF, 0x00AE81FF, 0x00A1EFE4, 0x00F8F8F2
+    dd 0x0075715E, 0x00F92672, 0x00A6E22E, 0x00F4BF75
+    dd 0x0066D9EF, 0x00AE81FF, 0x00A1EFE4, 0x00F9F8F5
 
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS section
@@ -4245,7 +4297,7 @@ pty_fork:
     ; Drop TERMINFO (parent's terminfo dir is kitty's; child should
     ; fall back to system terminfo for the TERM we advertise).
     cmp dword [rax], 'TERM'
-    jne .ptf_env_keep
+    jne .ptf_chk_colorterm
     cmp dword [rax+4], 'INFO'
     jne .ptf_chk_term
     cmp byte [rax+8], '='
@@ -4256,6 +4308,19 @@ pty_fork:
     jne .ptf_env_keep
     lea rax, [term_env]
     mov r8d, 1
+    jmp .ptf_env_keep
+.ptf_chk_colorterm:
+    ; Drop any inherited COLORTERM= — we set our own (truecolor) below
+    ; so apps like claude-code emit 24-bit RGB instead of falling back
+    ; to 256-color cube approximations that read brighter/harsher than
+    ; the kitty-default look. NASM word literal 'M=' = 0x3D4D, which
+    ; matches the LE byte order of "M=" in memory at offsets 8..9.
+    cmp dword [rax], 'COLO'
+    jne .ptf_env_keep
+    cmp dword [rax+4], 'RTER'
+    jne .ptf_env_keep
+    cmp word [rax+8], 'M='
+    je .ptf_env_skip
 .ptf_env_keep:
     mov [rdi + rcx*8], rax
     inc ecx
@@ -4264,9 +4329,15 @@ pty_fork:
     jmp .ptf_env_copy
 .ptf_env_add_term:
     test r8d, r8d
-    jnz .ptf_env_done
+    jnz .ptf_env_after_term
     ; TERM wasn't in env, add it
     lea rax, [term_env]
+    mov [rdi + rcx*8], rax
+    inc ecx
+.ptf_env_after_term:
+    ; Always inject our COLORTERM=truecolor (we dropped any inherited
+    ; value above, so we can append unconditionally).
+    lea rax, [colorterm_env]
     mov [rdi + rcx*8], rax
     inc ecx
 .ptf_env_done:
@@ -5636,31 +5707,51 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_up:
-    mov byte [key_out_buf], 0x1B
-    mov byte [key_out_buf+1], '['
-    mov byte [key_out_buf+2], 'A'
-    mov rdx, 3
-    jmp .hkp_send_seq
-
+    mov al, 'A'
+    jmp .hkp_arrow_emit
 .hkp_down:
-    mov byte [key_out_buf], 0x1B
-    mov byte [key_out_buf+1], '['
-    mov byte [key_out_buf+2], 'B'
-    mov rdx, 3
-    jmp .hkp_send_seq
-
+    mov al, 'B'
+    jmp .hkp_arrow_emit
 .hkp_right:
+    mov al, 'C'
+    jmp .hkp_arrow_emit
+.hkp_left:
+    mov al, 'D'
+    ; fall through
+
+; Arrow emit: al = final letter (A/B/C/D); ebx = X11 modifier mask.
+; Modifier param per xterm: 1 + Shift(1) + Alt(2) + Ctrl(4). Plain arrow
+; stays 3 bytes (ESC[A); modified arrow becomes ESC[1;<n><L> so vim sees
+; <C-Up>, <S-Down>, <A-Right> etc. (Ctrl+Up was the trigger.)
+.hkp_arrow_emit:
+    xor ecx, ecx
+    test ebx, 1                  ; Shift
+    jz .ha_ns
+    inc ecx
+.ha_ns:
+    test ebx, 8                  ; Alt (Mod1)
+    jz .ha_na
+    add ecx, 2
+.ha_na:
+    test ebx, 4                  ; Ctrl
+    jz .ha_nc
+    add ecx, 4
+.ha_nc:
     mov byte [key_out_buf], 0x1B
     mov byte [key_out_buf+1], '['
-    mov byte [key_out_buf+2], 'C'
+    test ecx, ecx
+    jnz .ha_mod
+    mov byte [key_out_buf+2], al
     mov rdx, 3
     jmp .hkp_send_seq
-
-.hkp_left:
-    mov byte [key_out_buf], 0x1B
-    mov byte [key_out_buf+1], '['
-    mov byte [key_out_buf+2], 'D'
-    mov rdx, 3
+.ha_mod:
+    inc ecx                      ; param = 1 + modifier bits
+    add cl, '0'
+    mov byte [key_out_buf+2], '1'
+    mov byte [key_out_buf+3], ';'
+    mov byte [key_out_buf+4], cl
+    mov byte [key_out_buf+5], al
+    mov rdx, 6
     jmp .hkp_send_seq
 
 .hkp_pgup:
@@ -10724,7 +10815,7 @@ load_config:
     ; an app that abuses OSC 8 — e.g. CC opens spans that effectively
     ; never close, leaving the whole screen visually underlined.
     cmp dword [rsi], 'osc8'
-    jne .lc_try_keybind
+    jne .lc_try_palette
     cmp dword [rsi+4], '_und'
     jne .lc_skip_line
     cmp dword [rsi+8], 'erli'
@@ -10739,6 +10830,198 @@ load_config:
     ja .lc_skip_line
     mov [cfg_osc8_underline], al
     jmp .lc_skip_line
+
+.lc_try_palette:
+    ; Match "palette = NAME" — bundled themes that overwrite slots 0..15.
+    ; Re-applies any cfg_bg/cfg_fg that were set BEFORE this line, so an
+    ; earlier "bg = #..." doesn't get clobbered by the theme. Lines after
+    ; this one (bg/fg/colorN) override individual slots normally.
+    cmp dword [rsi], 'pale'
+    jne .lc_try_color
+    cmp word [rsi+4], 'tt'
+    jne .lc_try_color
+    cmp byte [rsi+6], 'e'
+    jne .lc_try_color
+    movzx eax, byte [rsi+7]
+    cmp al, ' '
+    je .lc_pal_val
+    cmp al, 9
+    je .lc_pal_val
+    cmp al, '='
+    je .lc_pal_val
+    jmp .lc_try_color
+.lc_pal_val:
+    add rsi, 7
+    call lc_skip_to_value
+    ; Try each known theme name (.lc_match_token is a local helper below).
+    mov ecx, 5
+    lea rdi, [.lcp_n_kitty]
+    call .lc_match_token
+    je .lcp_use_kitty
+    mov ecx, 3
+    lea rdi, [.lcp_n_vga]
+    call .lc_match_token
+    je .lcp_use_vga
+    mov ecx, 14
+    lea rdi, [.lcp_n_solarized]
+    call .lc_match_token
+    je .lcp_use_solarized
+    mov ecx, 7
+    lea rdi, [.lcp_n_dracula]
+    call .lc_match_token
+    je .lcp_use_dracula
+    mov ecx, 12
+    lea rdi, [.lcp_n_gruvbox]
+    call .lc_match_token
+    je .lcp_use_gruvbox
+    mov ecx, 4
+    lea rdi, [.lcp_n_nord]
+    call .lc_match_token
+    je .lcp_use_nord
+    mov ecx, 11
+    lea rdi, [.lcp_n_tokyonight]
+    call .lc_match_token
+    je .lcp_use_tokyonight
+    mov ecx, 7
+    lea rdi, [.lcp_n_monokai]
+    call .lc_match_token
+    je .lcp_use_monokai
+    jmp .lc_skip_line                     ; unknown name → ignore
+.lcp_use_kitty:      lea rsi, [theme_kitty]            ; jmp .lcp_apply
+                     jmp .lcp_apply
+.lcp_use_vga:        lea rsi, [theme_vga]
+                     jmp .lcp_apply
+.lcp_use_solarized:  lea rsi, [theme_solarized_dark]
+                     jmp .lcp_apply
+.lcp_use_dracula:    lea rsi, [theme_dracula]
+                     jmp .lcp_apply
+.lcp_use_gruvbox:    lea rsi, [theme_gruvbox_dark]
+                     jmp .lcp_apply
+.lcp_use_nord:       lea rsi, [theme_nord]
+                     jmp .lcp_apply
+.lcp_use_tokyonight: lea rsi, [theme_tokyonight]
+                     jmp .lcp_apply
+.lcp_use_monokai:    lea rsi, [theme_monokai]
+.lcp_apply:
+    lea rdi, [palette]
+    mov ecx, 16
+.lcp_copy:
+    mov eax, [rsi]
+    mov [rdi], eax
+    add rsi, 4
+    add rdi, 4
+    dec ecx
+    jnz .lcp_copy
+    ; Re-apply any earlier bg/fg overrides so the theme doesn't undo them.
+    cmp byte [cfg_bg_set], 1
+    jne .lcp_chk_fg
+    mov eax, [cfg_bg_pixel]
+    mov [palette], eax
+.lcp_chk_fg:
+    cmp byte [cfg_fg_set], 1
+    jne .lcp_done
+    mov eax, [cfg_fg_pixel]
+    mov [palette + 7*4], eax
+.lcp_done:
+    jmp .lc_skip_line
+
+.lcp_n_kitty:      db "kitty"
+.lcp_n_vga:        db "vga"
+.lcp_n_solarized:  db "solarized-dark"
+.lcp_n_dracula:    db "dracula"
+.lcp_n_gruvbox:    db "gruvbox-dark"
+.lcp_n_nord:       db "nord"
+.lcp_n_tokyonight: db "tokyonight"
+.lcp_n_monokai:    db "monokai"
+
+.lc_try_color:
+    ; Match "colorN = #RRGGBB" or "colorNN = #RRGGBB" (N = 0..15). Sets
+    ; palette[N] directly. Order in the file matters: a theme line later
+    ; than this one would overwrite — that's documented.
+    cmp dword [rsi], 'colo'
+    jne .lc_try_keybind
+    cmp byte [rsi+4], 'r'
+    jne .lc_try_keybind
+    movzx eax, byte [rsi+5]
+    cmp al, '0'
+    jb .lc_try_keybind
+    cmp al, '9'
+    ja .lc_try_keybind
+    sub eax, '0'
+    movzx ecx, byte [rsi+6]
+    cmp cl, '0'
+    jb .lc_color_idx_done
+    cmp cl, '9'
+    ja .lc_color_idx_done
+    sub ecx, '0'
+    imul eax, 10
+    add eax, ecx
+    add rsi, 7
+    jmp .lc_color_check
+.lc_color_idx_done:
+    add rsi, 6
+.lc_color_check:
+    cmp eax, 15
+    ja .lc_skip_line                      ; out of range
+    push rax                              ; index
+    call lc_skip_to_value
+    cmp byte [rsi], '#'
+    jne .lc_color_drop
+    inc rsi
+    call hex_to_pixel
+    pop rcx
+    mov [palette + rcx*4], eax
+    jmp .lc_skip_line
+.lc_color_drop:
+    pop rax
+    jmp .lc_skip_line
+
+; Local helper: rdi = static name string (no terminator), ecx = length.
+; rsi = current value cursor in cfg_buf. Returns ZF=1 if the next `ecx`
+; bytes at rsi exactly equal [rdi..rdi+ecx) AND the byte at rsi+ecx is
+; an end-of-token (whitespace, newline, NUL, '#'). rsi/rdi/rcx preserved.
+; Defined as a local label of load_config so .lc_try_keybind below stays
+; in load_config's local-label scope.
+.lc_match_token:
+    push rsi
+    push rdi
+    push rcx
+.lc_mt_cp:
+    test ecx, ecx
+    jz .lc_mt_check_end
+    movzx eax, byte [rsi]
+    cmp al, byte [rdi]
+    jne .lc_mt_no
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .lc_mt_cp
+.lc_mt_check_end:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .lc_mt_yes
+    cmp al, 10
+    je .lc_mt_yes
+    cmp al, 13
+    je .lc_mt_yes
+    cmp al, ' '
+    je .lc_mt_yes
+    cmp al, 9
+    je .lc_mt_yes
+    cmp al, '#'
+    je .lc_mt_yes
+.lc_mt_no:
+    pop rcx
+    pop rdi
+    pop rsi
+    or eax, 1                              ; clear ZF
+    ret
+.lc_mt_yes:
+    pop rcx
+    pop rdi
+    pop rsi
+    xor eax, eax                           ; ZF=1
+    ret
 
 .lc_try_keybind:
     ; Match "key.NAME = ..." for the five Alt-action bindings.

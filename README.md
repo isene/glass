@@ -66,7 +66,20 @@ cursor_blink = 500
 bg_cycle = #000000,#001a33,#002200,#200033,#330011,#332200,#003333
 opacity_cycle = 100,75,50,25,0
 font_weight = bold
+palette = tokyonight
+color1 = #e06c75
 ```
+
+The default 16-color palette matches kitty's defaults so most modern
+TUIs (claude-code, lazygit, lazydocker, helix, etc.) render the way
+their authors intended. Use `palette = NAME` to swap the whole 16-slot
+block; bundled names: `kitty` (default), `vga` (the historical
+glass/console palette), `solarized-dark`, `dracula`, `gruvbox-dark`,
+`nord`, `tokyonight`, `monokai`. Layer on top with `colorN = #RRGGBB`
+where `N` is `0..15` — handy for tweaking a single slot without
+redefining the rest. Order in the file matters: a `palette =` line
+overwrites earlier `colorN` lines, but explicit `bg`/`fg` keys are
+re-applied after the theme so they're never clobbered.
 
 Available font sizes: 10, 13, 15, 18, 20 (misc-fixed, always present),
 22, 24, 28, 32 (xos4-terminus, requires the `xfonts-terminus` package
