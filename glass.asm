@@ -177,25 +177,6 @@
 ; ══════════════════════════════════════════════════════════════════════
 section .data
 
-; --- TTF debug strings (temporary) ---
-dbg_msg_loaded:     db "[ttf] config loaded; font_path = ", 0
-dbg_msg_loaded_len  equ $ - dbg_msg_loaded - 1
-dbg_msg_load_rc:    db "[ttf] glyph_load_font rc=", 0
-dbg_msg_load_rc_len equ $ - dbg_msg_load_rc - 1
-dbg_xri_msg:        db "[ttf] xrender_init: a8 nonzero? ", 0
-dbg_xri_msg_len     equ $ - dbg_xri_msg - 1
-dbg_render_hit:     db "[ttf] render hit", 10
-dbg_render_hit_len  equ $ - dbg_render_hit
-dbg_glyph_msg:      db "[ttf] W/H/bx/by/adv = ", 0
-dbg_glyph_msg_len   equ $ - dbg_glyph_msg - 1
-dbg_pre_msg:        db "[ttf] pre-render cp/size = ", 0
-dbg_pre_msg_len     equ $ - dbg_pre_msg - 1
-dbg_addglyphs_msg:  db "[ttf] AddGlyphs hex32: ", 0
-dbg_addglyphs_msg_len equ $ - dbg_addglyphs_msg - 1
-dbg_compglyph_msg:  db "[ttf] CompositeGlyphs hex40: ", 0
-dbg_compglyph_msg_len equ $ - dbg_compglyph_msg - 1
-dbg_nl:             db 10
-
 ; X11 auth
 auth_name:      db "MIT-MAGIC-COOKIE-1"
 auth_name_len   equ 18
@@ -890,9 +871,6 @@ osc_in_num:         resq 1          ; 1 = still parsing OSC number
 ; Font configuration
 cfg_font_size:      resq 1          ; 0 = default, else pixel size
 
-; debug bytes for stderr prints
-dbg_byte:           resb 4
-
 ; ---- TTF font (glyph engine) ----
 cfg_font_path:      resb 512        ; null-terminated path to TTF file (empty = use X core font)
 cfg_font_path_set:  resq 1          ; 1 if cfg_font_path is populated
@@ -1048,52 +1026,10 @@ _start:
     ; If font_path is configured, load the TTF via the embedded glyph
     ; engine. On failure we silently fall back to X core fonts so a
     ; bad path never bricks glass.
-    ; --- DEBUG: dump status to stderr ---
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_msg_loaded]
-    mov rdx, dbg_msg_loaded_len
-    syscall
-
-    cmp qword [cfg_font_path_set], 0
-    je .ttf_skip_dbg
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [cfg_font_path]
-    mov rdx, 64
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_nl]
-    mov rdx, 1
-    syscall
-.ttf_skip_dbg:
-
     cmp qword [cfg_font_path_set], 0
     je .ttf_skip
     lea rdi, [cfg_font_path]
     call glyph_load_font
-    push rax
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_msg_load_rc]
-    mov rdx, dbg_msg_load_rc_len
-    syscall
-    pop rax
-    push rax
-    add rax, '0'
-    mov [dbg_byte], al
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_byte]
-    mov rdx, 1
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_nl]
-    mov rdx, 1
-    syscall
-    pop rax
     test rax, rax
     jnz .ttf_failed
     mov rdi, [cfg_ttf_weight]
@@ -1101,7 +1037,6 @@ _start:
     mov qword [ttf_active], 1
     jmp .ttf_skip
 .ttf_failed:
-    ; Leave ttf_active = 0; fall through to X core font init.
     mov qword [ttf_active], 0
 .ttf_skip:
 
@@ -9726,31 +9661,6 @@ render_screen:
     inc dword [x11_seq]
 
 .rs_cursor_done:
-    ; ---- TTF proof-of-life: render 'A' on top at (50, 50) in red ----
-    cmp qword [ttf_active], 0
-    je .rs_ttf_skip
-    ; --- DEBUG: count this hit ---
-    push rax
-    push rdi
-    push rsi
-    push rdx
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_render_hit]
-    mov rdx, dbg_render_hit_len
-    syscall
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rax
-    ; --- END DEBUG ---
-    mov rdi, 65                         ; 'A'
-    mov rsi, 200                        ; pen x
-    mov rdx, 200                        ; pen y (baseline)
-    mov rcx, 0xFFFF0000                 ; ARGB red
-    call ttf_render_cp
-    call x11_flush
-.rs_ttf_skip:
 
     pop r15
     pop r14
@@ -13636,81 +13546,7 @@ ttf_glyph_uploaded:     resb 65536
 section .text
 
 ; ---------------------------------------------------------------------
-; dbg_dec — print rax as decimal to stderr.
-dbg_dec:
-    push rbx
-    push r12
-    lea r12, [dec_buf + 31]
-    mov rbx, 10
-    test rax, rax
-    jnz .l
-    dec r12
-    mov byte [r12], '0'
-    jmp .emit
-.l:
-    xor edx, edx
-    div rbx
-    dec r12
-    add dl, '0'
-    mov [r12], dl
-    test rax, rax
-    jnz .l
-.emit:
-    lea rax, [dec_buf + 31]
-    sub rax, r12
-    mov edx, eax
-    mov rsi, r12
-    mov edi, 2
-    mov eax, 1
-    syscall
-    pop r12
-    pop rbx
-    ret
-
-; dbg_putc — print al as one byte to stderr.
-dbg_putc:
-    mov [dbg_byte], al
-    mov rax, 1
-    mov rdi, 2
-    lea rsi, [dbg_byte]
-    mov rdx, 1
-    syscall
-    ret
-
-; ---------------------------------------------------------------------
 ttf_xrender_init:
-    ; --- DEBUG ---
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r11
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_xri_msg]
-    mov rdx, dbg_xri_msg_len
-    syscall
-    mov edi, [render_format_a8]
-    add edi, '0'
-    mov [dbg_byte], dil
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_byte]
-    mov rdx, 1
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_nl]
-    mov rdx, 1
-    syscall
-    pop r11
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    ; --- END DEBUG ---
     cmp dword [render_format_a8], 0
     je .skip
     cmp dword [render_format_argb32], 0
@@ -13848,33 +13684,6 @@ ttf_upload_glyph:
     jnz .have_size
     mov rsi, DEFAULT_FONT_SIZE
 .have_size:
-    ; --- DEBUG: dump cp, size before render ---
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r11
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_pre_msg]
-    mov rdx, dbg_pre_msg_len
-    syscall
-    mov rax, [rsp + 8]                 ; rdi (cp); after 6 pushes rdi at +8
-    call dbg_dec
-    mov al, '/'
-    call dbg_putc
-    mov rax, [rsp + 16]                ; rsi (size) at +16
-    call dbg_dec
-    mov al, 10
-    call dbg_putc
-    pop r11
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    ; --- END DEBUG ---
     call glyph_render_to_alpha
     test eax, eax
     jnz .skip                          ; missing/oversize → just skip
@@ -13885,82 +13694,6 @@ ttf_upload_glyph:
     mov r14, r8                         ; bearing_x (signed)
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
-
-    ; --- DEBUG: dump metrics for the glyph we're about to upload ---
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r11
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_glyph_msg]
-    mov rdx, dbg_glyph_msg_len
-    syscall
-    ; print W H bx by adv as 4 hex bytes joined by '/'
-    mov rax, r12
-    call dbg_dec
-    mov al, '/'
-    call dbg_putc
-    mov rax, r13
-    call dbg_dec
-    mov al, '/'
-    call dbg_putc
-    mov rax, r14
-    call dbg_dec
-    mov al, '/'
-    call dbg_putc
-    mov rax, r15
-    call dbg_dec
-    mov al, '/'
-    call dbg_putc
-    mov rax, rbp
-    call dbg_dec
-    mov al, ' '
-    call dbg_putc
-    ; Now dump engine globals: arg_size, out_xMin, out_xMax, out_yMax, head_unitsPerEm
-    mov al, 'a'
-    call dbg_putc
-    mov al, '='
-    call dbg_putc
-    mov rax, [arg_size]
-    call dbg_dec
-    mov al, ' '
-    call dbg_putc
-    mov al, 'x'
-    call dbg_putc
-    mov al, '='
-    call dbg_putc
-    mov rax, [out_xMax]
-    sub rax, [out_xMin]
-    call dbg_dec
-    mov al, ' '
-    call dbg_putc
-    mov al, 'y'
-    call dbg_putc
-    mov al, '='
-    call dbg_putc
-    mov rax, [out_yMax]
-    sub rax, [out_yMin]
-    call dbg_dec
-    mov al, ' '
-    call dbg_putc
-    mov al, 'u'
-    call dbg_putc
-    mov al, '='
-    call dbg_putc
-    mov rax, [head_unitsPerEm]
-    call dbg_dec
-    mov al, 10
-    call dbg_putc
-    pop r11
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    ; --- END DEBUG ---
 
     ; XRender expects alpha image data per glyph laid out W*H bytes
     ; tightly (NO per-row padding); the total alpha block (sum over
@@ -14022,65 +13755,6 @@ ttf_upload_glyph:
     ; Send the request. Total bytes = 28 + r8.
     mov rdx, r8
     add rdx, 28
-
-    ; --- DEBUG: dump first 32 bytes as hex to stderr ---
-    push rax
-    push rcx
-    push rdx
-    push rdi
-    push rsi
-    push r8
-    push r11
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_addglyphs_msg]
-    mov rdx, dbg_addglyphs_msg_len
-    syscall
-    xor rcx, rcx
-.dbgh_loop:
-    cmp rcx, 32
-    jge .dbgh_done
-    movzx eax, byte [tmp_buf + rcx]
-    push rcx
-    push rax
-    shr eax, 4
-    cmp al, 10
-    jl .h1
-    add al, 'a' - 10
-    jmp .h1d
-.h1:
-    add al, '0'
-.h1d:
-    call dbg_putc
-    pop rax
-    push rax
-    and eax, 0x0f
-    cmp al, 10
-    jl .h2
-    add al, 'a' - 10
-    jmp .h2d
-.h2:
-    add al, '0'
-.h2d:
-    call dbg_putc
-    mov al, ' '
-    call dbg_putc
-    pop rax
-    pop rcx
-    inc rcx
-    jmp .dbgh_loop
-.dbgh_done:
-    mov al, 10
-    call dbg_putc
-    pop r11
-    pop r8
-    pop rsi
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rax
-    ; --- END DEBUG ---
-
     lea rsi, [tmp_buf]
     call x11_buffer
     inc dword [x11_seq]
@@ -14157,62 +13831,6 @@ ttf_render_cp:
     mov [rdi+32], r13w                  ; dx (pen x)
     mov [rdi+34], r14w                  ; dy (pen y)
     mov [rdi+36], r12d                  ; glyph id
-
-    ; --- DEBUG: dump first 40 bytes of CompositeGlyphs ---
-    push rax
-    push rcx
-    push rdx
-    push rdi
-    push rsi
-    push r11
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [dbg_compglyph_msg]
-    mov rdx, dbg_compglyph_msg_len
-    syscall
-    xor rcx, rcx
-.dbgc_loop:
-    cmp rcx, 40
-    jge .dbgc_done
-    movzx eax, byte [tmp_buf + rcx]
-    push rcx
-    push rax
-    shr eax, 4
-    cmp al, 10
-    jl .ch1
-    add al, 'a' - 10
-    jmp .ch1d
-.ch1:
-    add al, '0'
-.ch1d:
-    call dbg_putc
-    pop rax
-    push rax
-    and eax, 0x0f
-    cmp al, 10
-    jl .ch2
-    add al, 'a' - 10
-    jmp .ch2d
-.ch2:
-    add al, '0'
-.ch2d:
-    call dbg_putc
-    mov al, ' '
-    call dbg_putc
-    pop rax
-    pop rcx
-    inc rcx
-    jmp .dbgc_loop
-.dbgc_done:
-    mov al, 10
-    call dbg_putc
-    pop r11
-    pop rsi
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rax
-    ; --- END DEBUG ---
 
     lea rsi, [tmp_buf]
     mov rdx, 40
