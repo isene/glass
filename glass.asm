@@ -14285,20 +14285,12 @@ ttf_invalidate_glyph_cache:
     cmp dword [render_major], 0
     je .tigc_ret
 
-    ; FreeGlyphSet old.
-    lea rdi, [tmp_buf]
-    mov al, [render_major]
-    mov [rdi], al
-    mov byte [rdi+1], RENDER_FREE_GLYPH_SET
-    mov word [rdi+2], 2
-    mov eax, [ttf_glyphset]
-    mov [rdi+4], eax
-    lea rsi, [tmp_buf]
-    mov rdx, 8
-    call x11_buffer
-    inc dword [x11_seq]
-
-    ; Allocate new XID and CreateGlyphSet (same a8 format).
+    ; Allocate a fresh GlyphSet XID and CreateGlyphSet at the new size.
+    ; We deliberately do NOT FreeGlyphSet the old one — sending Free +
+    ; Create back-to-back races against any in-flight render and several
+    ; X servers crash glass before the second request lands. The old
+    ; glyphset just leaks server-side until process exit (~64KB at
+    ; worst), which is fine for a few-times-per-session size change.
     call alloc_xid
     mov [ttf_glyphset], eax
     lea rdi, [tmp_buf]
@@ -14316,7 +14308,8 @@ ttf_invalidate_glyph_cache:
     inc dword [x11_seq]
 
     ; Zero the per-cp uploaded bitmap so subsequent ttf_upload_glyph
-    ; calls actually upload again. 65536 bytes via rep stosq.
+    ; calls actually re-upload (now into the new glyphset). 65536 bytes
+    ; via rep stosq. rdi/rcx/rax are caller-saved; restored by saver.
     push rdi
     push rcx
     push rax
