@@ -14863,11 +14863,39 @@ ttf_upload_glyph:
     jz .have_glyph
 .try_other_subs:
     cmp rbx, 0x23BC                    ; ⎼ → ─
-    jne .skip
+    jne .try_sub_23f5
     mov rdi, 0x2500
     call glyph_render_to_alpha
     test eax, eax
-    jnz .skip
+    jz .have_glyph
+.try_sub_23f5:
+    cmp rbx, 0x23F5                    ; ⏵ medium-triangle → ▶ U+25B6
+    jne .try_sub_23f4
+    mov rdi, 0x25B6
+    call glyph_render_to_alpha
+    test eax, eax
+    jz .have_glyph
+.try_sub_23f4:
+    cmp rbx, 0x23F4                    ; ⏴ medium-triangle-left → ◀
+    jne .empty_glyph
+    mov rdi, 0x25C0
+    call glyph_render_to_alpha
+    test eax, eax
+    jz .have_glyph
+.empty_glyph:
+    ; Engine couldn't render this cp and no substitute matched. Upload
+    ; a 1×1 fully-transparent glyph so the X server has a valid glyph
+    ; for this id and CompositeGlyphs32 paints nothing — instead of
+    ; falling back to the server's default-glyph placeholder (the tiny
+    ; `:`-shaped mark the user has been seeing for missing CC chars
+    ; like U+23F5 ⏵). W=0 H=0 didn't suppress the placeholder under
+    ; this server build, so we use 1×1 alpha=0 explicitly.
+    mov rcx, 1                         ; W = 1
+    mov rdx, 1                         ; H = 1
+    xor r8, r8                         ; bearing_x = 0
+    xor r9, r9                         ; bearing_y = 0
+    movzx r10, word [char_width]       ; advance = char_width
+    mov byte [output_buf], 0           ; alpha = 0 (transparent)
 .have_glyph:
 
     ; rcx=W rdx=H r8=bearing_x r9=bearing_y r10=advance
