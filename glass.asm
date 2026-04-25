@@ -4402,8 +4402,58 @@ pty_fork:
     syscall
 
 .ptf_default_shell:
-    ; Try /usr/local/bin/bare first (user-installed bare), then /bin/sh.
-    sub rsp, 32
+    ; Build $HOME/bin/bare into a stack buffer. Walk envp for "HOME=".
+    ; If found, try execve($HOME/bin/bare) first — handles users who
+    ; install bare to ~/bin without touching /usr/local. Falls through
+    ; to /usr/local/bin/bare and then /bin/sh.
+    sub rsp, 296                       ; 256 path + 24 argv + 16 align pad
+    lea r15, [rsp + 24]                ; r15 = path buffer
+    mov rdi, [envp]
+.ptf_home_loop:
+    mov rax, [rdi]
+    test rax, rax
+    jz .ptf_no_home
+    cmp dword [rax], 'HOME'
+    jne .ptf_home_next
+    cmp byte [rax+4], '='
+    jne .ptf_home_next
+    ; Found "HOME=value". Copy value into r15 buffer.
+    lea rsi, [rax + 5]
+    mov rdi, r15
+    mov rcx, 230                       ; cap so we leave room for "/bin/bare\0"
+.ptf_home_cp:
+    mov al, [rsi]
+    test al, al
+    jz .ptf_home_cp_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .ptf_home_cp
+.ptf_home_cp_done:
+    ; Append "/bin/bare\0".
+    mov dword [rdi], '/bin'
+    add rdi, 4
+    mov dword [rdi], '/bar'
+    add rdi, 4
+    mov word [rdi], 'e'                ; 'e' + NUL byte
+    ; argv = [path, -l, NULL]
+    mov [rsp], r15
+    lea rax, [shell_flag]
+    mov [rsp+8], rax
+    mov qword [rsp+16], 0
+    mov rdi, r15
+    mov rsi, rsp
+    lea rdx, [child_envp]
+    mov rax, SYS_EXECVE
+    syscall
+    jmp .ptf_try_local                 ; HOME/bin/bare didn't exist — fall through
+.ptf_home_next:
+    add rdi, 8
+    jmp .ptf_home_loop
+.ptf_no_home:
+.ptf_try_local:
+    ; Next try /usr/local/bin/bare (system-installed bare).
     lea rax, [.ptf_shell1]
     mov [rsp], rax
     lea rax, [shell_flag]
