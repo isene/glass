@@ -5995,10 +5995,24 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_pgup:
-    ; Shift+PageUp = scroll back
+    ; Shift+PageUp = scroll glass's main-screen scrollback view.
+    ; But when an alt-screen TUI is active (CC, vim, less, htop) there
+    ; is no main-screen scrollback to view — the app owns the screen
+    ; and may have its own scrollback. Forward the keypress as the
+    ; xterm-style modified sequence so the app sees Shift+PgUp.
     test ebx, 1
-    jnz .hkp_scroll_back
-    ; Normal PageUp: send ESC[5~
+    jz .hkp_pgup_normal
+    cmp qword [alt_screen_active], 0
+    je .hkp_scroll_back
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], '5'
+    mov byte [key_out_buf+3], ';'
+    mov byte [key_out_buf+4], '2'
+    mov byte [key_out_buf+5], '~'
+    mov rdx, 6
+    jmp .hkp_send_seq
+.hkp_pgup_normal:
     mov byte [key_out_buf], 0x1B
     mov byte [key_out_buf+1], '['
     mov byte [key_out_buf+2], '5'
@@ -6007,10 +6021,21 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_pgdn:
-    ; Shift+PageDown = scroll forward
+    ; Same Shift+PgDn handling as PgUp above: glass scroll-forward on
+    ; main screen, forward to app on alt screen.
     test ebx, 1
-    jnz .hkp_scroll_fwd
-    ; Normal PageDown: send ESC[6~
+    jz .hkp_pgdn_normal
+    cmp qword [alt_screen_active], 0
+    je .hkp_scroll_fwd
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], '6'
+    mov byte [key_out_buf+3], ';'
+    mov byte [key_out_buf+4], '2'
+    mov byte [key_out_buf+5], '~'
+    mov rdx, 6
+    jmp .hkp_send_seq
+.hkp_pgdn_normal:
     mov byte [key_out_buf], 0x1B
     mov byte [key_out_buf+1], '['
     mov byte [key_out_buf+2], '6'
