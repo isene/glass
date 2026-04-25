@@ -691,6 +691,31 @@ ttf_pen_picture:        resd 1     ; Picture wrapping ttf_pen_pixmap (Repeat=tru
 ttf_pen_color:          resd 1     ; current pen ARGB (cached so we skip redundant fills)
 render_window_picture:  resd 1     ; Picture wrapping the glass window
 render_temp_gc:         resd 1     ; GC used to PutImage onto pixmaps
+win_depth:              resb 1     ; window's bit depth (32 for ARGB, root_depth otherwise)
+
+; --- Off-screen back buffer (double-buffering) ---
+; render_screen draws into back_pixmap; once the entire frame is built
+; we CopyArea it to the window in one shot. Two wins:
+;   1. The user never sees a partially-painted frame (no bg-fill flash
+;      between PolyFillRectangle and CompositeGlyphs32).
+;   2. Expose events become free — just re-BLT the existing pixmap
+;      instead of running the whole render path.
+;
+; Pseudo-transparency mode (pseudo_full=1) BYPASSES the back buffer and
+; renders straight to the window, because the wallpaper-tinted bg only
+; shows through the window's BackPixmap, not an off-screen pixmap. The
+; trade-off: pseudo + double-buffering needs the back-pixmap initialised
+; with the wallpaper pixels per frame, which costs more than the BLT
+; saves. Easy to add later if pseudo + clean rendering is wanted.
+back_pixmap:        resd 1          ; XID, 0 = not allocated yet
+back_picture:       resd 1          ; XID for XRender ops, 0 = none
+back_size_w:        resq 1          ; allocated width (track for resize)
+back_size_h:        resq 1          ; allocated height
+; Indirection used by render_screen body — set to back_* (default) or
+; win_id/render_window_picture (pseudo-mode) at the top of render_screen.
+draw_drawable:      resd 1
+draw_picture:       resd 1
+needs_blt:          resb 1          ; 1 = render_screen must CopyArea after
 
 %define MAX_EMOJI 1024
 %define EMOJI_RASTER_MAX (64 * 64 * 4)   ; allow up to 64x64 ARGB
@@ -2528,12 +2553,14 @@ x11_create_window:
     cmp dword [x11_argb_colormap], 0
     je .xcw_depth_root
     mov byte [rdi+1], 32                  ; depth
+    mov byte [win_depth], 32              ; remember for back-pixmap allocation
     mov word [rdi+2], 12                  ; length (8 + 4 values = 12 words)
     mov eax, [x11_argb_visual]
     jmp .xcw_visual_set
 .xcw_depth_root:
     mov al, [x11_root_depth]
     mov byte [rdi+1], al
+    mov [win_depth], al
     mov word [rdi+2], 10                  ; length (8 + 2 values = 10 words)
     mov eax, [x11_root_visual]
 .xcw_visual_set:
@@ -5801,6 +5828,22 @@ handle_keypress:
     ; Ctrl+letter: keysym & 0x1F
     and eax, 0x1F
 .hkp_send_byte:
+    ; Alt+key (Mod1, bit 3) = ESC prefix, the xterm/weechat convention.
+    ; weechat depends on Alt+letter for window/buffer navigation
+    ; (Alt+a = jump to active buffer, Alt+1..Alt+9 = window, etc.).
+    ; Without the ESC prefix, those keystrokes arrived as plain letters
+    ; and got typed into the input line instead of triggering shortcuts.
+    test ebx, 8              ; Mod1Mask = Alt
+    jz .hkp_send_plain
+    mov byte [key_out_buf], 0x1B   ; ESC
+    mov [key_out_buf + 1], al
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 2
+    syscall
+    jmp .hkp_done
+.hkp_send_plain:
     mov [key_out_buf], al
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
@@ -8905,6 +8948,167 @@ request_render:
     mov byte [render_pending], 1
     ret
 
+; ---------------------------------------------------------------------
+; ensure_back_buffer — make sure back_pixmap exists and matches the
+; current win_width × win_height. Called at the top of render_screen.
+; Pseudo-transparency mode skips back-buffer allocation and points the
+; draw_drawable / draw_picture indirection at the window directly.
+ensure_back_buffer:
+    push rbx
+
+    cmp byte [pseudo_full], 1
+    jne .ebb_real
+
+    ; --- Pseudo path: draw straight to window, no BLT needed. ---
+    mov eax, [win_id]
+    mov [draw_drawable], eax
+    mov eax, [render_window_picture]
+    mov [draw_picture], eax
+    mov byte [needs_blt], 0
+    jmp .ebb_done
+
+.ebb_real:
+    ; --- Off-screen path: ensure pixmap matches current window size. ---
+    mov rax, [win_width]
+    cmp rax, [back_size_w]
+    jne .ebb_recreate
+    mov rax, [win_height]
+    cmp rax, [back_size_h]
+    je .ebb_have                       ; existing pixmap is correct size
+
+.ebb_recreate:
+    ; Free old picture + pixmap if present.
+    cmp dword [back_picture], 0
+    je .ebb_no_old_pic
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_FREE_PICTURE
+    mov word [rdi+2], 2
+    mov eax, [back_picture]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    mov dword [back_picture], 0
+.ebb_no_old_pic:
+
+    cmp dword [back_pixmap], 0
+    je .ebb_no_old_pix
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_FREE_PIXMAP
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [back_pixmap]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    mov dword [back_pixmap], 0
+.ebb_no_old_pix:
+
+    ; CreatePixmap (depth = window depth, w × h matches window)
+    call alloc_xid
+    mov [back_pixmap], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov al, [win_depth]
+    mov [rdi+1], al
+    mov word [rdi+2], 4
+    mov eax, [back_pixmap]
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax                   ; drawable for visual matching
+    movzx eax, word [win_width]        ; clamp to 16 bits — pixmap req format
+    mov word [rdi+12], ax
+    movzx eax, word [win_height]
+    mov word [rdi+14], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; CreatePicture wrapping the pixmap (use same PictFormat as window).
+    cmp dword [render_major], 0
+    je .ebb_no_picture                  ; XRender unavailable
+    call alloc_xid
+    mov [back_picture], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5                 ; 5 dwords (no values)
+    mov eax, [back_picture]
+    mov [rdi+4], eax
+    mov eax, [back_pixmap]
+    mov [rdi+8], eax
+    mov eax, [render_format_window]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0               ; value-mask = 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.ebb_no_picture:
+
+    mov rax, [win_width]
+    mov [back_size_w], rax
+    mov rax, [win_height]
+    mov [back_size_h], rax
+
+.ebb_have:
+    mov eax, [back_pixmap]
+    mov [draw_drawable], eax
+    mov eax, [back_picture]
+    test eax, eax
+    jnz .ebb_have_pic
+    ; XRender unavailable — leave draw_picture at window picture so the
+    ; (otherwise broken) TTF path doesn't reference 0.
+    mov eax, [render_window_picture]
+.ebb_have_pic:
+    mov [draw_picture], eax
+    mov byte [needs_blt], 1
+
+.ebb_done:
+    pop rbx
+    ret
+
+; ---------------------------------------------------------------------
+; blt_back_to_window — CopyArea from back_pixmap to win_id, full
+; window. Called at the end of render_screen when needs_blt = 1.
+blt_back_to_window:
+    cmp byte [needs_blt], 0
+    je .blt_ret
+    cmp dword [back_pixmap], 0
+    je .blt_ret
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], 62                 ; CopyArea opcode
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7                ; length = 7 dwords
+    mov eax, [back_pixmap]
+    mov [rdi+4], eax                   ; src-drawable
+    mov eax, [win_id]
+    mov [rdi+8], eax                   ; dst-drawable
+    mov eax, [gc_id]
+    mov [rdi+12], eax                  ; gc
+    mov word [rdi+16], 0               ; src-x
+    mov word [rdi+18], 0               ; src-y
+    mov word [rdi+20], 0               ; dst-x
+    mov word [rdi+22], 0               ; dst-y
+    movzx eax, word [win_width]
+    mov word [rdi+24], ax              ; width
+    movzx eax, word [win_height]
+    mov word [rdi+26], ax              ; height
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.blt_ret:
+    ret
+
 ; Render entire screen to X11
 render_screen:
     push rbx
@@ -8912,6 +9116,13 @@ render_screen:
     push r13
     push r14
     push r15
+
+    ; Set up the back-buffer (or fall back to direct-window render in
+    ; pseudo-transparency mode). After this returns:
+    ;   [draw_drawable] = pixmap (or win_id in pseudo mode)
+    ;   [draw_picture]  = back-pixmap Picture (or render_window_picture)
+    ;   [needs_blt]     = 1 if we must CopyArea at the end
+    call ensure_back_buffer
 
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
@@ -8924,7 +9135,7 @@ render_screen:
     mov byte [rdi], X11_CLEAR_AREA
     mov byte [rdi+1], 0
     mov word [rdi+2], 4
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov word [rdi+8], 0
     mov word [rdi+10], 0
@@ -8976,7 +9187,7 @@ render_screen:
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9254,7 +9465,7 @@ render_screen:
     add eax, 3
     shr eax, 2
     mov word [rdi+2], ax
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9310,7 +9521,7 @@ render_screen:
     add eax, 16 + 2 + 3
     shr eax, 2
     mov word [rdi+2], ax
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9394,7 +9605,7 @@ render_screen:
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5                   ; 3 header + 2 (one rect)
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9490,7 +9701,7 @@ render_screen:
     mov word [rdi+6], 0
     mov eax, [ttf_pen_picture]
     mov [rdi+8], eax                      ; src
-    mov eax, [render_window_picture]
+    mov eax, [draw_picture]
     mov [rdi+12], eax                     ; dst
     mov eax, [render_format_a8]
     mov [rdi+16], eax                     ; maskFormat
@@ -9560,7 +9771,7 @@ render_screen:
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5              ; 3 header + 2 (one rectangle)
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9661,7 +9872,7 @@ render_screen:
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9784,7 +9995,7 @@ render_screen:
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -9831,7 +10042,7 @@ render_screen:
     mov byte [rdi], X11_IMAGE_TEXT16
     mov byte [rdi+1], 1                     ; n = 1 char
     mov word [rdi+2], 5                     ; 4 base + 1 data word (2 bytes char + 2 bytes pad)
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [fallback_gc_id]
     mov [rdi+8], eax
@@ -9907,7 +10118,7 @@ render_screen:
     pop rax
     mov [rdi+8], eax                    ; src
     mov dword [rdi+12], 0               ; mask = None
-    mov eax, [render_window_picture]
+    mov eax, [draw_picture]
     mov [rdi+16], eax                   ; dst
     mov word [rdi+20], 0                ; src x
     mov word [rdi+22], 0                ; src y
@@ -10024,7 +10235,7 @@ render_screen:
     mov word [rdi+6], 0
     mov [rdi+8], r14d                ; src picture
     mov dword [rdi+12], 0            ; mask = None
-    mov eax, [render_window_picture]
+    mov eax, [draw_picture]
     mov [rdi+16], eax                ; dst
     mov word [rdi+20], 0             ; src x
     mov word [rdi+22], 0             ; src y
@@ -10098,7 +10309,7 @@ render_screen:
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5      ; length (3 + 2 per rect)
-    mov eax, [win_id]
+    mov eax, [draw_drawable]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -10164,6 +10375,11 @@ render_screen:
     inc dword [x11_seq]
 
 .rs_cursor_done:
+
+    ; Frame is fully painted into back_pixmap (or directly into win_id
+    ; in pseudo-mode). BLT it to the window in one shot — the user only
+    ; ever sees complete frames, no intermediate bg-fill flash.
+    call blt_back_to_window
 
     pop r15
     pop r14
