@@ -14122,6 +14122,14 @@ font_change_step:
     call ttf_compute_metrics
     call ttf_invalidate_glyph_cache
 
+    ; Force back_pixmap recreation on next render. Without this, the
+    ; previous size's glyph pixels remain in the back-buffer and bleed
+    ; through wherever the new (wider) per-run bg-fills don't cover —
+    ; visible as ghost strokes around larger letters like 'W' after
+    ; Alt+plus. Zeroing back_size_w trips ensure_back_buffer's mismatch
+    ; check, freeing + reallocating a clean pixmap.
+    mov qword [back_size_w], 0
+
     ; Tell the GC about the new font and refresh tracking.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
@@ -14494,6 +14502,9 @@ opacity_toggle_apply:
 
 section .bss
 ttf_glyph_uploaded:     resb 65536
+src_glyph_w:            resq 1          ; unclipped W from glyph engine,
+                                        ; used as output_buf row stride
+                                        ; during ttf_upload_glyph copy
 
 section .text
 
@@ -14784,7 +14795,8 @@ ttf_upload_glyph:
     jnz .skip                          ; missing/oversize → just skip
 
     ; rcx=W rdx=H r8=bearing_x r9=bearing_y r10=advance
-    mov r12, rcx                        ; W
+    mov r12, rcx                        ; W (will be clipped below)
+    mov [src_glyph_w], rcx              ; save UNCLIPPED W as output_buf row stride
     mov r13, rdx                        ; H
     mov r14, r8                         ; bearing_x (signed)
     mov r15, r9                         ; bearing_y
@@ -14843,18 +14855,15 @@ ttf_upload_glyph:
     xor r15, r15                        ; bearing_y = 0
 .not_space:
 
-    ; XRender's A8 PictFormat requires scanline stride padded to 4 bytes
-    ; (standard X11 image layout: stride = ((w*bpp + 31) >> 5) << 2;
-    ; for A8, bpp=8 → stride = (w + 3) & ~3). The earlier "tight W*H,
-    ; total padded" guess produced BadLength on RenderAddGlyphs because
-    ; the server expected stride*H bytes, not W*H. Compute the padded
-    ; stride here so each row has 0..3 zero bytes after its W real bytes.
+    ; XRender AddGlyphs: A8 bitmap data has each scanline padded to 4
+    ; bytes per the X server's PixmapBytePad(width, depth=8) →
+    ; (W+3)&~3. Total per-glyph = stride * H, where stride = (W+3)&~3.
     mov rax, r12                        ; W
     add rax, 3
     and rax, ~3
-    mov rcx, rax                        ; rcx = stride (per row, 4-aligned)
+    mov rcx, rax                        ; rcx = stride (4-aligned)
     imul rax, r13                       ; stride * H
-    mov r8, rax                         ; padded total alpha (always 4-aligned)
+    mov r8, rax                         ; padded total alpha (4-aligned)
 
     ; Total request length: 28 (fixed) + padded alpha
     mov rdx, r8
@@ -14882,31 +14891,40 @@ ttf_upload_glyph:
     mov [rdi+22], r15w                  ; y = +bearing_y
     mov [rdi+24], bp                    ; off-x = advance (low 16 bits)
     mov word [rdi+26], 0                ; off-y = 0
-    ; Alpha bytes: copy W*H bytes tightly from output_buf, then
-    ; Copy alpha from glyph engine's output_buf, row by row, padding each
-    ; row to `rcx` bytes (the 4-aligned stride). output_buf holds W*H
-    ; tight bytes, top-left origin; pad bytes are zero so the server sees
-    ; transparent extra columns past column W.
+
+    ; Copy alpha row-by-row from output_buf to tmp_buf+28.
+    ;   r12 = clipped W (bytes copied per row, also AddGlyphs declared W)
+    ;   src_glyph_w = unclipped W = source row stride in output_buf
+    ;   rcx = AddGlyphs scanline stride (4-aligned padded clipped W)
+    ; After copying r12 ink bytes, advance the source cursor over the
+    ; (src_glyph_w - r12) clipped-off bytes to reach the next source row.
+    ; Without this, we silently advance by r12 only, so each subsequent
+    ; row reads from the previous row's right-clipped column — visible
+    ; as a 1-pixel-per-row diagonal shear on every glyph wider than the
+    ; cell (DejaVu Sans Mono 'W' at sizes where ink_W > char_W).
     lea rdi, [rdi + 28]                 ; destination
     lea rax, [output_buf]               ; source row cursor
     mov r9, r13                         ; remaining rows
-    mov r11, rcx                        ; stride
-    sub r11, r12                        ; trailing-zero count per row
+    mov r11, rcx                        ; AddGlyphs stride
+    sub r11, r12                        ; trailing-zero pad bytes per row
+    mov r10, [src_glyph_w]
+    sub r10, r12                        ; source skip per row (>=0)
 .copy_row:
     test r9, r9
     jz .copy_done
     mov rdx, r12                        ; W bytes per row
 .copy_byte:
     test rdx, rdx
-    jz .copy_pad
+    jz .copy_skip_src
     mov cl, [rax]
     mov [rdi], cl
     inc rax
     inc rdi
     dec rdx
     jmp .copy_byte
-.copy_pad:
-    mov rdx, r11                        ; trailing pad
+.copy_skip_src:
+    add rax, r10                        ; skip clipped-off source bytes
+    mov rdx, r11                        ; trailing pad in destination
 .copy_pad_byte:
     test rdx, rdx
     jz .copy_row_next
