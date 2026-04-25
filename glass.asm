@@ -14837,15 +14837,38 @@ ttf_upload_glyph:
     jne .ret
     mov rbx, rdi                       ; remember cp
 
-    ; Render via engine.
+    ; Render via engine. The X server's default-glyph behaviour for a
+    ; cp the primary font doesn't have is a tiny placeholder mark —
+    ; the persistent "comma below tree-prefix" the user has been
+    ; chasing across many sessions is just U+23BF (⎿, dentistry-symbol
+    ; tree-continuation) which CC emits but DejaVu Sans Mono lacks.
+    ; If the engine reports the cp missing, retry with a visually
+    ; equivalent cp that IS in DejaVu, then store the result under the
+    ; original cp's glyph ID so CompositeGlyphs32 sees the right shape.
     mov rsi, [cfg_font_size]
     test rsi, rsi
     jnz .have_size
     mov rsi, DEFAULT_FONT_SIZE
 .have_size:
+    mov rdi, rbx                       ; original cp
     call glyph_render_to_alpha
     test eax, eax
-    jnz .skip                          ; missing/oversize → just skip
+    jz .have_glyph
+    ; Engine couldn't render — try a substitute for known CC tree chars.
+    cmp rbx, 0x23BF                    ; ⎿ → └
+    jne .try_other_subs
+    mov rdi, 0x2514
+    call glyph_render_to_alpha
+    test eax, eax
+    jz .have_glyph
+.try_other_subs:
+    cmp rbx, 0x23BC                    ; ⎼ → ─
+    jne .skip
+    mov rdi, 0x2500
+    call glyph_render_to_alpha
+    test eax, eax
+    jnz .skip
+.have_glyph:
 
     ; rcx=W rdx=H r8=bearing_x r9=bearing_y r10=advance
     mov r12, rcx                        ; W (will be clipped below)
