@@ -14850,6 +14850,41 @@ ttf_upload_glyph:
     jnz .have_size
     mov rsi, DEFAULT_FONT_SIZE
 .have_size:
+    ; Blank-class codepoints handled before the engine call: SPACE plus
+    ; NBSP and other Unicode space variants must be true zero-area
+    ; masks (otherwise spacer cells visibly speckle as `:`-shapes).
+    ; The post-engine SPACE check downstream is unreliable because
+    ; glyph_render_to_alpha can clobber rbx, so any W,H the engine
+    ; returns for these chars would slip through.
+    cmp rbx, 0x20                      ; SPACE
+    je .blank_glyph
+    cmp rbx, 0xA0                      ; NBSP (CC + bare use this as spacer)
+    je .blank_glyph
+    cmp rbx, 0x2007                    ; FIGURE SPACE
+    je .blank_glyph
+    cmp rbx, 0x2008                    ; PUNCTUATION SPACE
+    je .blank_glyph
+    cmp rbx, 0x2009                    ; THIN SPACE
+    je .blank_glyph
+    cmp rbx, 0x200A                    ; HAIR SPACE
+    je .blank_glyph
+    cmp rbx, 0x200B                    ; ZERO WIDTH SPACE
+    je .blank_glyph
+    cmp rbx, 0x202F                    ; NARROW NO-BREAK SPACE
+    je .blank_glyph
+    cmp rbx, 0x205F                    ; MEDIUM MATHEMATICAL SPACE
+    je .blank_glyph
+    cmp rbx, 0x3000                    ; IDEOGRAPHIC SPACE
+    je .blank_glyph
+    jmp .not_space_pre
+.blank_glyph:
+    xor rcx, rcx                       ; W = 0
+    xor rdx, rdx                       ; H = 0
+    xor r8, r8                         ; bearing_x = 0
+    xor r9, r9                         ; bearing_y = 0
+    movzx r10, word [char_width]       ; advance = char_width
+    jmp .have_glyph
+.not_space_pre:
     mov rdi, rbx                       ; original cp
     call glyph_render_to_alpha
     test eax, eax
