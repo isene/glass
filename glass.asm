@@ -937,7 +937,15 @@ dyn_bold_font_name_len: resq 1
 mouse_seq_buf:      resb 32
 
 ; Misc
-tmp_buf:            resb 4096
+; Sized for the worst-case TTF AddGlyphs payload: 28-byte header + a
+; stride-padded W×H alpha bitmap. The rasterizer caps single glyphs at
+; MAX_OUT_DIM=512 in the glyph engine, so the absolute upper bound is
+; 28 + 512*512 ≈ 256 KB. Anything smaller and a tall Nerd Font glyph at
+; preset font_size 28/32 (ascender + descender stack) overflowed and
+; corrupted neighbouring BSS — manifesting as a SEGV ~half a second
+; into the next render. BSS is lazy-allocated by the kernel, so the
+; reservation is free until actually touched.
+tmp_buf:            resb 262176
 num_buf:            resb 32
 key_out_buf:        resb 32
 rs_row_base:        resq 1          ; pointer to current row's cell data
