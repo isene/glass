@@ -14802,42 +14802,57 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
-    ; Trim trailing "speckle" rows: a single isolated low-alpha pixel
-    ; at the bottom of the bitmap is a hinting artifact at certain
-    ; rasterisation sizes (chevron `›` U+203A in DejaVu Sans Mono at
-    ; sizes 18..24+ emits one stray pixel below the actual glyph
-    ; shape). Without trimming, this paints as a "comma" 1-2 px below
-    ; the glyph in every CC prompt. All legitimate descender tails
-    ; (g/j/p/q/y/comma/period/apostrophe) have ≥2 ink pixels in their
-    ; last row, so dropping rows with ≤1 non-zero pixel doesn't damage
-    ; them.
+    ; Trim trailing "speckle" rows from the bottom of the bitmap.
+    ; Two artifact patterns from unhinted rasterisation of `›` U+203A in
+    ; DejaVu Sans Mono show up as the persistent "comma" 1-2 px below
+    ; the chevron in every CC prompt the user has reported:
+    ;   (1) sizes 18..22 — one isolated low-alpha pixel.
+    ;   (2) sizes 23..32 — two pixels at the LEFT and RIGHT edges of
+    ;       the row (diagonal-stroke tails extending below the body),
+    ;       with a wide gap of zeros between them.
+    ; Heuristic: drop trailing rows where ink_count ≤ 1, OR where
+    ; ink_count == 2 AND the two inked columns are ≥3 apart. Real
+    ; descender tails and punctuation (g/j/p/q/y/, /. /' /") have ink
+    ; pixels clustered (spread ≤ 1) so this leaves them intact.
 .trim_speckle:
     test r13, r13
     jz .trim_done                       ; H=0, nothing to trim
-    ; Compute (H-1) * src_glyph_w → start of last row in output_buf
     mov rax, r13
     dec rax
     imul rax, [src_glyph_w]
-    lea rsi, [output_buf + rax]
-    mov rcx, [src_glyph_w]              ; row width (unclipped W)
-    test rcx, rcx
+    lea rsi, [output_buf + rax]         ; rsi → first byte of last row
+    mov rdi, [src_glyph_w]              ; row width
+    test rdi, rdi
     jz .trim_done
-    xor edx, edx                        ; non-zero pixel count
+    xor edx, edx                        ; ink count
+    mov r8, -1                          ; first inked column (-1 = none)
+    mov r9, -1                          ; last inked column
+    xor ecx, ecx                        ; column index
 .trim_scan:
-    test rcx, rcx
-    jz .trim_decide
-    movzx eax, byte [rsi]
+    cmp rcx, rdi
+    jge .trim_decide
+    movzx eax, byte [rsi + rcx]
     test al, al
     jz .trim_next
     inc edx
-    cmp edx, 2
-    jge .trim_done                      ; ≥2 ink pixels: legitimate row
+    cmp r8, -1
+    jne .trim_set_last
+    mov r8, rcx                         ; first ink col
+.trim_set_last:
+    mov r9, rcx                         ; last ink col (always update)
 .trim_next:
-    inc rsi
-    dec rcx
+    inc rcx
     jmp .trim_scan
 .trim_decide:
-    ; Row had 0 or 1 ink pixels — drop it and check the next row up.
+    cmp rdx, 1
+    jle .trim_drop                      ; 0 or 1 ink → drop
+    cmp rdx, 2
+    jne .trim_done                      ; 3+ ink pixels → legitimate row
+    mov rax, r9
+    sub rax, r8                         ; spread = last - first
+    cmp rax, 3
+    jl .trim_done                       ; spread ≤ 2 → clustered, keep
+.trim_drop:
     dec r13
     jmp .trim_speckle
 .trim_done:
