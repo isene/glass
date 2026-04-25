@@ -14924,28 +14924,20 @@ ttf_upload_glyph:
     xor r14, r14
 .no_left_clamp:
 
-    ; Clip W to cell width so glyph bitmaps can't overhang into the next
-    ; cell on the right. Many fonts (DejaVu Sans Mono, Ubuntu Mono…)
-    ; make glyph bitmaps slightly wider than the monospace advance — e.g.
-    ; 'A' at size 16 is 10 px wide while char_width is also 10, but with
-    ; bearing ~1 the bitmap right edge lands at cell+1, leaking a
-    ; 1-pixel column into the next cell. The run's bg-fill happened
-    ; BEFORE the batched composite, so that leak never gets cleared.
-    ; Clipping (char_width - bearing_x) drops the rightmost overhang
-    ; column(s) before AddGlyphs caches the glyph.
-    movzx eax, word [char_width]
-    test eax, eax
-    jz .skip_clip                       ; metrics not ready, leave W as is
-    sub rax, r14                        ; available = char_width - bearing_x
-    jle .clip_to_zero                   ; bearing_x >= char_width
-    cmp r12, rax
-    jle .skip_clip
-    mov r12, rax                        ; clip W to available
-    jmp .skip_clip
-.clip_to_zero:
-    xor r12, r12                        ; whole bitmap is past cell; suppress
-    xor r13, r13
-.skip_clip:
+    ; W clipping intentionally disabled. The previous heuristic
+    ; clipped W to (char_width - bearing_x), but for centered
+    ; box-drawing glyphs (U+2500..U+259F) the bitmap is positioned at
+    ; bearing_x ≈ char_width/2 with W ≈ char_width/2 so it spans
+    ; exactly to the right cell edge — and any small font-metric
+    ; rounding pushed (bearing_x + W) past char_width by 1-2 px,
+    ; tripping the clip and dropping the entire horizontal-stroke
+    ; portion of glyphs like `└` `┘` `┐` `┌`. Result: tree-drawing
+    ; chars in CC scrollback rendered as a tiny vertical mark instead
+    ; of the full corner. Skip the clip and let any 1-2 px right-edge
+    ; overflow paint into the neighbouring cell — when that cell is
+    ; later painted, its bg-fill in the same run clears the overflow,
+    ; and across runs the user's prior screenshots show no visible
+    ; bleed.
 
     ; SPACE (0x20) is the most-rendered "glyph" in any terminal, and
     ; for some fonts (e.g. DejaVu Sans Mono) the rasterizer returns a
