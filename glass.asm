@@ -9348,6 +9348,142 @@ render_screen:
 .rs_no_bell:
     ; Skip ClearArea - cells fully cover the grid area via ImageText16
     ; backgrounds. ClearArea was causing flicker during selection drag.
+    ;
+    ; However: ImageText16 only paints the grid_cols×grid_rows cell
+    ; area, not the right/bottom margins (win_width may be > grid_cols
+    ; * char_width by up to char_width-1 px). Those margins keep
+    ; whatever was drawn there last. After alt-screen exit (vim,
+    ; less, …) where the alt-screen bg differed from the main bg,
+    ; the margins retain the alt-screen bg colour and look like a
+    ; stray border. Only repaint them on full-redraw events
+    ; (all_dirty=1) so the steady-state cost stays zero.
+    cmp qword [all_dirty], 1
+    jne .rs_after_clear
+    ; Right margin: x = grid_cols * char_width, y = 0,
+    ;               w = win_width - x, h = win_height
+    movzx eax, word [char_width]
+    mov rcx, [grid_cols]
+    imul rcx, rax                          ; rcx = grid_cols * char_width
+    mov eax, [win_width]
+    sub eax, ecx
+    jbe .rs_margin_bottom                  ; no right margin
+    push rcx
+    push rax
+    ; Set GC fg to default bg pixel.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    cmp byte [cfg_bg_set], 1
+    jne .rs_margin_use_black
+    mov eax, [cfg_bg_pixel]
+    jmp .rs_margin_have_pix
+.rs_margin_use_black:
+    xor eax, eax
+.rs_margin_have_pix:
+    cmp dword [x11_argb_colormap], 0
+    je .rs_margin_no_alpha
+    or eax, 0xFF000000
+.rs_margin_no_alpha:
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rax                                ; right-margin width
+    pop rcx                                ; grid pixel width (x origin)
+    ; PolyFillRectangle: right strip
+    push rax
+    push rcx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov edx, [draw_drawable]
+    mov [rdi+4], edx
+    mov edx, [gc_id]
+    mov [rdi+8], edx
+    mov word [rdi+12], cx                  ; x = grid_cols * char_width
+    mov word [rdi+14], 0                   ; y = 0
+    mov word [rdi+16], ax                  ; w = win_width - x
+    mov edx, [win_height]
+    mov word [rdi+18], dx                  ; h = win_height
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rcx
+    pop rax
+.rs_margin_bottom:
+    ; Bottom margin: x = 0, y = grid_rows * char_height,
+    ;                w = grid_cols * char_width, h = win_height - y
+    ; (Only the strip under the cell area; the bottom-right corner
+    ; was already covered by the right strip above when present.)
+    movzx eax, word [char_height]
+    mov rcx, [grid_rows]
+    imul rcx, rax                          ; rcx = grid_rows * char_height
+    mov eax, [win_height]
+    sub eax, ecx
+    jbe .rs_after_clear                    ; no bottom margin
+    push rcx
+    push rax
+    ; (GC fg is already set from the right-margin path; if the right
+    ; strip was skipped, set it now.)
+    movzx edx, word [char_width]
+    mov rsi, [grid_cols]
+    imul rsi, rdx                          ; rsi = grid pixel width
+    cmp dword [win_width], esi
+    ja .rs_margin_bot_have_gc              ; right strip already set GC
+    ; Set GC fg to default bg pixel.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    cmp byte [cfg_bg_set], 1
+    jne .rs_margin_bot_black
+    mov eax, [cfg_bg_pixel]
+    jmp .rs_margin_bot_have_pix
+.rs_margin_bot_black:
+    xor eax, eax
+.rs_margin_bot_have_pix:
+    cmp dword [x11_argb_colormap], 0
+    je .rs_margin_bot_no_alpha
+    or eax, 0xFF000000
+.rs_margin_bot_no_alpha:
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_margin_bot_have_gc:
+    pop rax                                ; bottom-margin height
+    pop rcx                                ; grid pixel height (y origin)
+    ; PolyFillRectangle: bottom strip (under the cells only)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov edx, [draw_drawable]
+    mov [rdi+4], edx
+    mov edx, [gc_id]
+    mov [rdi+8], edx
+    mov word [rdi+12], 0                   ; x = 0
+    mov word [rdi+14], cx                  ; y = grid_rows * char_height
+    movzx edx, word [char_width]
+    mov rsi, [grid_cols]
+    imul rsi, rdx
+    mov word [rdi+16], si                  ; w = grid pixel width
+    mov word [rdi+18], ax                  ; h = win_height - y
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
 .rs_after_clear:
 
     ; Draw each row with per-color-run rendering
