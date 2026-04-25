@@ -13807,6 +13807,13 @@ font_change_step:
     call x11_open_font
     call x11_query_font
 
+    ; TTF path: re-derive char_width/height/font_ascent at the new size
+    ; AND drop the cached glyphs so subsequent renders re-upload at the
+    ; new size. Without these, cells widen but glyphs keep their old
+    ; bearings/advances → tiny glyphs rattling around in oversized cells.
+    call ttf_compute_metrics
+    call ttf_invalidate_glyph_cache
+
     ; Tell the GC about the new font and refresh tracking.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
@@ -14256,6 +14263,72 @@ ttf_xrender_init:
     mov dword [ttf_pen_color], 0xFFFFFFFE  ; force first set_pen_color
     call x11_flush
 .skip:
+    ret
+
+; ---------------------------------------------------------------------
+; ttf_invalidate_glyph_cache — drop every cached glyph and recreate the
+; GlyphSet so subsequent renders re-upload at the current size. Called
+; from font_change_step (Alt+plus / Alt+minus / Alt+_): without it,
+; cached glyphs keep their old size's bearings/advances, so on a size
+; bump the cells widen but the glyphs render at the previous (smaller)
+; size with the previous (smaller) advance — text appears as small
+; glyphs floating at the start of huge cells.
+;
+; Tactic: FreeGlyphSet old XID, alloc new XID, CreateGlyphSet new XID,
+; zero the per-cp uploaded flags. The pen pixmap/picture survive — only
+; the glyphset (which holds the rasterised alpha masks) needs replacing.
+;
+; No-op when ttf_active = 0.
+ttf_invalidate_glyph_cache:
+    cmp qword [ttf_active], 0
+    je .tigc_ret
+    cmp dword [render_major], 0
+    je .tigc_ret
+
+    ; FreeGlyphSet old.
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_FREE_GLYPH_SET
+    mov word [rdi+2], 2
+    mov eax, [ttf_glyphset]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Allocate new XID and CreateGlyphSet (same a8 format).
+    call alloc_xid
+    mov [ttf_glyphset], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_GLYPH_SET
+    mov word [rdi+2], 3
+    mov eax, [ttf_glyphset]
+    mov [rdi+4], eax
+    mov eax, [render_format_a8]
+    mov [rdi+8], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Zero the per-cp uploaded bitmap so subsequent ttf_upload_glyph
+    ; calls actually upload again. 65536 bytes via rep stosq.
+    push rdi
+    push rcx
+    push rax
+    lea rdi, [ttf_glyph_uploaded]
+    mov ecx, 65536 / 8
+    xor eax, eax
+    rep stosq
+    pop rax
+    pop rcx
+    pop rdi
+
+.tigc_ret:
     ret
 
 ; ---------------------------------------------------------------------
