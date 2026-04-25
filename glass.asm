@@ -14790,17 +14790,29 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
-    ; Clip W to cell width so glyph bitmaps can't overhang into adjacent
-    ; cells. Many fonts (DejaVu Sans Mono, Ubuntu Mono…) make glyph
-    ; bitmaps slightly wider than the monospace advance — e.g. 'A' at
-    ; size 16 is 10 px wide while char_width is also 10, but with bearing
-    ; ~1 the bitmap right edge lands at cell+1, leaking a 1-pixel column
-    ; into the next cell. Because the run's bg-fill happened BEFORE the
-    ; batched composite, that leaked column never gets cleared and shows
-    ; up as a stray "comma"-like pixel after every render. Clipping the
-    ; bitmap to (char_width - bearing_x) drops the rightmost overhang
-    ; column(s) before AddGlyphs caches the glyph — small visual
-    ; truncation, no stray pixels.
+    ; Clamp bearing_x to >= 0 so the glyph bitmap can't extend left of
+    ; the cell origin into the previous cell. Some glyphs (italics,
+    ; certain glyphs in Nerd / DejaVu) have a small negative LSB so the
+    ; ink reaches just past the pen. The previous cell was already
+    ; bg-filled and composited before this glyph runs, so any leftward
+    ; bleed persists — visible as the recurring stray pixel ("comma")
+    ; the user reported in CC scrollback. Forcing bearing_x to 0
+    ; visually nudges the glyph right by |bearing_x| (1-2 px max in
+    ; practice, often invisible).
+    test r14, r14
+    jns .no_left_clamp
+    xor r14, r14
+.no_left_clamp:
+
+    ; Clip W to cell width so glyph bitmaps can't overhang into the next
+    ; cell on the right. Many fonts (DejaVu Sans Mono, Ubuntu Mono…)
+    ; make glyph bitmaps slightly wider than the monospace advance — e.g.
+    ; 'A' at size 16 is 10 px wide while char_width is also 10, but with
+    ; bearing ~1 the bitmap right edge lands at cell+1, leaking a
+    ; 1-pixel column into the next cell. The run's bg-fill happened
+    ; BEFORE the batched composite, so that leak never gets cleared.
+    ; Clipping (char_width - bearing_x) drops the rightmost overhang
+    ; column(s) before AddGlyphs caches the glyph.
     movzx eax, word [char_width]
     test eax, eax
     jz .skip_clip                       ; metrics not ready, leave W as is
