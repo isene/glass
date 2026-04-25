@@ -2,11 +2,14 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.8-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~75KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, 58KB.
+Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
-No toolkit, no rendering library, no font engine. Just your keystrokes, the X11 server, and the kernel.
+No toolkit, no rendering library, no external font engine. The TTF
+rasterizer ([glyph](https://github.com/isene/glyph)) is embedded
+in-binary via `%include`. Just your keystrokes, the X11 server, and
+the kernel.
 
 Part of the **CHasm** (CHange to ASM) suite: [bare](https://github.com/isene/bare) (shell), [show](https://github.com/isene/show) (file viewer), glass (terminal emulator).
 
@@ -108,7 +111,14 @@ a configured `opacity`, none of this code runs.
 ### Rendering
 - X11 wire protocol over Unix domain socket (no Xlib/XCB)
 - Xauthority cookie authentication (MIT-MAGIC-COOKIE-1)
-- Unicode BMP rendering via ImageText16 with iso10646-1 font
+- **Embedded pure-asm TTF rasterizer** (the `glyph` engine, included
+  via `%include`): 4×4 supersampling, gamma LUT for stem darkening,
+  XRender CompositeGlyphs32 with batched per-run uploads. Falls back
+  to bitmap iso10646-1 X core font when no `font_path` is set.
+- Codepoint substitution table for codepoints DejaVu Sans Mono lacks
+  (e.g. CC's tree-prefix `⎿` → `└`, tool-call `⏵` → `▶`); blank-class
+  codepoints (SPACE, NBSP, U+2007..U+200B etc.) upload as zero-area
+  glyphs to avoid the X server's default-glyph placeholder
 - UTF-8 decoding state machine (2/3/4-byte sequences)
 - Per-color-run rendering (each color segment drawn separately)
 - 256-color palette with truecolor (24-bit) SGR mapping
@@ -117,6 +127,8 @@ a configured `opacity`, none of this code runs.
 - Visual selection rendering (inverted cells during drag)
 - Visual bell on BEL (0x07)
 - No-flicker rendering (omits ClearArea since cells fully repaint)
+- Back-buffer pixmap cleared on resize/init so the bottom strip
+  (window_height % char_height) doesn't show uninitialised pixels
 
 ### Terminal Emulation
 - VT100/xterm escape sequence parser
@@ -144,7 +156,12 @@ a configured `opacity`, none of this code runs.
 - Ctrl+D properly exits glass when bare exits (POLLHUP detection)
 
 ### Interaction
-- Scrollback buffer (1000 lines, Shift+PageUp/Down)
+- Scrollback buffer (1000 lines, Shift+PageUp/Down) — captures rows
+  that scroll off the top of a scroll region too, so session history
+  printed by tools like `claude --resume` is scrollable from inside
+  the alt-screen TUI prompt
+- Cursor is hidden while viewing scrollback (prevents stray cursor
+  block at the bottom of the historical view)
 - Text selection (click and drag, visible inverted highlight)
 - Double-click to select word (alnum + `_-./~+@:%=`)
 - Triple-click to select whole line
@@ -234,7 +251,8 @@ empty value disables the binding.
 - [x] True emoji rendering (XRender extension + bundled cache)
 - [x] Opacity/transparency (compositor + wallpaper sampling fallback)
 - [x] Configurable key bindings (the five Alt-key shortcuts)
-- [ ] Pure-asm TTF parser/rasterizer (the bonkers route — kitty-grade fonts without breaking pure-asm/zero-deps)
+- [x] Pure-asm TTF parser/rasterizer (the [glyph](https://github.com/isene/glyph) engine, embedded via `%include` — 4×4 SS + gamma LUT)
+- [ ] Variable-font TTFs (gvar code path SEGVs in library mode; static TTFs work — see `CONFIG-FUTURE.md`)
 - [ ] Tab/split support (multiple PTYs)
 - [ ] Font ligatures
 - [ ] Image display via kitty graphics protocol (APC `ESC _G ... ESC \`) — rasters now silently consumed
