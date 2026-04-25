@@ -14802,6 +14802,46 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
+    ; Trim trailing "speckle" rows: a single isolated low-alpha pixel
+    ; at the bottom of the bitmap is a hinting artifact at certain
+    ; rasterisation sizes (chevron `›` U+203A in DejaVu Sans Mono at
+    ; sizes 18..24+ emits one stray pixel below the actual glyph
+    ; shape). Without trimming, this paints as a "comma" 1-2 px below
+    ; the glyph in every CC prompt. All legitimate descender tails
+    ; (g/j/p/q/y/comma/period/apostrophe) have ≥2 ink pixels in their
+    ; last row, so dropping rows with ≤1 non-zero pixel doesn't damage
+    ; them.
+.trim_speckle:
+    test r13, r13
+    jz .trim_done                       ; H=0, nothing to trim
+    ; Compute (H-1) * src_glyph_w → start of last row in output_buf
+    mov rax, r13
+    dec rax
+    imul rax, [src_glyph_w]
+    lea rsi, [output_buf + rax]
+    mov rcx, [src_glyph_w]              ; row width (unclipped W)
+    test rcx, rcx
+    jz .trim_done
+    xor edx, edx                        ; non-zero pixel count
+.trim_scan:
+    test rcx, rcx
+    jz .trim_decide
+    movzx eax, byte [rsi]
+    test al, al
+    jz .trim_next
+    inc edx
+    cmp edx, 2
+    jge .trim_done                      ; ≥2 ink pixels: legitimate row
+.trim_next:
+    inc rsi
+    dec rcx
+    jmp .trim_scan
+.trim_decide:
+    ; Row had 0 or 1 ink pixels — drop it and check the next row up.
+    dec r13
+    jmp .trim_speckle
+.trim_done:
+
     ; Clamp bearing_x to >= 0 so the glyph bitmap can't extend left of
     ; the cell origin into the previous cell. Some glyphs (italics,
     ; certain glyphs in Nerd / DejaVu) have a small negative LSB so the
