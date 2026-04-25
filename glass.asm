@@ -457,7 +457,7 @@ font_32_bold_len equ $ - font_32_bold - 1
 ; Ordered preset table for Alt+plus / Alt+minus stepping.
 font_size_presets: dq 10, 13, 15, 18, 20, 22, 24, 28, 32
 FONT_SIZE_PRESET_COUNT equ 9
-DEFAULT_FONT_SIZE equ 13         ; fallback when no font_size in .glassrc
+DEFAULT_FONT_SIZE equ 15         ; fallback when no font_size in .glassrc (one preset step up from 13)
 
 ; Fallback font: covers the entire Unicode BMP (16x16 PCF from
 ; xfonts-unifont). Used per-cell when the primary font lacks the
@@ -479,9 +479,6 @@ shell_name:     db "bare", 0
 shell_flag:     db "-l", 0
 term_env:       db "TERM=xterm-kitty", 0
 colorterm_env:  db "COLORTERM=truecolor", 0
-hkp_dbg_path:   db "/tmp/glass_keys.log", 0
-hkp_paste_marker: db "*** PASTE HANDLER REACHED ***", 10
-hkp_paste_marker_len equ $ - hkp_paste_marker
 
 ; Error messages
 err_x11:        db "glass: cannot connect to X11", 10
@@ -747,7 +744,6 @@ char_height:        resw 1
 keysym_map:         resd 2048       ; 256 keycodes × 8 keysyms each
 keysyms_per_kc:     resd 1
 hkp_unshifted_ksym: resd 1          ; saved unshifted keysym for special checks
-hkp_dbg_buf:        resb 64         ; debug buffer for keypress log
 
 ; Scrollback
 scroll_buf:         resb MAX_COLS * 1000 * CELL_SIZE  ; 1000 lines
@@ -4406,7 +4402,7 @@ pty_fork:
     syscall
 
 .ptf_default_shell:
-    ; Find shell in PATH
+    ; Try /usr/local/bin/bare first (user-installed bare), then /bin/sh.
     sub rsp, 32
     lea rax, [.ptf_shell1]
     mov [rsp], rax
@@ -4418,16 +4414,8 @@ pty_fork:
     lea rdx, [child_envp]
     mov rax, SYS_EXECVE
     syscall
-    ; Try fallback
-    lea rax, [.ptf_shell2]
-    mov [rsp], rax
-    mov rdi, [rsp]
-    mov rsi, rsp
-    lea rdx, [child_envp]
-    mov rax, SYS_EXECVE
-    syscall
     ; Last resort: /bin/sh
-    lea rax, [.ptf_shell3]
+    lea rax, [.ptf_shell2]
     mov [rsp], rax
     mov qword [rsp+8], 0
     mov rdi, [rsp]
@@ -4441,9 +4429,8 @@ pty_fork:
     mov rax, SYS_EXIT
     syscall
 
-.ptf_shell1: db "/home/geir/bin/bare", 0
-.ptf_shell2: db "/usr/local/bin/bare", 0
-.ptf_shell3: db "/bin/sh", 0
+.ptf_shell1: db "/usr/local/bin/bare", 0
+.ptf_shell2: db "/bin/sh", 0
 
 .ptf_fail:
     mov rax, -1
@@ -5995,23 +5982,16 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_pgup:
-    ; Shift+PageUp = scroll glass's main-screen scrollback view.
-    ; But when an alt-screen TUI is active (CC, vim, less, htop) there
-    ; is no main-screen scrollback to view — the app owns the screen
-    ; and may have its own scrollback. Forward the keypress as the
-    ; xterm-style modified sequence so the app sees Shift+PgUp.
+    ; Shift+PageUp = scroll glass's main-screen scrollback view, ALWAYS
+    ; — even when an alt-screen TUI is active. This matches kitty: any
+    ; main-screen content (like CC --resume printing session history
+    ; before entering alt-screen) stays scrollable from inside the TUI.
+    ; The previous "forward to app on alt screen" behaviour produced
+    ; no-ops because the relevant TUIs (CC, weechat, vim) don't bind
+    ; ESC[5;2~ to scroll their own buffer.
     test ebx, 1
     jz .hkp_pgup_normal
-    cmp qword [alt_screen_active], 0
-    je .hkp_scroll_back
-    mov byte [key_out_buf], 0x1B
-    mov byte [key_out_buf+1], '['
-    mov byte [key_out_buf+2], '5'
-    mov byte [key_out_buf+3], ';'
-    mov byte [key_out_buf+4], '2'
-    mov byte [key_out_buf+5], '~'
-    mov rdx, 6
-    jmp .hkp_send_seq
+    jmp .hkp_scroll_back
 .hkp_pgup_normal:
     mov byte [key_out_buf], 0x1B
     mov byte [key_out_buf+1], '['
@@ -6021,20 +6001,10 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_pgdn:
-    ; Same Shift+PgDn handling as PgUp above: glass scroll-forward on
-    ; main screen, forward to app on alt screen.
+    ; Same as PgUp above: always scroll glass's own buffer on Shift+PgDn.
     test ebx, 1
     jz .hkp_pgdn_normal
-    cmp qword [alt_screen_active], 0
-    je .hkp_scroll_fwd
-    mov byte [key_out_buf], 0x1B
-    mov byte [key_out_buf+1], '['
-    mov byte [key_out_buf+2], '6'
-    mov byte [key_out_buf+3], ';'
-    mov byte [key_out_buf+4], '2'
-    mov byte [key_out_buf+5], '~'
-    mov rdx, 6
-    jmp .hkp_send_seq
+    jmp .hkp_scroll_fwd
 .hkp_pgdn_normal:
     mov byte [key_out_buf], 0x1B
     mov byte [key_out_buf+1], '['
@@ -8217,6 +8187,76 @@ grid_scroll_region_up:
     ; No scroll region set, use full grid
     jmp grid_scroll_up.gsu_entry
 .gsru_have_region:
+    ; If the region's TOP is row 0, content scrolling off the region
+    ; top is genuinely leaving the visible viewport — save it to
+    ; scrollback so Shift+PgUp can find it. (CC's --resume prints
+    ; session history into a top-anchored scroll region while keeping
+    ; an input/status row fixed at the bottom; without this save no
+    ; line ever enters scrollback during a CC session.)
+    test r12, r12
+    jnz .gsru_no_scrollback_save
+    push r12
+    push r13
+    push rbp
+    mov rbp, [scroll_write_pos]
+    imul rbp, MAX_COLS * CELL_SIZE
+    xor ecx, ecx
+    mov rdx, [grid_cols]
+.gsru_save:
+    cmp rcx, rdx
+    jge .gsru_save_done
+    mov rax, rcx
+    imul rax, CELL_SIZE             ; src offset (grid row 0)
+    mov rbx, rcx
+    imul rbx, CELL_SIZE
+    add rbx, rbp                    ; dst offset
+    mov r8, [grid + rax]
+    mov [scroll_buf + rbx], r8
+    mov r8, [grid + rax + 8]
+    mov [scroll_buf + rbx + 8], r8
+    inc rcx
+    jmp .gsru_save
+.gsru_save_done:
+    mov rdx, [grid_cols]
+.gsru_save_pad:
+    cmp rdx, MAX_COLS
+    jge .gsru_save_advance
+    mov rbx, rdx
+    imul rbx, CELL_SIZE
+    add rbx, rbp
+    mov qword [scroll_buf + rbx], DEFAULT_CELL_LO
+    mov qword [scroll_buf + rbx + 8], 0
+    inc rdx
+    jmp .gsru_save_pad
+.gsru_save_advance:
+    mov rax, [scroll_write_pos]
+    inc rax
+    cmp rax, 1000
+    jl .gsru_no_wrap
+    xor eax, eax
+.gsru_no_wrap:
+    mov [scroll_write_pos], rax
+    mov rax, [scroll_lines]
+    cmp rax, 1000
+    jge .gsru_lines_ok
+    inc rax
+    mov [scroll_lines], rax
+.gsru_lines_ok:
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .gsru_offset_done
+    inc rax
+    mov rcx, [scroll_lines]
+    cmp rax, rcx
+    jle .gsru_offset_set
+    mov rax, rcx
+.gsru_offset_set:
+    mov [scroll_offset], rax
+.gsru_offset_done:
+    pop rbp
+    pop r13
+    pop r12
+.gsru_no_scrollback_save:
     ; Move rows scroll_top+1..scroll_bottom to scroll_top..scroll_bottom-1
     mov rbx, r12
     imul rbx, MAX_COLS
@@ -10320,6 +10360,13 @@ render_screen:
 .rs_imgs_done:
 
 .rs_cursor:
+    ; Skip cursor when viewing scrollback — the live cursor position
+    ; refers to the bottom of the live grid, not the historical view,
+    ; so painting it on top of scrollback rows is misleading and (with
+    ; a coloured cursor) leaves a stray block at the bottom of the
+    ; scrollback view.
+    cmp qword [scroll_offset], 0
+    jne .rs_cursor_done
     ; Skip cursor drawing if cursor_visible == 0
     cmp qword [cursor_visible], 0
     je .rs_cursor_done
@@ -12203,36 +12250,6 @@ itoa:
     pop rbx
     ret
 
-
-; hkp_dbg_itoa: rax = number, rdi = output (advances rdi).
-; Preserves all registers except rax, rdi, rdx.
-hkp_dbg_itoa:
-    push rbx
-    push rcx
-    push r8
-    mov rbx, rdi
-    xor ecx, ecx
-    mov r8, 10
-.hi_div:
-    xor edx, edx
-    div r8
-    add dl, '0'
-    push rdx
-    inc ecx
-    test rax, rax
-    jnz .hi_div
-    xor eax, eax
-.hi_pop:
-    pop rdx
-    mov [rbx + rax], dl
-    inc eax
-    dec ecx
-    jnz .hi_pop
-    add rdi, rax
-    pop r8
-    pop rcx
-    pop rbx
-    ret
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Mouse SGR reporting
@@ -14810,6 +14827,9 @@ ttf_compute_metrics:
     mov [font_descent], ax
 
     ; ----- cell height = ascent + |descent| -----
+    ; No extra leading: box-drawing glyphs (│ ─ etc.) are sized to span
+    ; exactly ascent+descent so consecutive cells form unbroken lines.
+    ; Adding leading leaves visible gaps between vertical bars.
     add rbx, rax
     mov [char_height], bx
 
