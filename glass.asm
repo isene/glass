@@ -14574,6 +14574,31 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
+    ; Clip W to cell width so glyph bitmaps can't overhang into adjacent
+    ; cells. Many fonts (DejaVu Sans Mono, Ubuntu Mono…) make glyph
+    ; bitmaps slightly wider than the monospace advance — e.g. 'A' at
+    ; size 16 is 10 px wide while char_width is also 10, but with bearing
+    ; ~1 the bitmap right edge lands at cell+1, leaking a 1-pixel column
+    ; into the next cell. Because the run's bg-fill happened BEFORE the
+    ; batched composite, that leaked column never gets cleared and shows
+    ; up as a stray "comma"-like pixel after every render. Clipping the
+    ; bitmap to (char_width - bearing_x) drops the rightmost overhang
+    ; column(s) before AddGlyphs caches the glyph — small visual
+    ; truncation, no stray pixels.
+    movzx eax, word [char_width]
+    test eax, eax
+    jz .skip_clip                       ; metrics not ready, leave W as is
+    sub rax, r14                        ; available = char_width - bearing_x
+    jle .clip_to_zero                   ; bearing_x >= char_width
+    cmp r12, rax
+    jle .skip_clip
+    mov r12, rax                        ; clip W to available
+    jmp .skip_clip
+.clip_to_zero:
+    xor r12, r12                        ; whole bitmap is past cell; suppress
+    xor r13, r13
+.skip_clip:
+
     ; SPACE (0x20) is the most-rendered "glyph" in any terminal, and
     ; for some fonts (e.g. DejaVu Sans Mono) the rasterizer returns a
     ; 1×1 alpha=0 bitmap rather than a true 0×0 empty. Some XRender
