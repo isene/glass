@@ -9055,6 +9055,34 @@ ensure_back_buffer:
     call x11_buffer
     inc dword [x11_seq]
 
+    ; X11 spec: a freshly-created pixmap has UNDEFINED contents. Without
+    ; an explicit clear, any pixels outside the grid render area —
+    ; specifically the (win_height mod char_height) px strip at the
+    ; bottom of the window — show whatever bytes happened to be in the
+    ; server's pixmap memory. blt_back_to_window CopyArea's the FULL
+    ; pixmap to the window, so those garbage bytes become visible as
+    ; the faint "border + spike" pattern at the very bottom of glass on
+    ; first paint. Fill the new pixmap with cfg_bg_pixel so the
+    ; remainder strip starts in the configured background colour.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5                 ; 3 header + 2 (one rect)
+    mov eax, [back_pixmap]
+    mov [rdi+4], eax                    ; drawable
+    mov eax, [gc_bg_id]
+    mov [rdi+8], eax                    ; gc (fg = cfg_bg_pixel)
+    mov word [rdi+12], 0                ; x
+    mov word [rdi+14], 0                ; y
+    movzx eax, word [win_width]
+    mov word [rdi+16], ax               ; w
+    movzx eax, word [win_height]
+    mov word [rdi+18], ax               ; h
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+
     ; CreatePicture wrapping the pixmap (use same PictFormat as window).
     cmp dword [render_major], 0
     je .ebb_no_picture                  ; XRender unavailable
