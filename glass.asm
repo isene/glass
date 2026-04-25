@@ -14894,6 +14894,34 @@ ttf_upload_glyph:
     xor r13, r13
 .skip_clip:
 
+    ; Clip H to (char_height + bearing_y - ascent) so the glyph bitmap
+    ; can't extend below this cell into the row underneath. The glyph
+    ; occupies pixel rows [baseline-bearing_y .. baseline-bearing_y+H);
+    ; the cell extends from (baseline-ascent) to (baseline-ascent+char_height),
+    ; so glyph_bottom must be ≤ cell_bottom, i.e.
+    ;   baseline - bearing_y + H ≤ baseline + char_height - ascent
+    ;   H ≤ char_height - ascent + bearing_y
+    ; Without this clip, certain glyphs (italic descenders, accented
+    ; lowercase, rasterisation artefacts) write 1-2 px into the row
+    ; below. Each cell's bg-fill ran BEFORE the batched composite, so
+    ; those stray rows persist in the back-buffer as "ghost ink" until
+    ; something redraws every pixel of that row — visible as the
+    ; recurring "comma" 1-2 px below previously-rendered chevrons.
+    movzx eax, word [char_height]
+    test eax, eax
+    jz .skip_h_clip                     ; metrics not ready, leave H as is
+    movzx ecx, word [font_ascent]
+    sub eax, ecx                        ; eax = char_height - ascent (descent)
+    add rax, r15                        ; eax += bearing_y
+    js .h_clip_zero                     ; descent + bearing_y < 0 → no room
+    cmp r13, rax
+    jle .skip_h_clip
+    mov r13, rax                        ; clip H to available
+    jmp .skip_h_clip
+.h_clip_zero:
+    xor r13, r13                        ; suppress: whole bitmap past cell
+.skip_h_clip:
+
     ; SPACE (0x20) is the most-rendered "glyph" in any terminal, and
     ; for some fonts (e.g. DejaVu Sans Mono) the rasterizer returns a
     ; 1×1 alpha=0 bitmap rather than a true 0×0 empty. Some XRender
