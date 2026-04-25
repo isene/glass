@@ -1126,6 +1126,11 @@ _start:
     ; Query font metrics
     call x11_query_font
 
+    ; If a TTF was loaded, override the X core font's char_width /
+    ; char_height / font_ascent with the TTF's own metrics so the cell
+    ; geometry matches the rasterised glyphs (no descender clipping).
+    call ttf_compute_metrics
+
     ; (Fallback font init disabled until rewritten — earlier version
     ; left undrained QueryFont reply bytes in the X socket which
     ; corrupted the InternAtom replies in x11_set_wm_hints, breaking
@@ -4572,7 +4577,7 @@ handle_x11_events:
     and eax, 0x7F
 
     cmp al, 0                ; error
-    je .hxe_skip
+    je .hxe_x11_error
 
     cmp al, EV_KEY_PRESS
     je .hxe_key_press
@@ -4592,6 +4597,152 @@ handle_x11_events:
     je .hxe_sel_request
     cmp al, EV_SELECTION_NOTIFY
     je .hxe_sel_notify
+
+.hxe_x11_error:
+    ; X11 error event (32 bytes):
+    ;   1: code, 2..3: seq, 4..7: bad rid, 8..9: minor, 10: major
+    ; Dump to stderr so silent server-side rejection of TTF / XRender
+    ; requests is at least visible. Keep one line; format:
+    ;   "glass: x11 err code=N seq=N major=N minor=N rid=0xN\n"
+    push rbx
+    push r12
+    movzx r12d, byte [x11_buf + rbx + 1]            ; code
+    push r12
+    movzx r12d, word [x11_buf + rbx + 2]            ; seq
+    push r12
+    movzx r12d, byte [x11_buf + rbx + 10]           ; major
+    push r12
+    movzx r12d, word [x11_buf + rbx + 8]            ; minor
+    push r12
+    mov   r12d, [x11_buf + rbx + 4]                 ; rid
+    push r12
+    lea rdi, [tmp_buf]
+    lea rsi, [.hxe_err_pre]
+    mov ecx, .hxe_err_pre_len
+    call .hxe_err_copy
+    pop rax                                          ; rid (last pushed)
+    call .hxe_err_hex32
+    mov byte [rdi], ' '
+    inc rdi
+    lea rsi, [.hxe_err_minor]
+    mov ecx, .hxe_err_minor_len
+    call .hxe_err_copy
+    pop rax                                          ; minor
+    call .hxe_err_dec
+    mov byte [rdi], ' '
+    inc rdi
+    lea rsi, [.hxe_err_major]
+    mov ecx, .hxe_err_major_len
+    call .hxe_err_copy
+    pop rax                                          ; major
+    call .hxe_err_dec
+    mov byte [rdi], ' '
+    inc rdi
+    lea rsi, [.hxe_err_seq]
+    mov ecx, .hxe_err_seq_len
+    call .hxe_err_copy
+    pop rax                                          ; seq
+    call .hxe_err_dec
+    mov byte [rdi], ' '
+    inc rdi
+    lea rsi, [.hxe_err_code]
+    mov ecx, .hxe_err_code_len
+    call .hxe_err_copy
+    pop rax                                          ; code
+    call .hxe_err_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [tmp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    syscall
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+; Helpers used only by .hxe_x11_error. rdi = dst (advanced),
+; .hxe_err_copy: rsi=src ecx=len  → copy and advance rdi.
+; .hxe_err_dec : rax=value (u32) → write decimal, advance rdi.
+; .hxe_err_hex32: rax=value (u32) → write "0xHHHHHHHH", advance rdi.
+.hxe_err_copy:
+    test ecx, ecx
+    jz .hxe_err_copy_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .hxe_err_copy
+.hxe_err_copy_done:
+    ret
+.hxe_err_dec:
+    push rbx
+    push rcx
+    push rdx
+    mov ecx, 0                                       ; digit count
+    test eax, eax
+    jnz .hxe_err_dec_loop
+    mov byte [rdi], '0'
+    inc rdi
+    jmp .hxe_err_dec_done
+.hxe_err_dec_loop:
+    test eax, eax
+    jz .hxe_err_dec_emit
+    xor edx, edx
+    mov ebx, 10
+    div ebx
+    add dl, '0'
+    push rdx
+    inc ecx
+    jmp .hxe_err_dec_loop
+.hxe_err_dec_emit:
+    test ecx, ecx
+    jz .hxe_err_dec_done
+    pop rdx
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jmp .hxe_err_dec_emit
+.hxe_err_dec_done:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+.hxe_err_hex32:
+    mov byte [rdi], '0'
+    mov byte [rdi+1], 'x'
+    add rdi, 2
+    mov ecx, 8
+.hxe_err_hex_loop:
+    test ecx, ecx
+    jz .hxe_err_hex_done
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jl .hxe_err_hex_dig
+    add dl, 'a' - 10 - '0'
+.hxe_err_hex_dig:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jmp .hxe_err_hex_loop
+.hxe_err_hex_done:
+    ret
+.hxe_err_pre:    db "glass: x11 err rid="
+.hxe_err_pre_len equ $ - .hxe_err_pre
+.hxe_err_minor:  db "minor="
+.hxe_err_minor_len equ $ - .hxe_err_minor
+.hxe_err_major:  db "major="
+.hxe_err_major_len equ $ - .hxe_err_major
+.hxe_err_seq:    db "seq="
+.hxe_err_seq_len equ $ - .hxe_err_seq
+.hxe_err_code:   db "code="
+.hxe_err_code_len equ $ - .hxe_err_code
 
 .hxe_skip:
     ; If type is 1 (Reply), advance by 32 + reply_length*4 bytes
@@ -8972,6 +9123,12 @@ render_screen:
     test ecx, ecx
     jz .rs_next_row
 
+    ; TTF path (XRender CompositeGlyphs32) bypasses the X core font /
+    ; ImageText16 / PolyText16 wiring entirely. Falls back to the bitmap
+    ; path if no font_path is configured (ttf_active = 0).
+    cmp qword [ttf_active], 0
+    jne .rs_run_ttf
+
     ; Pick desired font for this run (medium or bold). Only emit a
     ; ChangeGC font request when the GC's current font actually needs
     ; to change.
@@ -9137,6 +9294,207 @@ render_screen:
     lea rsi, [tmp_buf]
     call x11_buffer
     inc dword [x11_seq]
+
+.rs_run_ttf:
+    ; ttf_active path — paint bg as one PolyFillRectangle for the whole
+    ; run, then emit ONE CompositeGlyphs32 with every cell in a single
+    ; GLYPHELT (one X round-trip per run, matches kitty's batching).
+    ; Per-cell calls flickered (visible bg-fill flash before the text
+    ; arrived) and made scrollback paint visibly char-by-char on long
+    ; lines.
+    ;
+    ; State on entry: ecx = run length, r12 = row, r13 = start col,
+    ;                 r14 = fg pixel, r15 = bg pixel.
+    ; State on exit (for .rs_after_text underline fill): ecx, r12, r13,
+    ;                 r14 unchanged. GC fg restored to r14d so the
+    ;                 underline draws in the correct colour.
+    push rbx                              ; outer scan column
+    push rcx                              ; run length
+
+    ; Skip bg fill when pseudo-transparency is active and bg matches the
+    ; default (palette[0]) — leaves the wallpaper-tinted BackPixmap
+    ; visible behind the glyphs.
+    cmp byte [pseudo_full], 1
+    jne .rs_ttf_fill_bg
+    mov eax, [palette]
+    cmp r15d, eax
+    je .rs_ttf_no_bg
+.rs_ttf_fill_bg:
+    ; ChangeGC fg = r15d (bg colour) for the fill.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov edx, [gc_id]
+    mov [rdi+4], edx
+    mov dword [rdi+8], GC_FOREGROUND
+    mov [rdi+12], r15d
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; PolyFillRectangle: x = start_col*char_w, y = row*char_h,
+    ; w = run_length*char_w, h = char_h.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5                   ; 3 header + 2 (one rect)
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    movzx edx, word [char_width]
+    mov rax, r13
+    imul rax, rdx
+    mov word [rdi+12], ax                 ; x
+    movzx eax, word [char_height]
+    imul eax, r12d
+    mov word [rdi+14], ax                 ; y
+    mov rax, [rsp]                        ; run length
+    imul rax, rdx
+    mov word [rdi+16], ax                 ; w
+    movzx eax, word [char_height]
+    mov word [rdi+18], ax                 ; h
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_ttf_no_bg:
+
+    ; Restore GC fg to r14d (text colour) so the underline fill in
+    ; .rs_after_text uses the right colour.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov edx, [gc_id]
+    mov [rdi+4], edx
+    mov dword [rdi+8], GC_FOREGROUND
+    mov [rdi+12], r14d
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; --- Pre-upload every glyph in the run (idempotent per cp). ---
+    ; Cells are read directly from the grid (rs_row_base + col*CELL_SIZE).
+    ; Codepoint 0 (uninitialised cells) is substituted with 0x20 (space)
+    ; — the run-scan above includes empty cells in same-colour runs, and
+    ; glyph 0 was never AddGlyphs'd, so leaving it would produce stray
+    ; "comma"-shaped artifacts where the X server falls back on whatever
+    ; bytes happen to be in glyph slot 0.
+    xor ebx, ebx
+.rs_ttf_upload_loop:
+    cmp rbx, [rsp]                        ; vs run length
+    jge .rs_ttf_upload_done
+    mov rax, [rs_row_base]
+    mov rdx, r13
+    add rdx, rbx
+    imul rdx, CELL_SIZE
+    movzx edi, word [rax + rdx]
+    test edi, edi
+    jnz .rs_ttf_upload_have_cp
+    mov edi, 0x20
+.rs_ttf_upload_have_cp:
+    call ttf_upload_glyph
+    inc rbx
+    jmp .rs_ttf_upload_loop
+.rs_ttf_upload_done:
+
+    ; --- Set pen colour once for the whole run. ---
+    mov edi, r14d
+    or edi, 0xFF000000
+    call ttf_set_pen_color
+
+    ; --- Build one CompositeGlyphs32 with every cell in a single GLYPHELT. ---
+    ; Layout:
+    ;   28 bytes fixed header (op, src, dst, maskFmt, gset, srcXY)
+    ;   8 bytes GLYPHELT header (count + dx + dy)
+    ;   4*N bytes glyph IDs
+    ; Length in 4-byte units = 7 (fixed) + 2 (elt header) + N = 9 + N.
+    ;
+    ; XRender protocol caps a GLYPHELT count at 252 (next byte ≥ 254 is
+    ; reinterpreted as a sub-element marker). Cap our run-batch at 240
+    ; for headroom; runs longer than that get truncated for now (rare on
+    ; an 80-col terminal; full multi-elt support is a follow-up).
+    mov rcx, [rsp]                        ; run length
+    cmp rcx, 240
+    jle .rs_ttf_have_n
+    mov rcx, 240
+.rs_ttf_have_n:
+    ; rcx = N (cells in this batched element)
+
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS_32
+    lea rax, [rcx + 9]                    ; length = 9 + N (dwords)
+    mov [rdi+2], ax
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov eax, [ttf_pen_picture]
+    mov [rdi+8], eax                      ; src
+    mov eax, [render_window_picture]
+    mov [rdi+12], eax                     ; dst
+    mov eax, [render_format_a8]
+    mov [rdi+16], eax                     ; maskFormat
+    mov eax, [ttf_glyphset]
+    mov [rdi+20], eax
+    mov word [rdi+24], 0                  ; src x
+    mov word [rdi+26], 0                  ; src y
+
+    ; GLYPHELT header.
+    mov [rdi+28], cl                      ; numGlyphs
+    mov byte [rdi+29], 0
+    mov word [rdi+30], 0
+    ; dx = start_col * char_width  (initial pen x for the element)
+    mov rax, r13
+    movzx edx, word [char_width]
+    imul rax, rdx
+    mov [rdi+32], ax
+    ; dy = row * char_height + font_ascent  (baseline)
+    movzx eax, word [char_height]
+    imul eax, r12d
+    movzx edx, word [font_ascent]
+    add eax, edx
+    mov [rdi+34], ax
+
+    ; Glyph IDs at offset 36..36+4*N. Each cell's UCS-2 codepoint IS the
+    ; glyph id (we used cp as the gid in AddGlyphs). cp=0 → 0x20 to match
+    ; the upload-loop substitution.
+    xor ebx, ebx
+.rs_ttf_id_loop:
+    cmp rbx, rcx
+    jge .rs_ttf_id_done
+    mov rax, [rs_row_base]
+    mov rdx, r13
+    add rdx, rbx
+    imul rdx, CELL_SIZE
+    movzx eax, word [rax + rdx]
+    test eax, eax
+    jnz .rs_ttf_id_have_cp
+    mov eax, 0x20
+.rs_ttf_id_have_cp:
+    mov rdx, rbx
+    shl rdx, 2
+    mov [rdi + rdx + 36], eax
+    inc rbx
+    jmp .rs_ttf_id_loop
+.rs_ttf_id_done:
+
+    ; Send: 36 + 4*N bytes.
+    mov rdx, rcx
+    shl rdx, 2
+    add rdx, 36
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+
+    pop rcx                               ; run length restored
+    pop rbx                               ; outer scan column restored
+    jmp .rs_after_text
 
 .rs_after_text:
     ; If this run had SGR 4 (underline), draw a 1px line under it using
@@ -13944,6 +14302,90 @@ ttf_set_pen_color:
     ret
 
 ; ---------------------------------------------------------------------
+; ttf_compute_metrics — derive cell width / height / ascent in pixels
+; from the loaded TTF and overwrite glass's char_width / char_height /
+; font_ascent / font_descent. Without this, those slots hold the X
+; core bitmap font's metrics — typically shorter than the TTF cell, so
+; descenders ('g', 'j', 'p', 'y') get clipped at the cell bottom.
+;
+; Cell width = monospace advance of glyph for 'M' (or '0' fallback).
+; Cell height = (hhea_ascent + |hhea_descent|) * size / unitsPerEm.
+; Ascent      = hhea_ascent  * size / unitsPerEm   (baseline from top).
+; Descent     = |hhea_descent| * size / unitsPerEm (cells below baseline).
+;
+; Called after x11_query_font has run, so we cleanly override the X
+; core font metrics. No-op when ttf_active = 0.
+ttf_compute_metrics:
+    cmp qword [ttf_active], 0
+    je .tcm_ret
+    push rbx
+    push r12
+    push r13
+
+    ; arg_size = cfg_font_size (or DEFAULT_FONT_SIZE).
+    mov rax, [cfg_font_size]
+    test rax, rax
+    jnz .tcm_have_size
+    mov rax, DEFAULT_FONT_SIZE
+.tcm_have_size:
+    mov [arg_size], rax
+    mov r12, rax                      ; r12 = size
+    mov r13, [head_unitsPerEm]        ; r13 = UPE
+
+    ; ----- char_width = advance(glyph 'M') * size / UPE -----
+    mov rdi, 'M'
+    call cmap_lookup
+    test rax, rax
+    jnz .tcm_have_glyph
+    mov rdi, '0'                      ; fall back to '0'
+    call cmap_lookup
+    test rax, rax
+    jz .tcm_metrics_only              ; can't measure width; keep bitmap value
+.tcm_have_glyph:
+    mov rdi, rax
+    call hmtx_advance                 ; rax = advance in font units
+    imul rax, r12
+    mov rcx, r13
+    shr rcx, 1
+    add rax, rcx                      ; round
+    xor edx, edx
+    div r13
+    mov [char_width], ax
+.tcm_metrics_only:
+
+    ; ----- ascent_px (baseline from top of cell) -----
+    mov rax, [hhea_ascent]            ; signed; ascent is positive in spec
+    imul rax, r12
+    mov rcx, r13
+    shr rcx, 1
+    add rax, rcx
+    cqo
+    idiv r13
+    mov [font_ascent], ax
+    mov rbx, rax                      ; rbx = ascent_px
+
+    ; ----- descent_px (positive number of pixels below baseline) -----
+    mov rax, [hhea_descent]           ; usually negative
+    neg rax                           ; flip to positive distance
+    imul rax, r12
+    mov rcx, r13
+    shr rcx, 1
+    add rax, rcx
+    cqo
+    idiv r13
+    mov [font_descent], ax
+
+    ; ----- cell height = ascent + |descent| -----
+    add rbx, rax
+    mov [char_height], bx
+
+    pop r13
+    pop r12
+    pop rbx
+.tcm_ret:
+    ret
+
+; ---------------------------------------------------------------------
 ; ttf_upload_glyph — rdi = codepoint. Renders the glyph via the
 ; embedded engine, then sends AddGlyphs to install it in the glyphset.
 ; Marks ttf_glyph_uploaded[cp]. No-op if already uploaded.
@@ -13978,17 +14420,18 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
-    ; XRender expects alpha image data per glyph laid out W*H bytes
-    ; tightly (NO per-row padding); the total alpha block (sum over
-    ; glyphs) is then padded to 4 bytes. We have a single glyph here.
+    ; XRender's A8 PictFormat requires scanline stride padded to 4 bytes
+    ; (standard X11 image layout: stride = ((w*bpp + 31) >> 5) << 2;
+    ; for A8, bpp=8 → stride = (w + 3) & ~3). The earlier "tight W*H,
+    ; total padded" guess produced BadLength on RenderAddGlyphs because
+    ; the server expected stride*H bytes, not W*H. Compute the padded
+    ; stride here so each row has 0..3 zero bytes after its W real bytes.
     mov rax, r12                        ; W
-    imul rax, r13                       ; W*H = unpadded alpha bytes
-    mov rcx, rax                        ; remember unpadded size for the copy loop
     add rax, 3
     and rax, ~3
-    mov r8, rax                         ; padded total alpha
-    sub rax, rcx
-    mov r9, rax                         ; trailing pad bytes
+    mov rcx, rax                        ; rcx = stride (per row, 4-aligned)
+    imul rax, r13                       ; stride * H
+    mov r8, rax                         ; padded total alpha (always 4-aligned)
 
     ; Total request length: 28 (fixed) + padded alpha
     mov rdx, r8
@@ -14017,23 +14460,41 @@ ttf_upload_glyph:
     mov [rdi+24], bp                    ; off-x = advance (low 16 bits)
     mov word [rdi+26], 0                ; off-y = 0
     ; Alpha bytes: copy W*H bytes tightly from output_buf, then
-    ; r9 trailing bytes of zero padding.
-    push r8                             ; save padded total
-    push r9                             ; save trailing pad count
+    ; Copy alpha from glyph engine's output_buf, row by row, padding each
+    ; row to `rcx` bytes (the 4-aligned stride). output_buf holds W*H
+    ; tight bytes, top-left origin; pad bytes are zero so the server sees
+    ; transparent extra columns past column W.
     lea rdi, [rdi + 28]                 ; destination
-    ; --- DEBUG: fill with 0xFF instead of copying from output_buf ---
-    mov al, 0xFF
-    rep stosb                           ; rcx bytes of 0xFF
-    pop r9                              ; pad count
-    pop r8                              ; padded total
+    lea rax, [output_buf]               ; source row cursor
+    mov r9, r13                         ; remaining rows
+    mov r11, rcx                        ; stride
+    sub r11, r12                        ; trailing-zero count per row
+.copy_row:
     test r9, r9
-    jz .pad_done
-.pad_loop:
+    jz .copy_done
+    mov rdx, r12                        ; W bytes per row
+.copy_byte:
+    test rdx, rdx
+    jz .copy_pad
+    mov cl, [rax]
+    mov [rdi], cl
+    inc rax
+    inc rdi
+    dec rdx
+    jmp .copy_byte
+.copy_pad:
+    mov rdx, r11                        ; trailing pad
+.copy_pad_byte:
+    test rdx, rdx
+    jz .copy_row_next
     mov byte [rdi], 0
     inc rdi
+    dec rdx
+    jmp .copy_pad_byte
+.copy_row_next:
     dec r9
-    jnz .pad_loop
-.pad_done:
+    jmp .copy_row
+.copy_done:
 
     ; Send the request. Total bytes = 28 + r8.
     mov rdx, r8
@@ -14094,7 +14555,10 @@ ttf_render_cp:
     mov [rdi], al
     mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS_32
     mov word [rdi+2], 10                ; length
-    mov byte [rdi+4], RENDER_OP_SRC
+    ; OP_OVER: dst = src·α + dst·(1-α). OP_SRC overwrites with src·α
+    ; everywhere, so transparent pixels in the alpha mask wrote pen·0=0
+    ; (black), producing the dotted/speckled fringe around glyph edges.
+    mov byte [rdi+4], RENDER_OP_OVER
     mov byte [rdi+5], 0
     mov word [rdi+6], 0
     mov eax, [ttf_pen_picture]
