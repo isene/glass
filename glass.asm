@@ -13771,7 +13771,7 @@ font_change_step:
     jmp .fcs_have_size
 
 .fcs_step:
-    ; Find current cfg_font_size in preset table
+    ; Find current cfg_font_size in preset table.
     mov rax, [cfg_font_size]
     test rax, rax
     jnz .fcs_search
@@ -13780,13 +13780,57 @@ font_change_step:
     xor ecx, ecx
 .fcs_search_loop:
     cmp ecx, FONT_SIZE_PRESET_COUNT
-    jge .fcs_use_default_idx
+    jge .fcs_off_table
     cmp rax, [font_size_presets + rcx*8]
     je .fcs_found_idx
     inc ecx
     jmp .fcs_search_loop
-.fcs_use_default_idx:
-    mov ecx, 1                       ; index of 13 in the table
+
+.fcs_off_table:
+    ; Current size isn't in the preset table (e.g. user picked 16 via
+    ; .glassrc, the table is 10/13/15/18/20/22/24/28/32). Snap
+    ; directionally: Alt+plus jumps to the smallest preset larger than
+    ; current; Alt+minus jumps to the largest preset smaller than
+    ; current. The previous fallback was a hard-coded ecx=1 (size 13),
+    ; which made Alt+plus from 16 go to 15 — felt like "smaller, then
+    ; back, then bigger" instead of monotonically growing.
+    test r12d, r12d
+    js .fcs_off_down
+
+    ; Up: find first preset[i] > rax. Set ecx = i-1 so the inc below
+    ; lands on i. If none larger, clamp to last.
+    xor ecx, ecx
+.fcs_off_up_loop:
+    cmp ecx, FONT_SIZE_PRESET_COUNT
+    jge .fcs_off_up_clamp
+    cmp [font_size_presets + rcx*8], rax
+    ja .fcs_off_up_done
+    inc ecx
+    jmp .fcs_off_up_loop
+.fcs_off_up_clamp:
+    mov ecx, FONT_SIZE_PRESET_COUNT  ; the inc will clamp below
+.fcs_off_up_done:
+    dec ecx                          ; the .fcs_step_ok logic will inc
+    jmp .fcs_found_idx
+
+.fcs_off_down:
+    ; Down: find largest preset[i] < rax. Set ecx = i+1 so the dec
+    ; below lands on i. If none smaller, clamp to 0.
+    mov ecx, FONT_SIZE_PRESET_COUNT
+    dec ecx
+.fcs_off_down_loop:
+    test ecx, ecx
+    js .fcs_off_down_clamp
+    cmp [font_size_presets + rcx*8], rax
+    jb .fcs_off_down_done
+    dec ecx
+    jmp .fcs_off_down_loop
+.fcs_off_down_clamp:
+    mov ecx, -1                      ; the dec will clamp below
+.fcs_off_down_done:
+    inc ecx                          ; the .fcs_step_down logic will dec
+    jmp .fcs_found_idx
+
 .fcs_found_idx:
     ; Step
     test r12d, r12d
