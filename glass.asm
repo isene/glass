@@ -14494,6 +14494,22 @@ ttf_upload_glyph:
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
 
+    ; SPACE (0x20) is the most-rendered "glyph" in any terminal, and
+    ; for some fonts (e.g. DejaVu Sans Mono) the rasterizer returns a
+    ; 1×1 alpha=0 bitmap rather than a true 0×0 empty. Some XRender
+    ; servers visibly composite that 1-pixel "transparent" mask anyway,
+    ; producing a stray dot at every empty cell — at large sizes the
+    ; dots line up into visible dashes spanning the whole screen. Force
+    ; W=H=0 for space so the server stores a zero-area bitmap (advance
+    ; only, no mask) and CompositeGlyphs32 has nothing to paint.
+    cmp rbx, 0x20
+    jne .not_space
+    xor r12, r12                        ; W = 0
+    xor r13, r13                        ; H = 0
+    xor r14, r14                        ; bearing_x = 0
+    xor r15, r15                        ; bearing_y = 0
+.not_space:
+
     ; XRender's A8 PictFormat requires scanline stride padded to 4 bytes
     ; (standard X11 image layout: stride = ((w*bpp + 31) >> 5) << 2;
     ; for A8, bpp=8 → stride = (w + 3) & ~3). The earlier "tight W*H,
