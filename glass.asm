@@ -911,6 +911,14 @@ cursor_blink_state: resq 1          ; 0 = invisible, 1 = visible
 last_blink_time:    resq 1          ; nanoseconds of last toggle
 dirty_rows:         resb 256        ; per-row dirty flags (1 = needs redraw)
 all_dirty:          resq 1          ; 1 = full redraw needed
+; Render coalescing: handlers set this flag instead of calling render_screen
+; directly. The event loop checks it once per iteration after draining all
+; X11 events and pending PTY data, so a burst of mouse-motion events / PTY
+; chunks turns into a single repaint. Without this, glass spent most of its
+; time re-rendering the same final state many times — selection drag was
+; visibly slow, CC session-resume scrolled through the entire history paint
+; by paint instead of jumping to the bottom like kitty does.
+render_pending:     resb 1
 child_forked:       resq 1          ; 1 if child has been forked
 
 ; OSC title
@@ -4495,8 +4503,7 @@ event_loop:
     add rcx, [cfg_blink_ms]
     mov [cursor_blink_until], rcx
     push rax
-    call render_screen
-    call x11_flush
+    call request_render
     pop rax
 .ev_check_x11:
 
@@ -4518,34 +4525,69 @@ event_loop:
     ; Check PTY output (POLLIN | POLLHUP | POLLERR)
     movzx eax, word [poll_fds + 14]
     test eax, 0x19           ; POLLIN(1) | POLLERR(8) | POLLHUP(16)
-    jz .ev_loop
+    jz .ev_after_pty
     ; If POLLHUP/POLLERR without POLLIN, child died
     test eax, POLLIN
     jz .ev_child_died
     mov word [poll_fds + 14], 0
 
-    ; Read PTY output
+    ; Snap to live view on new PTY output (regardless of how many chunks)
+    mov qword [scroll_offset], 0
+
+    ; Drain the PTY: read in 4 KB chunks, vt_process each, then peek the
+    ; PTY with a non-blocking poll(0). Loop while data is still queued so
+    ; CC-style "dump 200 KB on session resume" doesn't trigger 50 separate
+    ; renders — each iteration vt_process'd a chunk and the old code paint
+    ; the whole grid before reading the next chunk. With drain-then-render,
+    ; the user sees one paint at the final state. Cap at 64 iterations
+    ; (256 KB) per tick so a runaway child can't starve X11 events.
+    xor r12, r12                       ; iteration counter
+.ev_pty_drain:
     mov rax, SYS_READ
     mov rdi, [pty_master]
     lea rsi, [pty_read_buf]
     mov rdx, 4096
     syscall
     test rax, rax
-    jle .ev_child_died
-
-    ; Snap to live view on new PTY output
-    mov qword [scroll_offset], 0
-
-    ; Process VT sequences
+    jle .ev_pty_drain_done             ; EOF / error → child likely dead
     mov rcx, rax
     lea rsi, [pty_read_buf]
     call vt_process
+    inc r12
+    cmp r12, 64
+    jge .ev_pty_drain_done
+    ; Non-blocking poll: more PTY data ready?
+    sub rsp, 16
+    mov eax, [pty_master]
+    mov [rsp], eax
+    mov word [rsp + 4], POLLIN
+    mov word [rsp + 6], 0
+    mov rax, SYS_POLL
+    mov rdi, rsp
+    mov rsi, 1
+    xor edx, edx                       ; timeout = 0 (non-blocking)
+    syscall
+    movzx eax, word [rsp + 6]
+    add rsp, 16
+    test eax, POLLIN
+    jnz .ev_pty_drain
+.ev_pty_drain_done:
+    ; PTY-driven changes: ask for one paint at the end of this iteration.
+    call request_render
 
-    ; Render screen
+.ev_after_pty:
+    ; Coalesced render: handlers (motion-drag, scroll, expose, font step,
+    ; SGR, PTY drain above…) set render_pending instead of painting
+    ; eagerly. We paint at most once per event-loop iteration, after
+    ; every visible state change has been applied — eliminates the
+    ; "selection drag is 10× slower than kitty" symptom (was repainting
+    ; 60× per drag-second instead of once) and the per-keystroke flicker.
+    cmp byte [render_pending], 0
+    je .ev_loop
+    mov byte [render_pending], 0
     call render_screen
     call scan_urls
     call x11_flush
-
     jmp .ev_loop
 
 .ev_child_died:
@@ -4781,8 +4823,7 @@ handle_x11_events:
 .hxe_expose:
     push rbx
     push r12
-    call render_screen
-    call x11_flush
+    call request_render
     pop r12
     pop rbx
     add rbx, 32
@@ -4887,8 +4928,7 @@ handle_x11_events:
     mov byte [pseudo_setup_done], 1
 .hxe_cfg_resample:
     call setup_pseudo_transparency
-    call render_screen
-    call x11_flush
+    call request_render
 .hxe_cfg_no_pseudo:
     pop r12
     pop rbx
@@ -4993,8 +5033,7 @@ handle_x11_events:
     cmp qword [sel_active], 0
     je .hxe_bp_done2
     mov qword [sel_active], 0
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hxe_bp_done2
 .hxe_bp_sel_word:
     mov qword [sel_mode], 1
@@ -5005,8 +5044,7 @@ handle_x11_events:
     call find_word_at
     call selection_extract
     call selection_claim_primary
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hxe_bp_done2
 .hxe_bp_sel_line:
     mov qword [sel_mode], 2
@@ -5016,8 +5054,7 @@ handle_x11_events:
     call select_line_at
     call selection_extract
     call selection_claim_primary
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hxe_bp_done2
 
 .hxe_bp_ctrl:
@@ -5194,9 +5231,10 @@ handle_x11_events:
     xor edx, edx
     div ecx
     mov [sel_end_row], rax
-    ; Trigger re-render to show selection visually
-    call render_screen
-    call x11_flush
+    ; Trigger re-render to show selection visually (coalesced — actual
+    ; paint happens once at end of event-loop iteration even if the X
+    ; server delivered dozens of MotionNotify events in this batch).
+    call request_render
 .hxe_mn_done:
     pop r12
     pop rbx
@@ -8379,8 +8417,7 @@ scroll_view_up:
     mov rax, rcx
 .svu_set:
     mov [scroll_offset], rax
-    call render_screen
-    call x11_flush
+    call request_render
     pop rbx
     ret
 
@@ -8402,8 +8439,7 @@ scroll_view_down:
     xor eax, eax
 .svd_set:
     mov [scroll_offset], rax
-    call render_screen
-    call x11_flush
+    call request_render
 .svd_done:
     pop rbx
     ret
@@ -8858,6 +8894,16 @@ b64_decode:
 ; ══════════════════════════════════════════════════════════════════════
 ; Screen rendering
 ; ══════════════════════════════════════════════════════════════════════
+
+; request_render — set the render_pending flag. The event loop turns
+; this into a single render_screen + scan_urls + x11_flush at the end
+; of the current iteration, after every X11 event and PTY chunk has
+; been processed. Use this from event handlers instead of calling
+; render_screen directly so a burst of mouse-motion events or scroll
+; key-repeats coalesces into one paint.
+request_render:
+    mov byte [render_pending], 1
+    ret
 
 ; Render entire screen to X11
 render_screen:
@@ -13328,8 +13374,7 @@ handle_kitty_apc:
     mov rdx, [cursor_col]
     call place_add
     ; Ask the renderer to redraw the image overlay.
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hka_done
 
 .hka_delete:
@@ -13360,8 +13405,7 @@ handle_kitty_apc:
     test edi, edi
     jz .hka_done
     call place_clear_image
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hka_done
 
 .hka_d_release_one:
@@ -13376,14 +13420,12 @@ handle_kitty_apc:
     call img_release_picture_in_rsi
     mov edi, [apc_kv_i]
     call place_clear_image
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hka_done
 
 .hka_d_clear_all_placements:
     call place_clear_all
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .hka_done
 
 .hka_d_release_all:
@@ -13404,8 +13446,7 @@ handle_kitty_apc:
     jmp .hka_da_loop
 .hka_da_done:
     call place_clear_all
-    call render_screen
-    call x11_flush
+    call request_render
 
 .hka_done:
     pop r14
@@ -13594,8 +13635,7 @@ kitty_finalize_image:
     mov rdx, [cursor_col]
     mov edi, [apc_pending_id]
     call place_add
-    call render_screen
-    call x11_flush
+    call request_render
 
 .kfi_unmap_decoded:
     mov rax, SYS_MUNMAP
@@ -13938,8 +13978,7 @@ font_change_step:
 .fcs_skip_signal:
 
 .fcs_skip_resize:
-    call render_screen
-    call x11_flush
+    call request_render
 
 .fcs_done:
     pop r13
@@ -13979,8 +14018,7 @@ bg_cycle_advance:
     mov byte [cfg_bg_set], 1
     mov [palette], ebx               ; default-bg cells re-route here
 
-    call render_screen
-    call x11_flush
+    call request_render
 .bca_done:
     pop rbx
     ret
@@ -14205,13 +14243,11 @@ opacity_toggle_apply:
     mov byte [cfg_opacity_set], 1
     mov byte [pseudo_setup_done], 0
     call setup_pseudo_transparency
-    call render_screen
-    call x11_flush
+    call request_render
     jmp .ota_done
 .ota_pseudo_off:
     call pseudo_disable
-    call render_screen
-    call x11_flush
+    call request_render
 .ota_done:
     pop r12
     pop rbx
