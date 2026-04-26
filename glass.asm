@@ -790,6 +790,11 @@ cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
 cfg_opacity_set:    resb 1
 cfg_font_bold:      resb 1          ; 1 = use bold variant as the default font
 cfg_osc8_underline: resb 1          ; 1 = underline OSC 8 hyperlink spans, 0 = don't
+; Kitty-style "I'm not the focused window" dim. 0 = disabled (no
+; visual change, no XRender request); 1..100 = darken the whole
+; window by N % when FocusOut, restore on FocusIn.
+cfg_unfocused_dim:  resb 1
+window_focused:     resq 1          ; 1 = focused (default), 0 = not
                                     ; (some apps — notably Claude Code — open
                                     ; OSC 8 spans that never close cleanly,
                                     ; making large parts of the screen appear
@@ -1098,6 +1103,8 @@ _start:
     mov qword [scroll_bottom], 0      ; 0 = use grid_rows-1
     mov qword [bracketed_paste], 0
     mov byte [cfg_osc8_underline], 1   ; standard terminal default; ~/.glassrc can disable
+    mov byte [cfg_unfocused_dim], 0    ; off by default (no XRender cost when 0)
+    mov qword [window_focused], 1      ; assume focused at startup until told otherwise
     mov qword [cursor_style], 0
     mov qword [cfg_font_size], 0
 
@@ -4717,6 +4724,10 @@ handle_x11_events:
     je .hxe_sel_request
     cmp al, EV_SELECTION_NOTIFY
     je .hxe_sel_notify
+    cmp al, EV_FOCUS_IN
+    je .hxe_focus_in
+    cmp al, EV_FOCUS_OUT
+    je .hxe_focus_out
 
 .hxe_x11_error:
     ; X11 error event (32 bytes):
@@ -4896,6 +4907,41 @@ handle_x11_events:
     call request_render
     pop r12
     pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_focus_in:
+    ; FocusIn (event type 9). Mark focused; if dim is enabled, also
+    ; force a full redraw so the dim overlay is removed (the back
+    ; buffer holds a dimmed frame from the FocusOut, and per-row
+    ; dirty tracking won't otherwise know to re-render unchanged
+    ; cells without the dim).
+    mov qword [window_focused], 1
+    cmp byte [cfg_unfocused_dim], 0
+    je .hxe_focus_in_done
+    mov qword [all_dirty], 1
+    push rbx
+    push r12
+    call request_render
+    pop r12
+    pop rbx
+.hxe_focus_in_done:
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_focus_out:
+    ; FocusOut (event type 10). Mark unfocused + repaint to apply the
+    ; dim overlay. Same all_dirty rationale as FocusIn.
+    mov qword [window_focused], 0
+    cmp byte [cfg_unfocused_dim], 0
+    je .hxe_focus_out_done
+    mov qword [all_dirty], 1
+    push rbx
+    push r12
+    call request_render
+    pop r12
+    pop rbx
+.hxe_focus_out_done:
     add rbx, 32
     jmp .hxe_loop
 
@@ -9455,24 +9501,30 @@ render_screen:
     ; Skip ClearArea - cells fully cover the grid area via ImageText16
     ; backgrounds. ClearArea was causing flicker during selection drag.
     ;
-    ; However: ImageText16 only paints the grid_cols×grid_rows cell
-    ; area, not the right/bottom margins (win_width may be > grid_cols
-    ; * char_width by up to char_width-1 px). Those margins keep
-    ; whatever was drawn there last. After alt-screen exit (vim,
-    ; less, …) where the alt-screen bg differed from the main bg,
-    ; the margins retain the alt-screen bg colour and look like a
-    ; stray border. Only repaint them on full-redraw events
-    ; (all_dirty=1) so the steady-state cost stays zero.
-    cmp qword [all_dirty], 1
-    jne .rs_after_clear
-    ; Right margin: x = grid_cols * char_width, y = 0,
-    ;               w = win_width - x, h = win_height
+    ; ImageText16 only paints the grid_cols×grid_rows cell area, not
+    ; the right/bottom margins (win_width may be > grid_cols *
+    ; char_width by up to char_width-1 px). Those margins keep
+    ; whatever was drawn there last. Two distinct issues:
+    ;
+    ; 1. Right margin: glyph rendering intentionally lets cells bleed
+    ;    1-2 px right (see ttf_upload_glyph comment about box-drawing
+    ;    chars). For interior cells the next cell's bg-fill clears
+    ;    the bleed, but for the rightmost column the bleed lands in
+    ;    the margin and accumulates on every render → visible dot
+    ;    column on the right edge. So we repaint the right strip on
+    ;    EVERY render. Cost: one PolyFillRectangle (~20 bytes) per
+    ;    frame.
+    ;
+    ; 2. Bottom margin: only matters when the default bg changes
+    ;    between contexts (alt-screen exit from vim/less). Glyphs
+    ;    don't bleed downward, so this only needs to fire on full-
+    ;    redraw events (all_dirty=1).
     movzx eax, word [char_width]
     mov rcx, [grid_cols]
     imul rcx, rax                          ; rcx = grid_cols * char_width
     mov eax, [win_width]
     sub eax, ecx
-    jbe .rs_margin_bottom                  ; no right margin
+    jbe .rs_check_bottom                   ; no right margin
     push rcx
     push rax
     ; Set GC fg to default bg pixel.
@@ -9523,6 +9575,10 @@ render_screen:
     inc dword [x11_seq]
     pop rcx
     pop rax
+.rs_check_bottom:
+    ; Bottom strip: only on all_dirty (no glyph bleeds downward).
+    cmp qword [all_dirty], 1
+    jne .rs_after_clear
 .rs_margin_bottom:
     ; Bottom margin: x = 0, y = grid_rows * char_height,
     ;                w = grid_cols * char_width, h = win_height - y
@@ -10768,6 +10824,58 @@ render_screen:
 
 .rs_cursor_done:
 
+    ; Unfocused dim overlay (kitty-style). Skipped when:
+    ;   - dim is disabled (cfg_unfocused_dim == 0), or
+    ;   - the window is focused (window_focused == 1), or
+    ;   - XRender isn't available (render_major == 0), or
+    ;   - we have no draw_picture target.
+    ; When all of those clear, paint a single rgba(0,0,0,dim%) Over
+    ; the back buffer covering the entire window. Done after the cell
+    ; pass and the cursor pass so even the cursor block gets dimmed,
+    ; matching kitty behaviour.
+    cmp byte [cfg_unfocused_dim], 0
+    je .rs_dim_done
+    cmp qword [window_focused], 0
+    jne .rs_dim_done
+    cmp dword [render_major], 0
+    je .rs_dim_done
+    mov eax, [draw_picture]
+    test eax, eax
+    jz .rs_dim_done
+    ; alpha = dim * 65535 / 100 (16-bit XRender colour channel).
+    movzx eax, byte [cfg_unfocused_dim]
+    imul eax, 65535
+    mov ecx, 100
+    xor edx, edx
+    div ecx                                 ; eax = alpha (0..65535)
+    push rax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_FILL_RECTANGLES
+    mov word [rdi+2], 7                     ; length in 4-byte units
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov eax, [draw_picture]
+    mov [rdi+8], eax
+    mov word [rdi+12], 0                    ; red
+    mov word [rdi+14], 0                    ; green
+    mov word [rdi+16], 0                    ; blue
+    pop rax
+    mov [rdi+18], ax                        ; alpha
+    mov word [rdi+20], 0                    ; rect x
+    mov word [rdi+22], 0                    ; rect y
+    mov eax, [win_width]
+    mov [rdi+24], ax                        ; rect w
+    mov eax, [win_height]
+    mov [rdi+26], ax                        ; rect h
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_dim_done:
+
     ; Frame is fully painted into back_pixmap (or directly into win_id
     ; in pseudo-mode). BLT it to the window in one shot — the user only
     ; ever sees complete frames, no intermediate bg-fill flash.
@@ -11835,7 +11943,7 @@ load_config:
     ; an app that abuses OSC 8 — e.g. CC opens spans that effectively
     ; never close, leaving the whole screen visually underlined.
     cmp dword [rsi], 'osc8'
-    jne .lc_try_palette
+    jne .lc_try_unfocused_dim
     cmp dword [rsi+4], '_und'
     jne .lc_skip_line
     cmp dword [rsi+8], 'erli'
@@ -11849,6 +11957,41 @@ load_config:
     cmp eax, 1
     ja .lc_skip_line
     mov [cfg_osc8_underline], al
+    jmp .lc_skip_line
+
+.lc_try_unfocused_dim:
+    ; Match "unfocused_dim = N" where N is 0..100. Default 0 = off.
+    ; N % darkens the whole window via an XRender Over composite of
+    ; rgba(0,0,0,N%) when the window is not focused.
+    cmp dword [rsi], 'unfo'
+    jne .lc_try_palette
+    cmp dword [rsi+4], 'cuse'
+    jne .lc_skip_line
+    cmp dword [rsi+8], 'd_di'
+    jne .lc_skip_line
+    cmp byte [rsi+12], 'm'
+    jne .lc_skip_line
+    add rsi, 13
+    call lc_skip_to_value
+    ; Parse 1..3 decimal digits, clamp to 100.
+    xor eax, eax
+.lc_ud_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_ud_done
+    cmp cl, '9'
+    ja .lc_ud_done
+    sub ecx, '0'
+    imul eax, eax, 10
+    add eax, ecx
+    inc rsi
+    jmp .lc_ud_digit
+.lc_ud_done:
+    cmp eax, 100
+    jbe .lc_ud_store
+    mov eax, 100
+.lc_ud_store:
+    mov [cfg_unfocused_dim], al
     jmp .lc_skip_line
 
 .lc_try_palette:
