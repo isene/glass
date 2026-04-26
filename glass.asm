@@ -873,6 +873,12 @@ prev_paint_sel_er:     resq 1
 prev_paint_sel_ec:     resq 1
 prev_paint_scroll_off: resq 1
 prev_paint_bell_until: resq 1
+; Per-row paint range, computed by the dirty scan. The run scanner
+; only walks cells in [row_paint_start, row_paint_end); cells outside
+; this range keep their last-frame ink on the back buffer. Force-paint
+; paths (all_dirty=1, cursor row, scrollback) set 0..grid_cols.
+row_paint_start:       resq 1
+row_paint_end:         resq 1
 
 ; Cursor
 cursor_row:         resq 1
@@ -9770,40 +9776,95 @@ render_screen:
     lea rax, [grid + rax]
     mov [rs_row_base], rax
 
-    ; Per-row dirty skip: if grid_row == prev_paint_row byte-for-byte
-    ; AND the row isn't visually different for non-grid reasons (cursor
-    ; current/last, all_dirty), skip every X11 request for this row.
-    ; This is the dominant tock optimisation — a steady-state screen
-    ; whose grid bytes don't change avoids almost all rendering work.
+    ; Default paint range: full row. Force-render branches below leave
+    ; this in place; the dirty-scan branch narrows it to the changed
+    ; column band.
+    mov qword [row_paint_start], 0
+    mov rax, [grid_cols]
+    mov [row_paint_end], rax
+
+    ; Per-row dirty skip: scan grid_row vs prev_paint_row at cell
+    ; granularity, recording the leftmost and rightmost differing
+    ; cells. Identical rows skip every X11 request; partially-changed
+    ; rows render only the [first_diff..last_diff+1) column band, so
+    ; e.g. a cursor blink or a single-cell update is one run wide
+    ; instead of a whole-row pass. Force-render conditions
+    ; (all_dirty=1, cursor current/prev) keep the default 0..grid_cols.
     cmp qword [all_dirty], 0
     jne .rs_row_ready
     cmp r12, [cursor_row]
     je .rs_row_ready
     cmp r12, [prev_paint_cursor_row]
     je .rs_row_ready
-    push rdi
-    push rsi
-    push rcx
+    push rbx
+    push r10
+    push r11
     mov rax, r12
     imul rax, MAX_COLS
-    imul rax, CELL_SIZE
-    lea rdi, [prev_paint_grid + rax]
-    lea rsi, [grid + rax]
-    mov rcx, [grid_cols]
-    imul rcx, CELL_SIZE
-    shr rcx, 3                       ; qwords
-    repe cmpsq
-    pop rcx
-    pop rsi
-    pop rdi
-    je .rs_row_skip                  ; ZF=1 → identical → skip the row
+    imul rax, CELL_SIZE                 ; row byte offset
+    lea rsi, [grid + rax]               ; live row
+    lea rdi, [prev_paint_grid + rax]    ; mirror row
+    mov r10, -1                         ; first_diff (sentinel)
+    mov r11, -1                         ; last_diff
+    xor rbx, rbx                        ; col index
+.rs_row_diff_loop:
+    cmp rbx, [grid_cols]
+    jge .rs_row_diff_done
+    mov rax, rbx
+    shl rax, 4                          ; col × 16 (CELL_SIZE)
+    mov rcx, [rsi + rax]
+    cmp rcx, [rdi + rax]
+    jne .rs_row_diff_hit
+    mov rcx, [rsi + rax + 8]
+    cmp rcx, [rdi + rax + 8]
+    jne .rs_row_diff_hit
+    inc rbx
+    jmp .rs_row_diff_loop
+.rs_row_diff_hit:
+    cmp r10, -1
+    jne .rs_row_diff_have_first
+    mov r10, rbx                        ; first_diff = rbx
+.rs_row_diff_have_first:
+    mov r11, rbx                        ; last_diff = rbx (track latest)
+    inc rbx
+    jmp .rs_row_diff_loop
+.rs_row_diff_done:
+    cmp r10, -1
+    je .rs_row_diff_skip                ; no diffs → skip whole row
+    ; Pad the paint range by ±1 cell to cover glyph bleed: a changed
+    ; cell's new glyph may extend a pixel or two into its neighbour
+    ; (italic tails, bold overhang, certain box-drawing chars), and
+    ; the previous frame's bleed needs to be cleared on the neighbour
+    ; or it persists because the neighbour itself didn't change.
+    test r10, r10
+    jz .rs_row_diff_no_left_pad
+    dec r10
+.rs_row_diff_no_left_pad:
+    mov rax, [grid_cols]
+    inc r11                             ; exclusive end
+    inc r11                             ; +1 padding
+    cmp r11, rax
+    jle .rs_row_diff_end_ok
+    mov r11, rax
+.rs_row_diff_end_ok:
+    mov [row_paint_start], r10
+    mov [row_paint_end], r11
+    pop r11
+    pop r10
+    pop rbx
+    jmp .rs_row_ready
+.rs_row_diff_skip:
+    pop r11
+    pop r10
+    pop rbx
+    jmp .rs_row_skip
 
 .rs_row_ready:
     ; r12 = display row, scan columns for color runs
-    xor r13, r13             ; col = start of current run
+    mov r13, [row_paint_start]    ; col = start of current run
 
 .rs_run_start:
-    cmp r13, [grid_cols]
+    cmp r13, [row_paint_end]      ; was grid_cols — narrowed by dirty scan
     jge .rs_next_row
 
     ; Get effective fg/bg pixel of cell (apply inverse attr + selection).
@@ -9849,7 +9910,7 @@ render_screen:
     mov rbx, r13             ; current col
     xor ecx, ecx             ; character count
 .rs_run_scan:
-    cmp rbx, [grid_cols]
+    cmp rbx, [row_paint_end] ; was grid_cols — narrowed by dirty scan
     jge .rs_run_draw
     cmp ecx, 254             ; PolyText16 max m (255 = font-change marker)
     jge .rs_run_draw
