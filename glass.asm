@@ -9496,7 +9496,11 @@ render_screen:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
-    jmp .rs_after_clear
+    ; Fall through into the margin clears so the bell flash doesn't
+    ; persist in the right/bottom strips (cells repaint over the flash
+    ; inside the grid area, but the margins have no neighbour cell to
+    ; do the same — visible as an L-shaped border in vim and other
+    ; alt-screen apps with their own dark bg).
 .rs_no_bell:
     ; Skip ClearArea - cells fully cover the grid area via ImageText16
     ; backgrounds. ClearArea was causing flicker during selection drag.
@@ -10234,7 +10238,9 @@ render_screen:
     movzx edx, word [char_width]
     imul eax, edx
     mov word [rdi+16], ax
-    mov word [rdi+18], 1             ; height
+    mov word [rdi+18], 2             ; height (2px so it's clearly visible
+                                     ; vs DejaVu/Ubuntu Mono descenders at
+                                     ; 18px+; matches kitty's underline weight)
     lea rsi, [tmp_buf]
     mov rdx, 20
     call x11_buffer
@@ -15481,6 +15487,50 @@ ttf_upload_glyph:
     mov r14, r8                         ; bearing_x (signed)
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
+
+    ; Underscore (`_`, U+005F) workaround: DejaVu Sans Mono / many TTFs
+    ; rasterise `_` as H=1 with bearing_y a few pixels below the
+    ; baseline (engine returns e.g. W=11 H=1 by=-4 at 18px). With
+    ; glass's standard y=+bearing_y XRender placement the height-1
+    ; mask ends up at a y where the X server drops it — visible
+    ; result: filenames like `0_foo` render as `0 foo`. The engine's
+    ; output is correct, the upstream RENDER handling of a 1-pixel
+    ; mask at small negative y is the issue. Sidestep it by re-packing
+    ; into a full-cell mask with the inked row positioned at
+    ; (font_ascent + 1) — same y the SGR-4 underline draws — and
+    ; bearing_y = font_ascent so the glyph top sits at the cell top.
+    cmp rbx, 0x5F
+    jne .ttf_no_us_pack
+    movzx ecx, word [char_width]
+    mov [src_glyph_w], rcx
+    mov r12, rcx                        ; W = char_width
+    movzx r13d, word [char_height]      ; H = char_height
+    xor r14, r14                        ; bearing_x = 0
+    movzx r15d, word [font_ascent]      ; bearing_y = +ascent (top of cell)
+    movzx ebp, word [char_width]
+    ; Zero the full output_buf area (W*H bytes)
+    mov rax, r12
+    imul rax, r13
+    xor edi, edi
+.ttf_us_zero:
+    cmp rdi, rax
+    jge .ttf_us_zero_done
+    mov byte [output_buf + rdi], 0
+    inc rdi
+    jmp .ttf_us_zero
+.ttf_us_zero_done:
+    ; Fill row at offset (font_ascent + 1) * W with 0xFF for W bytes.
+    movzx eax, word [font_ascent]
+    inc eax
+    imul rax, r12                       ; row offset
+    xor edi, edi
+.ttf_us_inkrow:
+    cmp rdi, r12
+    jge .ttf_no_us_pack
+    mov byte [output_buf + rax + rdi], 0xFF
+    inc rdi
+    jmp .ttf_us_inkrow
+.ttf_no_us_pack:
 
     ; Trim trailing "speckle" rows from the bottom of the bitmap.
     ; Two artifact patterns from unhinted rasterisation of `›` U+203A in
