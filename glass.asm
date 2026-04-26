@@ -880,6 +880,19 @@ prev_paint_bell_until: resq 1
 row_paint_start:       resq 1
 row_paint_end:         resq 1
 
+; GC foreground cache. Tracks what fg pixel was last loaded into
+; gc_id via ChangeGC. Lets adjacent runs that share fg (or share
+; bg, since many cells use default bg) skip the redundant ChangeGC.
+;   gc_current_fg     last ChangeGC value
+;   gc_fg_valid       1 = cache value is the live GC state
+; Every site that issues ChangeGC for the GC_FOREGROUND mask either
+; goes through gc_set_fg (which honours the cache) or invalidates by
+; clearing gc_fg_valid after writing fg directly. A wrong cache only
+; ever causes a wrong-coloured paint until the next render covers
+; the area; never a crash.
+gc_current_fg:         resd 1
+gc_fg_valid:           resb 1
+
 ; Cursor
 cursor_row:         resq 1
 cursor_col:         resq 1
@@ -2701,6 +2714,8 @@ x11_create_gc:
     mov eax, [x11_white_pixel]
 .xgc_set_fg:
     mov [rdi+16], eax        ; foreground
+    mov [gc_current_fg], eax              ; seed GC fg cache
+    mov byte [gc_fg_valid], 1
     ; GC background: use cfg_bg_pixel or black
     cmp byte [cfg_bg_set], 1
     jne .xgc_def_bg
@@ -9541,6 +9556,8 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], eax              ; update GC fg cache
+    mov byte [gc_fg_valid], 1
     ; PolyFillRectangle covering entire window
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
@@ -9619,6 +9636,8 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], eax               ; update GC fg cache
+    mov byte [gc_fg_valid], 1
     pop rax                                ; right-margin width
     pop rcx                                ; grid pixel width (x origin)
     ; PolyFillRectangle: right strip
@@ -9691,6 +9710,8 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], eax               ; update GC fg cache
+    mov byte [gc_fg_valid], 1
 .rs_margin_bot_have_gc:
     pop rax                                ; bottom-margin height
     pop rcx                                ; grid pixel height (y origin)
@@ -10032,6 +10053,8 @@ render_screen:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], r14d              ; update GC fg cache
+    mov byte [gc_fg_valid], 1
     pop rcx
 
     ; If pseudo-transparency is active and this run's effective bg pixel
@@ -10177,7 +10200,18 @@ render_screen:
     cmp r15d, eax
     je .rs_ttf_no_bg
 .rs_ttf_fill_bg:
-    ; ChangeGC fg = r15d (bg colour) for the fill.
+    ; ChangeGC fg = r15d (bg colour) for the fill — skip the request
+    ; entirely when gc_id already holds r15d in fg from the previous
+    ; run. Saves one ChangeGC per run when adjacent runs share a bg
+    ; (e.g. tock's calendar grid: most cells use the same dim-row bg,
+    ; only the date glyph fg differs). gc_fg_valid is cleared by every
+    ; non-cache-aware ChangeGC fg write below; setting it here after
+    ; the write keeps the cache truthful.
+    cmp byte [gc_fg_valid], 1
+    jne .rs_ttf_bg_send
+    cmp r15d, [gc_current_fg]
+    je .rs_ttf_bg_skip
+.rs_ttf_bg_send:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
     mov byte [rdi+1], 0
@@ -10190,6 +10224,9 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], r15d
+    mov byte [gc_fg_valid], 1
+.rs_ttf_bg_skip:
 
     ; PolyFillRectangle: x = start_col*char_w, y = row*char_h,
     ; w = run_length*char_w, h = char_h.
@@ -10220,7 +10257,13 @@ render_screen:
 .rs_ttf_no_bg:
 
     ; Restore GC fg to r14d (text colour) so the underline fill in
-    ; .rs_after_text uses the right colour.
+    ; .rs_after_text uses the right colour. Cache-aware: skip when
+    ; the GC already holds r14d (common when many cells share fg).
+    cmp byte [gc_fg_valid], 1
+    jne .rs_ttf_restore_send
+    cmp r14d, [gc_current_fg]
+    je .rs_ttf_restore_skip
+.rs_ttf_restore_send:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
     mov byte [rdi+1], 0
@@ -10233,6 +10276,9 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], r14d
+    mov byte [gc_fg_valid], 1
+.rs_ttf_restore_skip:
 
     ; --- Pre-upload every glyph in the run (idempotent per cp). ---
     ; Cells are read directly from the grid (rs_row_base + col*CELL_SIZE).
@@ -10485,6 +10531,8 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], r15d             ; update GC fg cache
+    mov byte [gc_fg_valid], 1
     ; PolyFillRect at (r14*char_w, (r12+1)*char_h - 1, span_w*char_w, 1)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
@@ -10609,6 +10657,8 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], r15d             ; update GC fg cache
+    mov byte [gc_fg_valid], 1
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
@@ -10928,6 +10978,8 @@ render_screen:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov [gc_current_fg], eax               ; update GC fg cache
+    mov byte [gc_fg_valid], 1
 
     ; PolyFillRectangle with shape based on cursor_style
     lea rdi, [tmp_buf]
@@ -15031,6 +15083,11 @@ bg_cycle_advance:
     mov byte [cfg_bg_set], 1
     mov [palette], ebx               ; default-bg cells re-route here
 
+    ; Default-bg cells store no pixel in the cell bytes — they read
+    ; palette[0] at render time. Changing palette[0] doesn't dirty
+    ; the grid, so the per-row diff would skip and leave the old bg
+    ; on screen. Force a full repaint to push the new bg through.
+    mov qword [all_dirty], 1
     call request_render
 .bca_done:
     pop rbx
@@ -15256,10 +15313,14 @@ opacity_toggle_apply:
     mov byte [cfg_opacity_set], 1
     mov byte [pseudo_setup_done], 0
     call setup_pseudo_transparency
+    mov qword [all_dirty], 1            ; opacity affects every cell
+    mov byte [gc_fg_valid], 0           ; pixmap recreated; cache stale
     call request_render
     jmp .ota_done
 .ota_pseudo_off:
     call pseudo_disable
+    mov qword [all_dirty], 1
+    mov byte [gc_fg_valid], 0
     call request_render
 .ota_done:
     pop r12
