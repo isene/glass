@@ -857,6 +857,23 @@ grid_rows:          resq 1
 prev_grid_cols:     resq 1
 prev_grid_rows:     resq 1
 
+; Per-row dirty tracking. prev_paint_grid mirrors what was actually
+; painted on the back-buffer pixmap last render. render_screen does a
+; memcmp(grid_row, prev_paint_row); equal rows skip every X11 request.
+; Cursor and selection rows are force-rendered so their visuals can
+; change without a grid mutation. all_dirty=1 paths bypass the skip
+; (and the memcpy below still runs, refreshing the mirror).
+prev_paint_grid:    resb MAX_COLS * MAX_ROWS * CELL_SIZE
+prev_paint_cursor_row: resq 1
+prev_paint_cursor_col: resq 1
+prev_paint_sel_active: resq 1
+prev_paint_sel_sr:     resq 1
+prev_paint_sel_sc:     resq 1
+prev_paint_sel_er:     resq 1
+prev_paint_sel_ec:     resq 1
+prev_paint_scroll_off: resq 1
+prev_paint_bell_until: resq 1
+
 ; Cursor
 cursor_row:         resq 1
 cursor_col:         resq 1
@@ -5026,6 +5043,10 @@ handle_x11_events:
     neg rdi                   ; negative pid = process group
     mov rsi, SIGWINCH
     syscall
+    ; Resize invalidates the dirty-tracking mirror: prev_paint_grid is
+    ; sized for the previous dimensions, the back-buffer pixmap was
+    ; reallocated, and rows past the new height/width have stale ink.
+    mov qword [all_dirty], 1
 .hxe_cfg_done:
     ; ConfigureNotify: (re)sample the wallpaper for pseudo-transparency.
     ; Tile may MOVE us when cycling layouts (without changing our size),
@@ -9419,6 +9440,43 @@ render_screen:
     ;   [needs_blt]     = 1 if we must CopyArea at the end
     call ensure_back_buffer
 
+    ; ─────────────────────────────────────────────────────────────────
+    ; Per-row dirty-skip global invalidation: a number of state changes
+    ; affect every cell visually without altering the grid bytes
+    ; (selection toggle, scroll, bell flash on/off, pseudo-transparency).
+    ; Detect any change vs the last paint and force all_dirty=1 so the
+    ; per-row memcmp skip is bypassed for this frame.
+    ; ─────────────────────────────────────────────────────────────────
+    cmp byte [pseudo_full], 1
+    je .rs_force_full
+    mov rax, [bell_flash_until]
+    cmp rax, [prev_paint_bell_until]
+    jne .rs_force_full
+    mov rax, [scroll_offset]
+    cmp rax, [prev_paint_scroll_off]
+    jne .rs_force_full
+    mov rax, [sel_active]
+    cmp rax, [prev_paint_sel_active]
+    jne .rs_force_full
+    test rax, rax
+    jz .rs_after_force_check
+    mov rax, [sel_start_row]
+    cmp rax, [prev_paint_sel_sr]
+    jne .rs_force_full
+    mov rax, [sel_start_col]
+    cmp rax, [prev_paint_sel_sc]
+    jne .rs_force_full
+    mov rax, [sel_end_row]
+    cmp rax, [prev_paint_sel_er]
+    jne .rs_force_full
+    mov rax, [sel_end_col]
+    cmp rax, [prev_paint_sel_ec]
+    jne .rs_force_full
+    jmp .rs_after_force_check
+.rs_force_full:
+    mov qword [all_dirty], 1
+.rs_after_force_check:
+
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
     ; and the previous cursor block don't get painted over. Clear the
@@ -9711,6 +9769,34 @@ render_screen:
     imul rax, CELL_SIZE
     lea rax, [grid + rax]
     mov [rs_row_base], rax
+
+    ; Per-row dirty skip: if grid_row == prev_paint_row byte-for-byte
+    ; AND the row isn't visually different for non-grid reasons (cursor
+    ; current/last, all_dirty), skip every X11 request for this row.
+    ; This is the dominant tock optimisation — a steady-state screen
+    ; whose grid bytes don't change avoids almost all rendering work.
+    cmp qword [all_dirty], 0
+    jne .rs_row_ready
+    cmp r12, [cursor_row]
+    je .rs_row_ready
+    cmp r12, [prev_paint_cursor_row]
+    je .rs_row_ready
+    push rdi
+    push rsi
+    push rcx
+    mov rax, r12
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rdi, [prev_paint_grid + rax]
+    lea rsi, [grid + rax]
+    mov rcx, [grid_cols]
+    imul rcx, CELL_SIZE
+    shr rcx, 3                       ; qwords
+    repe cmpsq
+    pop rcx
+    pop rsi
+    pop rdi
+    je .rs_row_skip                  ; ZF=1 → identical → skip the row
 
 .rs_row_ready:
     ; r12 = display row, scan columns for color runs
@@ -10251,6 +10337,30 @@ render_screen:
     jmp .rs_run_start
 
 .rs_next_row:
+    ; Mirror the grid row we just painted into prev_paint_grid so the
+    ; next render's dirty-skip check has something to compare against.
+    ; Skip this when scroll_offset != 0 (rows came from scrollback /
+    ; shifted, not the live grid) — leaving the live mirror untouched
+    ; means the first frame after exiting scrollback re-paints fully.
+    cmp qword [scroll_offset], 0
+    jne .rs_row_skip_copy
+    push rdi
+    push rsi
+    push rcx
+    mov rax, r12
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rdi, [prev_paint_grid + rax]
+    lea rsi, [grid + rax]
+    mov rcx, [grid_cols]
+    imul rcx, CELL_SIZE
+    shr rcx, 3
+    rep movsq
+    pop rcx
+    pop rsi
+    pop rdi
+.rs_row_skip_copy:
+.rs_row_skip:
     inc r12
     jmp .rs_row
 
@@ -10972,6 +11082,27 @@ render_screen:
     ; in pseudo-mode). BLT it to the window in one shot — the user only
     ; ever sees complete frames, no intermediate bg-fill flash.
     call blt_back_to_window
+
+    ; Snapshot the visual state we just painted so the next render's
+    ; dirty-skip check can detect any change.
+    mov rax, [cursor_row]
+    mov [prev_paint_cursor_row], rax
+    mov rax, [cursor_col]
+    mov [prev_paint_cursor_col], rax
+    mov rax, [scroll_offset]
+    mov [prev_paint_scroll_off], rax
+    mov rax, [bell_flash_until]
+    mov [prev_paint_bell_until], rax
+    mov rax, [sel_active]
+    mov [prev_paint_sel_active], rax
+    mov rax, [sel_start_row]
+    mov [prev_paint_sel_sr], rax
+    mov rax, [sel_start_col]
+    mov [prev_paint_sel_sc], rax
+    mov rax, [sel_end_row]
+    mov [prev_paint_sel_er], rax
+    mov rax, [sel_end_col]
+    mov [prev_paint_sel_ec], rax
 
     pop r15
     pop r14
