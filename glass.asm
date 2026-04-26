@@ -9607,6 +9607,15 @@ render_screen:
     je .rs_bbox_init_done
     call bbox_full_window
 .rs_bbox_init_done:
+    ; Invalidate the GC fg cache at the start of every render. The
+    ; cache is correct WITHIN a render (bg-fill / restore / cursor
+    ; ChangeGC sites all keep gc_current_fg in sync), but a subtle
+    ; cross-render invariant violation manifested as the "red bg
+    ; under geir" artifact on past prompt rows after each Enter.
+    ; Resetting the cache once per frame costs at most one extra
+    ; ChangeGC at the first run of the row loop; the in-render
+    ; savings (adjacent runs sharing fg or bg) are preserved.
+    mov byte [gc_fg_valid], 0
 
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
