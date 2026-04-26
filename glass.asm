@@ -893,6 +893,21 @@ row_paint_end:         resq 1
 gc_current_fg:         resd 1
 gc_fg_valid:           resb 1
 
+; Partial-BLT dirty bbox in pixel coordinates. blt_back_to_window
+; CopyArea's only the bbox at the end of render_screen; areas outside
+; it keep their existing window pixels (which match the back buffer
+; from the last frame). Eliminates the visible "tearing" window the
+; full-window CopyArea opens up at every render — the user reported
+; tock as "snappy but flickery" after the per-row dirty skip landed,
+; which was exactly the symptom of full-frame BLT without vsync.
+;   blt_dirty=0  → bbox empty, skip BLT entirely
+;   blt_dirty=1  → bbox holds [x0,y0)..[x1,y1) inclusive-exclusive
+blt_dirty:             resb 1
+blt_x0:                resq 1
+blt_y0:                resq 1
+blt_x1:                resq 1
+blt_y1:                resq 1
+
 ; Cursor
 cursor_row:         resq 1
 cursor_col:         resq 1
@@ -9413,13 +9428,99 @@ ensure_back_buffer:
     ret
 
 ; ---------------------------------------------------------------------
-; blt_back_to_window — CopyArea from back_pixmap to win_id, full
-; window. Called at the end of render_screen when needs_blt = 1.
+; expand_bbox — grow the partial-BLT dirty rect to cover (rdi=x,
+; rsi=y, rdx=w, rcx=h). Caller-saved registers preserved (rax, r8, r9
+; clobbered).
+expand_bbox:
+    cmp byte [blt_dirty], 1
+    je .eb_have
+    mov [blt_x0], rdi
+    mov [blt_y0], rsi
+    mov rax, rdi
+    add rax, rdx
+    mov [blt_x1], rax
+    mov rax, rsi
+    add rax, rcx
+    mov [blt_y1], rax
+    mov byte [blt_dirty], 1
+    ret
+.eb_have:
+    cmp rdi, [blt_x0]
+    jge .eb_x0_ok
+    mov [blt_x0], rdi
+.eb_x0_ok:
+    cmp rsi, [blt_y0]
+    jge .eb_y0_ok
+    mov [blt_y0], rsi
+.eb_y0_ok:
+    mov rax, rdi
+    add rax, rdx
+    cmp rax, [blt_x1]
+    jle .eb_x1_ok
+    mov [blt_x1], rax
+.eb_x1_ok:
+    mov rax, rsi
+    add rax, rcx
+    cmp rax, [blt_y1]
+    jle .eb_y1_ok
+    mov [blt_y1], rax
+.eb_y1_ok:
+    ret
+
+; bbox_full_window — set the dirty bbox to the entire window. Called
+; when something paints into every pixel (bell, pseudo clear, dim
+; overlay) or when all_dirty=1 forces a full repaint.
+bbox_full_window:
+    xor edi, edi
+    xor esi, esi
+    mov rdx, [win_width]
+    mov rcx, [win_height]
+    jmp expand_bbox
+
+; blt_back_to_window — CopyArea from back_pixmap to win_id, clipped
+; to the bbox accumulated during render_screen. Called at the end of
+; render_screen when needs_blt = 1.
 blt_back_to_window:
     cmp byte [needs_blt], 0
     je .blt_ret
     cmp dword [back_pixmap], 0
     je .blt_ret
+    cmp byte [blt_dirty], 1
+    jne .blt_ret                       ; nothing painted → no-op BLT
+    ; Clamp bbox to the window in case any caller over-reported.
+    mov rax, [blt_x0]
+    test rax, rax
+    jns .blt_x0_pos
+    xor eax, eax
+    mov [blt_x0], rax
+.blt_x0_pos:
+    mov rax, [blt_y0]
+    test rax, rax
+    jns .blt_y0_pos
+    xor eax, eax
+    mov [blt_y0], rax
+.blt_y0_pos:
+    mov rax, [blt_x1]
+    cmp rax, [win_width]
+    jle .blt_x1_ok
+    mov rax, [win_width]
+    mov [blt_x1], rax
+.blt_x1_ok:
+    mov rax, [blt_y1]
+    cmp rax, [win_height]
+    jle .blt_y1_ok
+    mov rax, [win_height]
+    mov [blt_y1], rax
+.blt_y1_ok:
+    ; Compute width/height; degenerate → no BLT.
+    mov rax, [blt_x1]
+    sub rax, [blt_x0]
+    jle .blt_ret
+    mov r8, rax                        ; r8 = width
+    mov rax, [blt_y1]
+    sub rax, [blt_y0]
+    jle .blt_ret
+    mov r9, rax                        ; r9 = height
 
     lea rdi, [tmp_buf]
     mov byte [rdi], 62                 ; CopyArea opcode
@@ -9431,14 +9532,14 @@ blt_back_to_window:
     mov [rdi+8], eax                   ; dst-drawable
     mov eax, [gc_id]
     mov [rdi+12], eax                  ; gc
-    mov word [rdi+16], 0               ; src-x
-    mov word [rdi+18], 0               ; src-y
-    mov word [rdi+20], 0               ; dst-x
-    mov word [rdi+22], 0               ; dst-y
-    movzx eax, word [win_width]
-    mov word [rdi+24], ax              ; width
-    movzx eax, word [win_height]
-    mov word [rdi+26], ax              ; height
+    mov rax, [blt_x0]
+    mov word [rdi+16], ax              ; src-x
+    mov word [rdi+20], ax              ; dst-x (mirror src)
+    mov rax, [blt_y0]
+    mov word [rdi+18], ax              ; src-y
+    mov word [rdi+22], ax              ; dst-y
+    mov word [rdi+24], r8w             ; width
+    mov word [rdi+26], r9w             ; height
     lea rsi, [tmp_buf]
     mov rdx, 28
     call x11_buffer
@@ -9497,6 +9598,15 @@ render_screen:
 .rs_force_full:
     mov qword [all_dirty], 1
 .rs_after_force_check:
+
+    ; Reset the partial-BLT bbox. all_dirty paths prefill with the
+    ; full window so the final CopyArea covers everything; partial
+    ; renders start empty and grow per paint site via expand_bbox.
+    mov byte [blt_dirty], 0
+    cmp qword [all_dirty], 0
+    je .rs_bbox_init_done
+    call bbox_full_window
+.rs_bbox_init_done:
 
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
@@ -9583,27 +9693,23 @@ render_screen:
     ; do the same — visible as an L-shaped border in vim and other
     ; alt-screen apps with their own dark bg).
 .rs_no_bell:
-    ; Skip ClearArea - cells fully cover the grid area via ImageText16
-    ; backgrounds. ClearArea was causing flicker during selection drag.
-    ;
-    ; ImageText16 / CompositeGlyphs32 only paint the grid_cols×grid_rows
-    ; cell area, not the right/bottom margins (win_width may exceed
-    ; grid_cols*char_width by up to char_width-1 px; same for height).
-    ; Glyph rendering is allowed to bleed past any cell edge by 1-2 px
-    ; — intentional for box-drawing chars, and unavoidable for fonts
-    ; whose descenders extend past the nominal cell box (g/p/q/y/j,
-    ; underscores in some fonts). For interior cells the neighbour's
-    ; bg-fill on the next render covers the bleed, but for cells on
-    ; the right or bottom edge the bleed lands in the margin where no
-    ; neighbour ever paints. Without an explicit margin clear the
-    ; bleed accumulates → visible dot/dash artefacts along the edges.
-    ; Same root cause as the bg-change-on-alt-screen-exit case (vim,
-    ; less): margins must be repainted in the current default bg.
-    ;
-    ; Solution is generic: clear both margins on EVERY render, not
-    ; just on all_dirty. Cost: two PolyFillRectangles (~40 bytes wire)
-    ; per frame, no syscall, negligible. Skipped cleanly when the
-    ; respective margin is zero-width.
+    ; Margin clears moved to AFTER the row loop, gated on blt_dirty.
+    ; Reason: with the per-row dirty skip + partial BLT, an idle render
+    ; (all rows skip) shouldn't paint anything. Painting margins
+    ; unconditionally here would expand the BLT bbox to the window
+    ; edges every frame and undo the partial-BLT win. The post-row
+    ; gated paint still cleans glyph bleed because bleed only happens
+    ; when a row paints (which sets blt_dirty=1).
+    jmp rs_row_loop
+
+paint_margins:
+    ; Paint right-strip + bottom-strip with default-bg pixel. Called
+    ; from render_screen when blt_dirty=1 (something painted in this
+    ; frame) so glyph bleed at the right/bottom cell edges gets
+    ; cleaned. ImageText16 / CompositeGlyphs32 only paint the
+    ; grid_cols × grid_rows cell area; the margins (up to char_w-1 px
+    ; right, char_h-1 px bottom) need their own bg fill to avoid
+    ; visible dot/dash artefacts along the edges over time.
     movzx eax, word [char_width]
     mov rcx, [grid_cols]
     imul rcx, rax                          ; rcx = grid_cols * char_width
@@ -9676,7 +9782,7 @@ render_screen:
     imul rcx, rax                          ; rcx = grid_rows * char_height
     mov eax, [win_height]
     sub eax, ecx
-    jbe .rs_after_clear                    ; no bottom margin
+    jbe .pm_no_bottom_paint                ; no bottom margin → skip paint
     push rcx
     push rax
     ; (GC fg is already set from the right-margin path; if the right
@@ -9735,8 +9841,43 @@ render_screen:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
-.rs_after_clear:
+.pm_no_bottom_paint:
+    ; Expand bbox to cover both margin strips (right + bottom).
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    movzx eax, word [char_width]
+    mov rdi, [grid_cols]
+    imul rdi, rax                          ; right strip x = grid_w
+    xor esi, esi                           ; y = 0
+    mov rdx, [win_width]
+    sub rdx, rdi                           ; w = win_w - grid_w
+    test rdx, rdx
+    jle .pm_no_right_bbox
+    mov rcx, [win_height]                  ; h = full window height
+    call expand_bbox
+.pm_no_right_bbox:
+    movzx eax, word [char_height]
+    mov rsi, [grid_rows]
+    imul rsi, rax                          ; bottom strip y = grid_h
+    xor edi, edi                           ; x = 0
+    mov rcx, [win_height]
+    sub rcx, rsi                           ; h = win_h - grid_h
+    test rcx, rcx
+    jle .pm_no_bottom_bbox
+    movzx eax, word [char_width]
+    mov rdx, [grid_cols]
+    imul rdx, rax                          ; w = grid_w
+    call expand_bbox
+.pm_no_bottom_bbox:
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    ret
 
+rs_row_loop:
     ; Draw each row with per-color-run rendering
     ; When scroll_offset > 0, top rows come from scrollback buffer
     xor r12, r12             ; display row
@@ -10444,6 +10585,27 @@ render_screen:
     jmp .rs_run_start
 
 .rs_next_row:
+    ; Expand partial-BLT bbox to include this row's painted band so
+    ; the final CopyArea picks up the freshly-painted pixels.
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    movzx ecx, word [char_width]
+    mov rdi, [row_paint_start]
+    imul rdi, rcx                       ; x = paint_start * char_width
+    mov rdx, [row_paint_end]
+    sub rdx, [row_paint_start]
+    imul rdx, rcx                       ; w = (end-start) * char_width
+    movzx ecx, word [char_height]
+    mov rsi, r12
+    imul rsi, rcx                       ; y = row * char_height
+                                        ; rcx still = char_height = h
+    call expand_bbox
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
     ; Mirror the grid row we just painted into prev_paint_grid so the
     ; next render's dirty-skip check has something to compare against.
     ; Skip this when scroll_offset != 0 (rows came from scrollback /
@@ -10472,6 +10634,13 @@ render_screen:
     jmp .rs_row
 
 .rs_after_rows:
+    ; Paint right + bottom margins now (after row paints) so any
+    ; glyph bleed at the cell edges gets cleaned up. Skip when
+    ; nothing painted this frame — there's no new bleed to clean.
+    cmp byte [blt_dirty], 0
+    je .rs_after_margins
+    call paint_margins
+.rs_after_margins:
     ; OSC 8 hyperlink underline pass — gated by cfg_osc8_underline so
     ; the user can disable it for apps that abuse OSC 8 (CC opens
     ; spans that effectively never close).
@@ -11195,6 +11364,14 @@ render_screen:
     ; in pseudo-mode). BLT it to the window in one shot — the user only
     ; ever sees complete frames, no intermediate bg-fill flash.
     call blt_back_to_window
+
+    ; all_dirty was a one-shot flag set by handlers that need a full
+    ; repaint (configure, focus, alt-screen toggle, bg_cycle, opacity,
+    ; etc.). Now that the full repaint has happened, clear it so the
+    ; next render can fall back to the dirty-skip + partial-BLT fast
+    ; paths. (Originally the flag was never cleared because the old
+    ; renderer ignored it after the dirt-skip was added.)
+    mov qword [all_dirty], 0
 
     ; Snapshot the visual state we just painted so the next render's
     ; dirty-skip check can detect any change.
