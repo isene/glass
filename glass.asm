@@ -9501,24 +9501,24 @@ render_screen:
     ; Skip ClearArea - cells fully cover the grid area via ImageText16
     ; backgrounds. ClearArea was causing flicker during selection drag.
     ;
-    ; ImageText16 only paints the grid_cols×grid_rows cell area, not
-    ; the right/bottom margins (win_width may be > grid_cols *
-    ; char_width by up to char_width-1 px). Those margins keep
-    ; whatever was drawn there last. Two distinct issues:
+    ; ImageText16 / CompositeGlyphs32 only paint the grid_cols×grid_rows
+    ; cell area, not the right/bottom margins (win_width may exceed
+    ; grid_cols*char_width by up to char_width-1 px; same for height).
+    ; Glyph rendering is allowed to bleed past any cell edge by 1-2 px
+    ; — intentional for box-drawing chars, and unavoidable for fonts
+    ; whose descenders extend past the nominal cell box (g/p/q/y/j,
+    ; underscores in some fonts). For interior cells the neighbour's
+    ; bg-fill on the next render covers the bleed, but for cells on
+    ; the right or bottom edge the bleed lands in the margin where no
+    ; neighbour ever paints. Without an explicit margin clear the
+    ; bleed accumulates → visible dot/dash artefacts along the edges.
+    ; Same root cause as the bg-change-on-alt-screen-exit case (vim,
+    ; less): margins must be repainted in the current default bg.
     ;
-    ; 1. Right margin: glyph rendering intentionally lets cells bleed
-    ;    1-2 px right (see ttf_upload_glyph comment about box-drawing
-    ;    chars). For interior cells the next cell's bg-fill clears
-    ;    the bleed, but for the rightmost column the bleed lands in
-    ;    the margin and accumulates on every render → visible dot
-    ;    column on the right edge. So we repaint the right strip on
-    ;    EVERY render. Cost: one PolyFillRectangle (~20 bytes) per
-    ;    frame.
-    ;
-    ; 2. Bottom margin: only matters when the default bg changes
-    ;    between contexts (alt-screen exit from vim/less). Glyphs
-    ;    don't bleed downward, so this only needs to fire on full-
-    ;    redraw events (all_dirty=1).
+    ; Solution is generic: clear both margins on EVERY render, not
+    ; just on all_dirty. Cost: two PolyFillRectangles (~40 bytes wire)
+    ; per frame, no syscall, negligible. Skipped cleanly when the
+    ; respective margin is zero-width.
     movzx eax, word [char_width]
     mov rcx, [grid_cols]
     imul rcx, rax                          ; rcx = grid_cols * char_width
@@ -9576,9 +9576,9 @@ render_screen:
     pop rcx
     pop rax
 .rs_check_bottom:
-    ; Bottom strip: only on all_dirty (no glyph bleeds downward).
-    cmp qword [all_dirty], 1
-    jne .rs_after_clear
+    ; Bottom strip: same always-paint policy as the right strip.
+    ; Descenders / underscores can bleed past the bottom of the last
+    ; cell row, and there's no neighbour cell below to cover it.
 .rs_margin_bottom:
     ; Bottom margin: x = 0, y = grid_rows * char_height,
     ;                w = grid_cols * char_width, h = win_height - y
