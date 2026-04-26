@@ -10822,6 +10822,92 @@ render_screen:
     call x11_buffer
     inc dword [x11_seq]
 
+    ; Cursor block "knockout" (kitty-style). The block style obscures
+    ; whatever character was at the cursor cell. To keep the character
+    ; visible (and avoid the user having to make the cursor translucent
+    ; — which only goes pink), re-render that single glyph on top of
+    ; the cursor block in the cell's background colour. Underline / bar
+    ; styles don't obscure, so they're skipped.
+    cmp qword [cursor_style], 0
+    jne .rs_cursor_done
+    cmp dword [render_major], 0
+    je .rs_cursor_done
+    cmp dword [ttf_glyphset], 0
+    je .rs_cursor_done
+    ; Cell offset: cursor_row * MAX_COLS + cursor_col, all * CELL_SIZE.
+    mov rax, [cursor_row]
+    imul rax, MAX_COLS
+    add rax, [cursor_col]
+    imul rax, CELL_SIZE
+    movzx ebx, word [grid + rax]                ; cp at cursor cell
+    test ebx, ebx
+    jz .rs_cursor_done                          ; empty cell: nothing to redraw
+    cmp ebx, 0x20
+    je .rs_cursor_done                          ; space: same
+    ; Knockout colour: the cell's bg pixel if non-default, else cfg_bg_pixel.
+    movzx ecx, byte [grid + rax + 3]            ; bg flags
+    test cl, 1                                  ; bit 0 = default bg
+    jnz .rs_cursor_ko_default_bg
+    mov ecx, [grid + rax + 12]                  ; cell-specific bg
+    jmp .rs_cursor_ko_have_color
+.rs_cursor_ko_default_bg:
+    cmp byte [cfg_bg_set], 1
+    jne .rs_cursor_ko_use_black
+    mov ecx, [cfg_bg_pixel]
+    jmp .rs_cursor_ko_have_color
+.rs_cursor_ko_use_black:
+    mov ecx, [x11_black_pixel]
+.rs_cursor_ko_have_color:
+    or ecx, 0xFF000000                          ; ensure opaque in ARGB mode
+    push rcx
+    mov edi, ebx
+    call ttf_upload_glyph                       ; idempotent; ensures gid is uploaded
+    pop rcx
+    push rbx                                    ; preserve cp across pen-set call
+    mov edi, ecx
+    call ttf_set_pen_color
+    pop rbx
+    ; Build a 1-glyph CompositeGlyphs32 at (col*cw, row*ch + ascent).
+    ; Length = 9 (fixed) + 1 (one glyph id) = 10 dwords = 40 bytes.
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS_32
+    mov word [rdi+2], 10
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov eax, [ttf_pen_picture]
+    mov [rdi+8], eax
+    mov eax, [draw_picture]
+    mov [rdi+12], eax
+    mov eax, [render_format_a8]
+    mov [rdi+16], eax
+    mov eax, [ttf_glyphset]
+    mov [rdi+20], eax
+    mov word [rdi+24], 0
+    mov word [rdi+26], 0
+    ; GLYPHELT header: 1 glyph, dx = col*cw, dy = row*ch + ascent.
+    mov byte [rdi+28], 1
+    mov byte [rdi+29], 0
+    mov word [rdi+30], 0
+    mov rax, [cursor_col]
+    movzx edx, word [char_width]
+    imul rax, rdx
+    mov [rdi+32], ax
+    mov rax, [cursor_row]
+    movzx edx, word [char_height]
+    imul rax, rdx
+    movzx edx, word [font_ascent]
+    add eax, edx
+    mov [rdi+34], ax
+    ; Glyph id = cp.
+    mov [rdi+36], ebx
+    lea rsi, [tmp_buf]
+    mov rdx, 40
+    call x11_buffer
+    inc dword [x11_seq]
+
 .rs_cursor_done:
 
     ; Unfocused dim overlay (kitty-style). Skipped when:
