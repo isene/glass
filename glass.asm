@@ -924,6 +924,12 @@ autowrap:           resq 1          ; 1 = autowrap on (default)
 mouse_tracking:     resq 1          ; 0=off, 1=normal, 2=button, 3=any
 mouse_sgr:          resq 1          ; 1 = SGR mouse encoding
 bracketed_paste:    resq 1          ; 1 = bracketed paste mode
+; Kitty keyboard protocol level (CSI > N u to set, CSI < u to pop, CSI = N u
+; to push). 0 = legacy encoding; >0 = encode keys with modifiers as
+; CSI keycode ; modifiers u. Bit 0 (level=1) is "disambiguate escape codes",
+; which is what Claude Code requests so it can distinguish Shift+Enter /
+; Alt+Enter from a bare Enter and let the user insert newlines in the prompt.
+kitty_kbd_flags:    resq 1
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
@@ -5949,6 +5955,67 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_return:
+    ; If kitty keyboard mode is on AND any modifier (shift/alt/ctrl/super)
+    ; is held, emit `\e[13;<mods>u` so the app can distinguish e.g.
+    ; Shift+Enter from a bare Enter. Otherwise emit a plain CR.
+    cmp qword [kitty_kbd_flags], 0
+    je .hkp_return_plain
+    mov ecx, ebx
+    and ecx, 1 | 4 | 8 | 64
+    jz .hkp_return_plain
+    ; Build modifier byte: 1 + (shift?1:0) + (alt?2:0) + (ctrl?4:0) + (super?8:0)
+    mov edx, 1
+    test ebx, 1
+    jz .hkp_ret_no_shift
+    add edx, 1
+.hkp_ret_no_shift:
+    test ebx, 8
+    jz .hkp_ret_no_alt
+    add edx, 2
+.hkp_ret_no_alt:
+    test ebx, 4
+    jz .hkp_ret_no_ctrl
+    add edx, 4
+.hkp_ret_no_ctrl:
+    test ebx, 64
+    jz .hkp_ret_no_super
+    add edx, 8
+.hkp_ret_no_super:
+    ; Emit "\e[13;<edx>u" (mod fits in two ASCII digits).
+    lea rdi, [key_out_buf]
+    mov byte [rdi+0], 0x1B
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '1'
+    mov byte [rdi+3], '3'
+    mov byte [rdi+4], ';'
+    add rdi, 5
+    mov eax, edx
+    cmp eax, 10
+    jb .hkp_ret_one_digit
+    mov ecx, eax
+    mov eax, ecx
+    mov r8d, 10
+    xor edx, edx
+    div r8d
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    jmp .hkp_ret_finish_u
+.hkp_ret_one_digit:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+.hkp_ret_finish_u:
+    mov byte [rdi], 'u'
+    inc rdi
+    lea rax, [key_out_buf]
+    mov rdx, rdi
+    sub rdx, rax
+    jmp .hkp_send_seq
+.hkp_return_plain:
     mov byte [key_out_buf], 0x0D
     mov rdx, 1
     jmp .hkp_send_seq
@@ -6892,18 +6959,57 @@ vt_process:
     mov [vt_param_count], rcx
 
     ; Private-prefix sequences with '>', '<', or '=' are xterm/kitty
-    ; extensions glass doesn't implement (modifyOtherKeys, kitty
-    ; keyboard protocol, etc.). Without this guard, e.g. CC's
-    ; \e[>1u (kitty keyboard set) would dispatch as 'u' = restore
-    ; cursor → cursor lands at whatever was last DECSC'd, completely
-    ; out of place. '?' private (DEC modes) DOES dispatch (h/l for
-    ; ?25h, ?2004h, etc.) — those handlers themselves still need to
-    ; check vt_private to distinguish DEC modes from standard ones.
+    ; extensions. Most we still don't implement (modifyOtherKeys via
+    ; \e[>4m etc.), but we DO implement the kitty keyboard protocol's
+    ; \e[>Nu (push), \e[<u (pop), \e[=Nu (set). Without that, Shift+
+    ; Enter and Alt+Enter can't be disambiguated from bare Enter,
+    ; which means Claude Code can't insert a newline in its prompt.
+    ; '?' private (DEC modes) always dispatches.
     movzx ecx, byte [vt_private]
     test ecx, ecx
     jz .vtp_csi_dispatch_open
     cmp ecx, '?'
+    je .vtp_csi_dispatch_open
+    ; Allow >/<= ONLY for the 'u' final (kitty keyboard).
+    cmp al, 'u'
     jne .vtp_loop
+    cmp ecx, '>'
+    je .vtp_csi_kitty_push
+    cmp ecx, '<'
+    je .vtp_csi_kitty_pop
+    cmp ecx, '='
+    je .vtp_csi_kitty_set
+    jmp .vtp_loop
+.vtp_csi_kitty_push:
+    ; \e[>Nu — request progressive enhancement at level N (default 1).
+    ; Treat as "set"; we don't keep a stack since callers only care that
+    ; the level is non-zero.
+    mov rax, [vt_param_count]
+    test rax, rax
+    jz .vtp_csi_kitty_default
+    mov rax, [vt_params]
+    jmp .vtp_csi_kitty_store
+.vtp_csi_kitty_default:
+    mov rax, 1
+.vtp_csi_kitty_store:
+    mov [kitty_kbd_flags], rax
+    jmp .vtp_loop
+.vtp_csi_kitty_pop:
+    ; \e[<u — pop / disable. Return to legacy encoding.
+    mov qword [kitty_kbd_flags], 0
+    jmp .vtp_loop
+.vtp_csi_kitty_set:
+    ; \e[=Nu — set flags absolutely.
+    mov rax, [vt_param_count]
+    test rax, rax
+    jz .vtp_csi_kitty_default_set
+    mov rax, [vt_params]
+    jmp .vtp_csi_kitty_set_store
+.vtp_csi_kitty_default_set:
+    xor eax, eax
+.vtp_csi_kitty_set_store:
+    mov [kitty_kbd_flags], rax
+    jmp .vtp_loop
 .vtp_csi_dispatch_open:
     cmp al, 'A'
     je .vtp_csi_cuu
