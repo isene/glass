@@ -16005,6 +16005,23 @@ ttf_upload_glyph:
     ; descender tails and punctuation (g/j/p/q/y/, /. /' /") have ink
     ; pixels clustered (spread ≤ 1) so this leaves them intact.
 .trim_speckle:
+    ; Skip the speckle trim entirely for braille (U+2800..U+28FF) and
+    ; the box-drawing / block-elements range (U+2500..U+259F) where
+    ; sparse-dot patterns are the actual glyph shape, not a hinting
+    ; artifact. Braille is the load-bearing case: the Rust `plot`
+    ; crate draws line graphs via braille chars in apps like the
+    ; trade TUI — without this bypass the trim chews the dot rows
+    ; and the graph renders as a blank pane.
+    cmp rbx, 0x2800
+    jb .trim_speckle_run
+    cmp rbx, 0x28FF
+    jbe .trim_done
+.trim_speckle_run:
+    cmp rbx, 0x2500
+    jb .trim_speckle_real
+    cmp rbx, 0x259F
+    jbe .trim_done
+.trim_speckle_real:
     test r13, r13
     jz .trim_done                       ; H=0, nothing to trim
     mov rax, r13
