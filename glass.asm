@@ -880,6 +880,17 @@ prev_paint_bell_until: resq 1
 row_paint_start:       resq 1
 row_paint_end:         resq 1
 
+; Per-row dirty bitmap, populated by a pre-pass at the top of
+; render_screen. row_dirty_map[r] = 1 if grid[r] differs from
+; prev_paint_grid[r]. The main row loop paints rows where the bit
+; itself OR a neighbour's bit (smearing ±1 row) is set, so glyph
+; bleed from a changed row gets cleaned by the neighbour repaint
+; even when the neighbour's grid cells didn't change. Without the
+; smear, kastrup-style scrolling left dotted residue along the
+; lower edge of the right pane where the bottom row's glyph bleed
+; survived into the row below.
+row_dirty_map:         resb MAX_ROWS
+
 ; GC foreground cache. Tracks what fg pixel was last loaded into
 ; gc_id via ChangeGC. Lets adjacent runs that share fg (or share
 ; bg, since many cells use default bg) skip the redundant ChangeGC.
@@ -6248,16 +6259,24 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_send_seq:
-    ; Ctrl+L (single 0x0C byte) clears the screen via the shell. Also
-    ; clear any active mouse selection so the lingering inverse-video
-    ; band doesn't survive the visual-clear into the next prompt.
+    ; Ctrl+L (single 0x0C byte): traditionally a "clear screen" hint
+    ; to the shell. Some apps honour it (bash, vim normal mode);
+    ; others (kastrup, rcurses TUIs) ignore it. Even when the shell
+    ; clears, back-pixmap residue from a previous frame survives the
+    ; per-row dirty-skip + partial-BLT path because the underlying
+    ; grid bytes never changed (e.g. cleared kitty-graphics images,
+    ; OSC 8 underline strips that aren't repainted by row-cell logic).
+    ;
+    ; Glass-side: on Ctrl+L, also (1) drop any active mouse selection
+    ; and (2) set all_dirty=1 so the next render does a full-window
+    ; repaint and BLT, sweeping any pixel residue regardless of what
+    ; the shell does with the byte.
     cmp rdx, 1
     jne .hkp_send_seq_no_clear
     cmp byte [key_out_buf], 0x0C
     jne .hkp_send_seq_no_clear
-    cmp qword [sel_active], 0
-    je .hkp_send_seq_no_clear
     mov qword [sel_active], 0
+    mov qword [all_dirty], 1
     call request_render
 .hkp_send_seq_no_clear:
     mov rax, SYS_WRITE
@@ -9629,6 +9648,54 @@ render_screen:
     ; savings (adjacent runs sharing fg or bg) are preserved.
     mov byte [gc_fg_valid], 0
 
+    ; Pre-pass: build row_dirty_map by comparing each grid row to
+    ; prev_paint_grid. The main row loop will paint rows where the
+    ; bit OR an immediate-neighbour bit is set, covering glyph bleed
+    ; from a changed row onto an unchanged neighbour. all_dirty=1
+    ; or scrollback paths skip the pre-pass entirely (every row
+    ; already force-paints).
+    push rbx
+    push r12
+    xor r12, r12
+.rs_dmap_zero:
+    cmp r12, MAX_ROWS
+    jge .rs_dmap_zero_done
+    mov byte [row_dirty_map + r12], 0
+    inc r12
+    jmp .rs_dmap_zero
+.rs_dmap_zero_done:
+    cmp qword [all_dirty], 0
+    jne .rs_dmap_done                  ; full repaint → bitmap unused
+    cmp qword [scroll_offset], 0
+    jne .rs_dmap_done                  ; scrollback path doesn't use mirror
+    xor r12, r12
+.rs_dmap_row:
+    cmp r12, [grid_rows]
+    jge .rs_dmap_done
+    push rdi
+    push rsi
+    push rcx
+    mov rax, r12
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rdi, [grid + rax]
+    lea rsi, [prev_paint_grid + rax]
+    mov rcx, [grid_cols]
+    imul rcx, CELL_SIZE
+    shr rcx, 3
+    repe cmpsq
+    pop rcx
+    pop rsi
+    pop rdi
+    je .rs_dmap_clean                  ; ZF=1 → identical
+    mov byte [row_dirty_map + r12], 1
+.rs_dmap_clean:
+    inc r12
+    jmp .rs_dmap_row
+.rs_dmap_done:
+    pop r12
+    pop rbx
+
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
     ; and the previous cursor block don't get painted over. Clear the
@@ -9966,35 +10033,59 @@ rs_row_loop:
     mov rax, [grid_cols]
     mov [row_paint_end], rax
 
-    ; Per-row dirty skip: scan grid_row vs prev_paint_row at cell
-    ; granularity, recording the leftmost and rightmost differing
-    ; cells. Identical rows skip every X11 request; partially-changed
-    ; rows render only the [first_diff..last_diff+1) column band, so
-    ; e.g. a cursor blink or a single-cell update is one run wide
-    ; instead of a whole-row pass. Force-render conditions
-    ; (all_dirty=1, cursor current/prev) keep the default 0..grid_cols.
+    ; Per-row dirty skip via the pre-computed row_dirty_map. Paint
+    ; this row if its own bit is set OR if a neighbour bit is set
+    ; (±1 row smear) — glyph bleed from a changed row needs the
+    ; neighbour to repaint so the bleed-into-neighbour pixels get
+    ; cleaned. Force-render conditions (all_dirty=1, cursor row,
+    ; scrollback) bypass the bitmap entirely.
     cmp qword [all_dirty], 0
     jne .rs_row_ready
     cmp r12, [cursor_row]
     je .rs_row_ready
     cmp r12, [prev_paint_cursor_row]
     je .rs_row_ready
+    cmp qword [scroll_offset], 0
+    jne .rs_row_ready                   ; scrollback always paints
+    movzx eax, byte [row_dirty_map + r12]
+    test eax, eax
+    jnz .rs_row_dirty
+    ; Check neighbour above (r12 - 1).
+    test r12, r12
+    jz .rs_row_check_below
+    mov rax, r12
+    dec rax
+    movzx eax, byte [row_dirty_map + rax]
+    test eax, eax
+    jnz .rs_row_dirty
+.rs_row_check_below:
+    ; Check neighbour below (r12 + 1).
+    mov rax, r12
+    inc rax
+    cmp rax, [grid_rows]
+    jge .rs_row_skip                    ; no row below → no smear
+    movzx eax, byte [row_dirty_map + rax]
+    test eax, eax
+    jz .rs_row_skip                     ; clean + clean neighbours → skip
+.rs_row_dirty:
+    ; This row paints. Compute paint range from cell-level diff with
+    ; ±1 cell padding to cover horizontal glyph bleed.
     push rbx
     push r10
     push r11
     mov rax, r12
     imul rax, MAX_COLS
-    imul rax, CELL_SIZE                 ; row byte offset
-    lea rsi, [grid + rax]               ; live row
-    lea rdi, [prev_paint_grid + rax]    ; mirror row
-    mov r10, -1                         ; first_diff (sentinel)
-    mov r11, -1                         ; last_diff
-    xor rbx, rbx                        ; col index
+    imul rax, CELL_SIZE
+    lea rsi, [grid + rax]
+    lea rdi, [prev_paint_grid + rax]
+    mov r10, -1
+    mov r11, -1
+    xor rbx, rbx
 .rs_row_diff_loop:
     cmp rbx, [grid_cols]
     jge .rs_row_diff_done
     mov rax, rbx
-    shl rax, 4                          ; col × 16 (CELL_SIZE)
+    shl rax, 4
     mov rcx, [rsi + rax]
     cmp rcx, [rdi + rax]
     jne .rs_row_diff_hit
@@ -10006,26 +10097,32 @@ rs_row_loop:
 .rs_row_diff_hit:
     cmp r10, -1
     jne .rs_row_diff_have_first
-    mov r10, rbx                        ; first_diff = rbx
+    mov r10, rbx
 .rs_row_diff_have_first:
-    mov r11, rbx                        ; last_diff = rbx (track latest)
+    mov r11, rbx
     inc rbx
     jmp .rs_row_diff_loop
 .rs_row_diff_done:
     cmp r10, -1
-    je .rs_row_diff_skip                ; no diffs → skip whole row
-    ; Pad the paint range by ±1 cell to cover glyph bleed: a changed
-    ; cell's new glyph may extend a pixel or two into its neighbour
-    ; (italic tails, bold overhang, certain box-drawing chars), and
-    ; the previous frame's bleed needs to be cleared on the neighbour
-    ; or it persists because the neighbour itself didn't change.
+    jne .rs_row_diff_have_range
+    ; This row's own cells didn't change — we're here only because a
+    ; neighbour was dirty. Repaint the whole row so we can be sure to
+    ; cover any bleed from the neighbour.
+    mov qword [row_paint_start], 0
+    mov rax, [grid_cols]
+    mov [row_paint_end], rax
+    pop r11
+    pop r10
+    pop rbx
+    jmp .rs_row_ready
+.rs_row_diff_have_range:
     test r10, r10
     jz .rs_row_diff_no_left_pad
     dec r10
 .rs_row_diff_no_left_pad:
     mov rax, [grid_cols]
-    inc r11                             ; exclusive end
-    inc r11                             ; +1 padding
+    inc r11
+    inc r11
     cmp r11, rax
     jle .rs_row_diff_end_ok
     mov r11, rax
@@ -10036,11 +10133,6 @@ rs_row_loop:
     pop r10
     pop rbx
     jmp .rs_row_ready
-.rs_row_diff_skip:
-    pop r11
-    pop r10
-    pop rbx
-    jmp .rs_row_skip
 
 .rs_row_ready:
     ; r12 = display row, scan columns for color runs
