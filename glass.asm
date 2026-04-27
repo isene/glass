@@ -15892,6 +15892,157 @@ ttf_upload_glyph:
     movzx r10, word [char_width]       ; advance = char_width
     jmp .have_glyph
 .not_space_pre:
+    ; Procedural braille (U+2800..U+28FF). DejaVu Sans Mono ships
+    ; without braille glyphs and apps that draw line graphs via
+    ; braille (the Ruby `termgraph` gem, the Rust `plot` crate, etc.)
+    ; render as blank cells. Generate the dot pattern algorithmically
+    ; from the codepoint's low 8 bits — no font fallback needed.
+    cmp rbx, 0x2800
+    jb .ttf_no_braille
+    cmp rbx, 0x28FF
+    ja .ttf_no_braille
+    ; Layout: 2 cols × 4 rows of dots in the cell. Dot side = max(2,
+    ; char_width / 5). Column centres at W/4 and 3W/4; row centres at
+    ; H/8, 3H/8, 5H/8, 7H/8. Bit→position table (standard 8-dot
+    ; braille):
+    ;   bit 0 → (col 0, row 0)   bit 3 → (col 1, row 0)
+    ;   bit 1 → (col 0, row 1)   bit 4 → (col 1, row 1)
+    ;   bit 2 → (col 0, row 2)   bit 5 → (col 1, row 2)
+    ;   bit 6 → (col 0, row 3)   bit 7 → (col 1, row 3)
+    push rbx                            ; preserve cp across helper math
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx r12d, word [char_width]      ; W
+    movzx r13d, word [char_height]     ; H
+    ; Zero the W*H bytes of output_buf.
+    mov rax, r12
+    imul rax, r13
+    xor edi, edi
+.ttf_brl_zero:
+    cmp rdi, rax
+    jge .ttf_brl_zero_done
+    mov byte [output_buf + rdi], 0
+    inc rdi
+    jmp .ttf_brl_zero
+.ttf_brl_zero_done:
+    ; dot_side = max(2, char_width / 5)
+    mov eax, r12d
+    mov ecx, 5
+    xor edx, edx
+    div ecx                            ; eax = W/5
+    cmp eax, 2
+    jge .ttf_brl_dot_ok
+    mov eax, 2
+.ttf_brl_dot_ok:
+    mov r14d, eax                      ; r14d = dot_side
+    ; n = cp - 0x2800  (low 8 bits = dot pattern)
+    mov rax, rbx
+    sub rax, 0x2800
+    mov r15d, eax                      ; r15d = bit pattern
+    ; Iterate bits 0..7. ebx = bit index.
+    xor ebx, ebx
+.ttf_brl_loop:
+    cmp ebx, 8
+    jge .ttf_brl_done
+    mov ecx, ebx
+    mov eax, 1
+    shl eax, cl
+    test r15d, eax
+    jz .ttf_brl_next_bit
+    ; Bit set → draw a dot. Compute (col, row) from bit index:
+    ;   col = (bit < 3) ? 0 : (bit < 6) ? 1 : (bit & 1)
+    ;   row = (bit < 6) ? (bit % 3) : 3
+    cmp ebx, 6
+    jl .ttf_brl_low6
+    ; bits 6/7 → row 3, col = bit & 1
+    mov esi, ebx
+    and esi, 1                         ; col
+    mov edi, 3                         ; row
+    jmp .ttf_brl_have_pos
+.ttf_brl_low6:
+    mov eax, ebx
+    mov ecx, 3
+    xor edx, edx
+    div ecx                            ; eax = bit/3 (col), edx = bit%3 (row)
+    mov esi, eax                       ; col
+    mov edi, edx                       ; row
+.ttf_brl_have_pos:
+    ; dot top-left x = (col == 0) ? W/4 - dot/2 : 3W/4 - dot/2
+    mov eax, r12d
+    test esi, esi
+    jnz .ttf_brl_x_right
+    shr eax, 2                         ; W/4
+    jmp .ttf_brl_x_have
+.ttf_brl_x_right:
+    imul eax, eax, 3
+    shr eax, 2                         ; 3W/4
+.ttf_brl_x_have:
+    mov ecx, r14d
+    shr ecx, 1
+    sub eax, ecx                       ; eax = dot top-left x
+    test eax, eax
+    jns .ttf_brl_x_pos
+    xor eax, eax
+.ttf_brl_x_pos:
+    mov esi, eax                       ; esi = x
+    ; dot top-left y = (2*row + 1) * H / 8 - dot/2
+    mov eax, edi
+    shl eax, 1                         ; 2*row
+    inc eax                            ; 2*row + 1
+    imul eax, r13d                     ; (2*row+1) * H
+    shr eax, 3                         ; / 8
+    mov ecx, r14d
+    shr ecx, 1
+    sub eax, ecx                       ; eax = dot top-left y
+    test eax, eax
+    jns .ttf_brl_y_pos
+    xor eax, eax
+.ttf_brl_y_pos:
+    mov edi, eax                       ; edi = y
+    ; Fill dot_side × dot_side rectangle at (esi, edi) with 0xFF.
+    xor ecx, ecx                       ; dy
+.ttf_brl_dot_row:
+    cmp ecx, r14d
+    jge .ttf_brl_next_bit
+    cmp edi, r13d                      ; y past H?
+    jge .ttf_brl_next_bit
+    mov rax, rdi
+    imul rax, r12                      ; y * W
+    add rax, rsi                       ; + x
+    xor edx, edx                       ; dx
+.ttf_brl_dot_col:
+    cmp edx, r14d
+    jge .ttf_brl_dot_row_done
+    mov r8d, esi
+    add r8d, edx
+    cmp r8d, r12d                      ; x past W?
+    jge .ttf_brl_dot_row_done
+    mov byte [output_buf + rax + rdx], 0xFF
+    inc edx
+    jmp .ttf_brl_dot_col
+.ttf_brl_dot_row_done:
+    inc edi
+    inc ecx
+    jmp .ttf_brl_dot_row
+.ttf_brl_next_bit:
+    inc ebx
+    jmp .ttf_brl_loop
+.ttf_brl_done:
+    ; Set up engine output regs for .have_glyph path.
+    mov rcx, r12                       ; W
+    mov rdx, r13                       ; H
+    xor r8, r8                         ; bearing_x = 0
+    movzx r9, word [font_ascent]       ; bearing_y = ascent (top of cell)
+    movzx r10, word [char_width]       ; advance
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    jmp .have_glyph
+.ttf_no_braille:
     mov rdi, rbx                       ; original cp
     call glyph_render_to_alpha
     test eax, eax
