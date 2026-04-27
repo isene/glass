@@ -6248,6 +6248,18 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_send_seq:
+    ; Ctrl+L (single 0x0C byte) clears the screen via the shell. Also
+    ; clear any active mouse selection so the lingering inverse-video
+    ; band doesn't survive the visual-clear into the next prompt.
+    cmp rdx, 1
+    jne .hkp_send_seq_no_clear
+    cmp byte [key_out_buf], 0x0C
+    jne .hkp_send_seq_no_clear
+    cmp qword [sel_active], 0
+    je .hkp_send_seq_no_clear
+    mov qword [sel_active], 0
+    call request_render
+.hkp_send_seq_no_clear:
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
     lea rsi, [key_out_buf]
