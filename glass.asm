@@ -14482,6 +14482,14 @@ place_clear_image:
     inc ecx
     jmp .pci_loop
 .pci_done:
+    ; Force full repaint: the just-removed image painted pixels onto
+    ; the back-pixmap that aren't in any cell's paint area, so the
+    ; per-row dirty-skip + column-range diff would otherwise leave
+    ; the residue visible underneath whatever now occupies that
+    ; cell range (visible in pointer when navigating from an image
+    ; preview back into a directory listing — the listing draws over
+    ; the image instead of replacing it).
+    mov qword [all_dirty], 1
     ret
 
 ; Clear all placements.
@@ -14490,6 +14498,7 @@ place_clear_all:
     mov ecx, PLACE_SLOTS * PLACE_SLOT_SIZE / 8
     xor eax, eax
     rep stosq
+    mov qword [all_dirty], 1               ; same reason as place_clear_image
     ret
 
 ; ──────────────────────────────────────────────────────────────────
