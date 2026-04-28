@@ -10265,6 +10265,14 @@ render_screen:
     call bbox_full_window
     jmp .rs_no_bell
 .rs_bell_active:
+    ; Force the partial-BLT bbox to the full window AND mark all rows
+    ; dirty: the gray fill paints the entire back-pixmap, but only the
+    ; bbox region gets CopyArea'd to the visible window — without this,
+    ; only the row that was already dirty (typically the cursor's row)
+    ; would actually flash gray. Same idea as the bell-expiry branch
+    ; above; both transitions need a full-window repaint.
+    mov qword [all_dirty], 1
+    call bbox_full_window
     ; Set GC fg to bright color for fill
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
