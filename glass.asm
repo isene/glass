@@ -6328,6 +6328,14 @@ handle_keypress:
 .hkp_ctrl_l_no_sel:
     mov qword [all_dirty], 1
     call request_render
+    ; selection_release_all + request_render clobber rdx. The fall-
+    ; through to .hkp_send_seq_no_clear writes rdx bytes from
+    ; key_out_buf to the PTY — without this restore, that became
+    ; ~16 bytes of trash (0x0C plus whatever the previous keypress
+    ; left in key_out_buf — `[C` from a right-arrow, `[3~` from
+    ; delete, etc. — which bare echoed straight into its line
+    ; buffer, advancing the cursor).
+    mov rdx, 1
 .hkp_send_seq_no_clear:
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
