@@ -6043,13 +6043,17 @@ handle_keypress:
     syscall
     jmp .hkp_done
 .hkp_send_plain:
+    ; Route through .hkp_send_seq so its Ctrl+L (0x0C) post-process
+    ; (drop selection, release X11 selection ownership, force full
+    ; repaint) actually runs. .hkp_send_seq is reached otherwise only
+    ; from special-key handlers — without this jump, Ctrl+L from the
+    ; ASCII path bypassed all of the cleanup, leaving sel_active=1
+    ; while the shell cleared the grid → blank cells in the still-
+    ; "selected" rect painted with inverse bg, leaving a white box
+    ; floating in the cleared screen.
     mov [key_out_buf], al
-    mov rax, SYS_WRITE
-    mov rdi, [pty_master]
-    lea rsi, [key_out_buf]
     mov rdx, 1
-    syscall
-    jmp .hkp_done
+    jmp .hkp_send_seq
 
 .hkp_special:
     ; XK_BackSpace = 0xFF08
@@ -6317,7 +6321,11 @@ handle_keypress:
     jne .hkp_send_seq_no_clear
     cmp byte [key_out_buf], 0x0C
     jne .hkp_send_seq_no_clear
+    cmp qword [sel_active], 0
+    je .hkp_ctrl_l_no_sel
     mov qword [sel_active], 0
+    call selection_release_all
+.hkp_ctrl_l_no_sel:
     mov qword [all_dirty], 1
     call request_render
 .hkp_send_seq_no_clear:
@@ -9212,6 +9220,40 @@ selection_claim_primary:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
+    ret
+
+; selection_release_all: SetSelectionOwner(window=None) on both
+; PRIMARY and CLIPBOARD so other apps stop seeing glass as the
+; selection owner. Used when Ctrl+L drops the active selection —
+; otherwise a middle-click paste in another app would still pull
+; the no-longer-highlighted text from us.
+selection_release_all:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov dword [rdi+4], 0          ; window = None → release
+    mov dword [rdi+8], 1          ; XA_PRIMARY
+    mov dword [rdi+12], 0         ; CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    cmp dword [clipboard_atom], 0
+    je .sra_done
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov dword [rdi+4], 0
+    mov eax, [clipboard_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.sra_done:
     ret
 
 ; selection_claim_clipboard: SetSelectionOwner on CLIPBOARD (interned).
