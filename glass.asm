@@ -4678,22 +4678,51 @@ event_loop:
     mov edx, 200              ; 200ms timeout to fork fallback
     jmp .ev_do_poll
 .ev_poll_normal:
-    cmp qword [cfg_blink_ms], 0
-    je .ev_poll_infinite
-    cmp qword [cursor_visible], 0
-    je .ev_poll_infinite
-    ; Compute remaining ms until next blink toggle
+    ; Compute the smaller of: cursor_blink remaining, bell_flash remaining.
+    ; Either or both can be inactive; if neither is, poll waits forever.
+    ; rcx accumulates the deadline (ms remaining); 0 = no deadline yet.
+    xor ecx, ecx
+    xor r8d, r8d
+    ; Bell deadline?
+    cmp qword [bell_flash_until], 0
+    je .ev_poll_check_blink
+    push rax
     call click_now_ms
-    mov rcx, [cursor_blink_until]
-    sub rcx, rax
+    mov r8, [bell_flash_until]
+    sub r8, rax
+    pop rax
+    test r8, r8
+    jg .ev_poll_have_bell
+    mov r8d, 1
+.ev_poll_have_bell:
+    mov rcx, r8
+.ev_poll_check_blink:
+    cmp qword [cfg_blink_ms], 0
+    je .ev_poll_have_deadlines
+    cmp qword [cursor_visible], 0
+    je .ev_poll_have_deadlines
+    push rax
+    call click_now_ms
+    mov r8, [cursor_blink_until]
+    sub r8, rax
+    pop rax
+    test r8, r8
+    jg .ev_poll_blink_pos
+    mov r8d, 1
+.ev_poll_blink_pos:
+    cmp r8, [cfg_blink_ms]
+    jle .ev_poll_blink_cap
+    mov r8, [cfg_blink_ms]
+.ev_poll_blink_cap:
     test rcx, rcx
-    jg .ev_blink_timeout_ok
-    mov rcx, 1                ; due now-ish, fire next iteration
-.ev_blink_timeout_ok:
-    cmp rcx, [cfg_blink_ms]
-    jle .ev_blink_timeout_set
-    mov rcx, [cfg_blink_ms]
-.ev_blink_timeout_set:
+    jz .ev_poll_blink_only
+    cmp r8, rcx
+    jge .ev_poll_have_deadlines
+.ev_poll_blink_only:
+    mov rcx, r8
+.ev_poll_have_deadlines:
+    test rcx, rcx
+    jz .ev_poll_infinite
     mov rdx, rcx
     jmp .ev_do_poll
 .ev_poll_infinite:
@@ -4718,19 +4747,35 @@ event_loop:
     ; Even if a real fd event woke us, see if the blink timer expired so
     ; the cursor doesn't drift visually.
     cmp qword [cfg_blink_ms], 0
-    je .ev_check_x11
+    je .ev_check_bell
     cmp qword [cursor_visible], 0
-    je .ev_check_x11
+    je .ev_check_bell
     push rax
     call click_now_ms
     mov rcx, rax
     pop rax
     cmp rcx, [cursor_blink_until]
-    jl .ev_check_x11
+    jl .ev_check_bell
     ; Toggle state and rearm
     xor qword [cursor_blink_state], 1
     add rcx, [cfg_blink_ms]
     mov [cursor_blink_until], rcx
+    push rax
+    call request_render
+    pop rax
+.ev_check_bell:
+    ; If the bell-flash deadline expired, kick a render so the gray fill
+    ; gets repainted over (render_screen handles the all_dirty + bbox
+    ; reset on the expiry path). Without this, vim's ESC-bell leaves the
+    ; whole screen gray until the user types something else.
+    cmp qword [bell_flash_until], 0
+    je .ev_check_x11
+    push rax
+    call click_now_ms
+    mov rcx, rax
+    pop rax
+    cmp rcx, [bell_flash_until]
+    jl .ev_check_x11
     push rax
     call request_render
     pop rax
@@ -6783,21 +6828,18 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_bel:
-    ; Visual bell: set bell_flash_until = now + 100ms
-    sub rsp, 16
-    mov rax, SYS_CLOCK_GETTIME
-    xor edi, edi             ; CLOCK_REALTIME
-    mov rsi, rsp
-    syscall
-    ; Convert sec*1e9 + nsec
-    mov rax, [rsp]
-    imul rax, 1000000000
-    add rax, [rsp + 8]
-    add rax, 100000000       ; +100ms
+    ; Visual bell: set bell_flash_until = now + 100ms (CLOCK_MONOTONIC ms,
+    ; same clock as cursor_blink_until so the poll loop can compute one
+    ; timeout that covers both).
+    push rdx
+    push rcx
+    call click_now_ms
+    add rax, 100
     mov [bell_flash_until], rax
+    pop rcx
+    pop rdx
     ; Force redraw to show flash
     mov qword [all_dirty], 1
-    add rsp, 16
     jmp .vtp_loop
 
 .vtp_esc:
@@ -10199,18 +10241,15 @@ render_screen:
     inc dword [x11_seq]
 .rs_no_pseudo_clear:
 
-    ; Check visual bell - if active, fill window with bell color first
+    ; Check visual bell - if active, fill window with bell color first.
+    ; bell_flash_until is CLOCK_MONOTONIC ms (matches cursor_blink_until).
     cmp qword [bell_flash_until], 0
     jz .rs_no_bell
-    sub rsp, 16
-    mov rax, SYS_CLOCK_GETTIME
-    xor edi, edi
-    mov rsi, rsp
-    syscall
-    mov rax, [rsp]
-    imul rax, 1000000000
-    add rax, [rsp + 8]
-    add rsp, 16
+    push rdx
+    push rcx
+    call click_now_ms
+    pop rcx
+    pop rdx
     cmp rax, [bell_flash_until]
     jl .rs_bell_active
     ; Bell expired during this render. Resetting to 0 isn't enough —
