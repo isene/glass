@@ -787,6 +787,11 @@ url_str_pos:        resq 1
 hover_url_idx:      resq 1          ; signed; -1 = no hover
 hover_url_pressed:  resb 1          ; 1 between press-on-url and release
 
+; Logging — see log_open_glass / log_write_buf in .text. fd=0 means
+; "log file unavailable" (kernel never returns 0 from open with
+; stdin still open).
+log_fd_glass:       resq 1
+
 ; Config (.glassrc)
 cfg_bg_pixel:       resd 1
 cfg_fg_pixel:       resd 1
@@ -1126,6 +1131,10 @@ _start:
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
 
+    ; Open /tmp/glass.log so errors / X11 protocol failures land in
+    ; a tail-able file even when stderr is eaten by gdm-x-session.
+    call log_open_glass
+
     ; Parse argv for `-e CMD [ARGS...]` or `-- CMD [ARGS...]`. Anything
     ; after the marker becomes exec_argv (capped at 31 args + NULL).
     ; Argv before the marker is silently ignored — we don't have any
@@ -1319,6 +1328,7 @@ _start:
     lea rsi, [err_x11]
     mov rdx, err_x11_len
     syscall
+    call log_write_buf
     jmp .die
 
 .die_pty:
@@ -1327,6 +1337,7 @@ _start:
     lea rsi, [err_pty]
     mov rdx, err_pty_len
     syscall
+    call log_write_buf
     jmp .die
 
 .die_fork:
@@ -1335,6 +1346,7 @@ _start:
     lea rsi, [err_fork]
     mov rdx, err_fork_len
     syscall
+    call log_write_buf
 
 .die:
     mov rdi, 1
@@ -1931,6 +1943,47 @@ alloc_xid:
     and eax, [x11_rid_mask]
     or eax, [x11_rid_base]
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Logging
+; ══════════════════════════════════════════════════════════════════════
+; /tmp/glass.log is opened in append mode at startup. log_write_buf
+; mirrors the existing stderr writes to that file; gdm-x-session and
+; tile-spawned children otherwise drop stderr on the floor, so a
+; user-facing crash or X11 protocol error left no trail. This path
+; is cold (only error/warning sites call it), so no measurable cost
+; on the normal render hot path. fd 0 is the sentinel for "open
+; failed / not yet opened" — the kernel never returns fd 0 from
+; open() while stdin is still a fd (which it always is for us).
+
+log_open_glass:
+    mov rax, SYS_OPEN
+    lea rdi, [log_path_glass]
+    mov rsi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .lo_done
+    mov [log_fd_glass], rax
+.lo_done:
+    ret
+
+; rsi=buf, rdx=len. Preserves rax/rdi/rsi/rdx so callers can chain
+; this immediately after a write(2) to fd 2 without re-loading args.
+log_write_buf:
+    cmp qword [log_fd_glass], 0
+    jle .lwb_done
+    push rax
+    push rdi
+    mov rdi, [log_fd_glass]
+    mov rax, SYS_WRITE
+    syscall
+    pop rdi
+    pop rax
+.lwb_done:
+    ret
+
+log_path_glass: db "/tmp/glass.log", 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; X11 requests
@@ -4889,6 +4942,7 @@ handle_x11_events:
     mov rax, SYS_WRITE
     mov rdi, 2
     syscall
+    call log_write_buf
     pop r12
     pop rbx
     add rbx, 32
