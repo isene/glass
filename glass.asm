@@ -6838,8 +6838,10 @@ vt_process:
     mov [bell_flash_until], rax
     pop rcx
     pop rdx
-    ; Force redraw to show flash
-    mov qword [all_dirty], 1
+    ; Trigger a render so the gray fill paints. Don't set all_dirty=1
+    ; here — render_screen's bell-active branch handles the bbox
+    ; expansion, and forcing row repaints would cover the gray.
+    call request_render
     jmp .vtp_loop
 
 .vtp_esc:
@@ -9949,6 +9951,20 @@ blt_back_to_window:
     je .blt_ret
     cmp byte [blt_dirty], 1
     jne .blt_ret                       ; nothing painted → no-op BLT
+    ; Bell-flash gate: when the visual bell is active, render_screen
+    ; painted gray directly on the window. CopyArea'ing the back-pixmap
+    ; over that would erase the flash before the user sees it. The
+    ; flash-expiry render forces all_dirty + full repaint, so the next
+    ; CopyArea covers the whole window cleanly.
+    cmp qword [bell_flash_until], 0
+    je .blt_no_bell
+    push rax
+    call click_now_ms
+    mov rcx, rax
+    pop rax
+    cmp rcx, [bell_flash_until]
+    jl .blt_ret                        ; bell still active → skip CopyArea
+.blt_no_bell:
     ; Clamp bbox to the window in case any caller over-reported.
     mov rax, [blt_x0]
     test rax, rax
@@ -10265,15 +10281,14 @@ render_screen:
     call bbox_full_window
     jmp .rs_no_bell
 .rs_bell_active:
-    ; Force the partial-BLT bbox to the full window AND mark all rows
-    ; dirty: the gray fill paints the entire back-pixmap, but only the
-    ; bbox region gets CopyArea'd to the visible window — without this,
-    ; only the row that was already dirty (typically the cursor's row)
-    ; would actually flash gray. Same idea as the bell-expiry branch
-    ; above; both transitions need a full-window repaint.
-    mov qword [all_dirty], 1
-    call bbox_full_window
-    ; Set GC fg to bright color for fill
+    ; Paint a full-window gray rectangle directly on the window (NOT the
+    ; back-pixmap). The previous design painted gray on the back-pixmap
+    ; and relied on CopyArea + per-row dirty-skip to leave the gray
+    ; visible on unchanged rows; in practice the partial-BLT bbox and
+    ; per-row repaint logic kept clobbering the flash to a single row.
+    ; Direct-to-window gray is unconditional and visible immediately.
+    ; The next render (after expiry) repaints all cells over the
+    ; window via the normal back-pixmap → CopyArea path.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
     mov byte [rdi+1], 0
@@ -10293,12 +10308,12 @@ render_screen:
     inc dword [x11_seq]
     mov [gc_current_fg], eax              ; update GC fg cache
     mov byte [gc_fg_valid], 1
-    ; PolyFillRectangle covering entire window
+    ; PolyFillRectangle on win_id (NOT draw_drawable).
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
-    mov eax, [draw_drawable]
+    mov eax, [win_id]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -10312,11 +10327,14 @@ render_screen:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
-    ; Fall through into the margin clears so the bell flash doesn't
-    ; persist in the right/bottom strips (cells repaint over the flash
-    ; inside the grid area, but the margins have no neighbour cell to
-    ; do the same — visible as an L-shaped border in vim and other
-    ; alt-screen apps with their own dark bg).
+    call x11_flush                  ; force the gray onto the wire now
+    ; The bell flash now lives directly on the window. The rest of
+    ; render_screen will run (so the back-pixmap stays consistent for
+    ; the next frame), but blt_back_to_window will skip its CopyArea
+    ; because bell_flash_until is still set to "active" — see the
+    ; .blt_bell_skip check at the top of blt_back_to_window. Without
+    ; that gate, the back-pixmap (which holds the previous frame's
+    ; cells, untouched here) would immediately overwrite our gray.
 .rs_no_bell:
     ; Margin clears moved to AFTER the row loop, gated on blt_dirty.
     ; Reason: with the per-row dirty skip + partial BLT, an idle render
