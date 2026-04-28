@@ -844,6 +844,7 @@ KB_COUNT         equ 5
 keybind_mods:    resb KB_COUNT
 keybind_keysyms: resd KB_COUNT
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
+cfg_visual_bell:    resq 1          ; 0 = disable visual-bell flash on BEL
 cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
 cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
 row_wrapped:        resb MAX_ROWS    ; 1 = row N's last char wrapped to N+1
@@ -1219,6 +1220,9 @@ _start:
 
     ; Parse DISPLAY number
     call parse_display
+
+    ; Defaults for config keys whose "off" value isn't 0 (BSS-init).
+    mov qword [cfg_visual_bell], 1        ; bell flash enabled by default
 
     ; Seed default Alt+key bindings before parsing the user's config so
     ; load_config can override individual entries via key.NAME = ...
@@ -6828,6 +6832,11 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_bel:
+    ; Visual bell disabled via `visual_bell = 0` in ~/.glassrc → drop
+    ; the BEL byte silently. Useful for users who'd rather not have any
+    ; flash (apps like vim's normal-mode bell get noisy).
+    cmp qword [cfg_visual_bell], 0
+    je .vtp_loop
     ; Visual bell: set bell_flash_until = now + 100ms (CLOCK_MONOTONIC ms,
     ; same clock as cursor_blink_until so the poll loop can compute one
     ; timeout that covers both).
@@ -13141,13 +13150,13 @@ load_config:
 .lc_try_blink:
     ; Match "cursor_blink"
     cmp dword [rsi], 'curs'
-    jne .lc_try_opacity
+    jne .lc_try_visual_bell
     cmp dword [rsi+4], 'or_b'
-    jne .lc_try_opacity
+    jne .lc_try_visual_bell
     cmp word [rsi+8], 'li'
-    jne .lc_try_opacity
+    jne .lc_try_visual_bell
     cmp word [rsi+10], 'nk'
-    jne .lc_try_opacity
+    jne .lc_try_visual_bell
     add rsi, 12
     call lc_skip_to_value
     xor eax, eax
@@ -13164,6 +13173,34 @@ load_config:
     jmp .lc_blink_digit
 .lc_blink_done:
     mov [cfg_blink_ms], rax
+    jmp .lc_skip_line
+
+.lc_try_visual_bell:
+    ; Match "visual_bell"
+    cmp dword [rsi], 'visu'
+    jne .lc_try_opacity
+    cmp dword [rsi+4], 'al_b'
+    jne .lc_try_opacity
+    cmp word [rsi+8], 'el'
+    jne .lc_try_opacity
+    cmp byte [rsi+10], 'l'
+    jne .lc_try_opacity
+    add rsi, 11
+    call lc_skip_to_value
+    xor eax, eax
+.lc_vb_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_vb_done
+    cmp cl, '9'
+    ja .lc_vb_done
+    imul eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .lc_vb_digit
+.lc_vb_done:
+    mov [cfg_visual_bell], rax
     jmp .lc_skip_line
 
 .lc_try_opacity:
