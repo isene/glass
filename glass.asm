@@ -796,9 +796,11 @@ log_fd_glass:       resq 1
 cfg_bg_pixel:       resd 1
 cfg_fg_pixel:       resd 1
 cfg_cursor_pixel:   resd 1
+cfg_url_pixel:      resd 1          ; hover-URL underline color
 cfg_bg_set:         resb 1
 cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
+cfg_url_set:        resb 1
 cfg_opacity:        resb 1          ; 0..255, 255 = opaque (default)
 cfg_opacity_set:    resb 1
 cfg_font_bold:      resb 1          ; 1 = use bold variant as the default font
@@ -1131,10 +1133,6 @@ _start:
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
 
-    ; Open /tmp/glass.log so errors / X11 protocol failures land in
-    ; a tail-able file even when stderr is eaten by gdm-x-session.
-    call log_open_glass
-
     ; Parse argv for `-e CMD [ARGS...]` or `-- CMD [ARGS...]`. Anything
     ; after the marker becomes exec_argv (capped at 31 args + NULL).
     ; Argv before the marker is silently ignored — we don't have any
@@ -1175,6 +1173,12 @@ _start:
 .es_collect_done:
     mov qword [exec_argv + r11*8], 0
 .es_arg_done:
+
+    ; Open /tmp/glass.log so errors / X11 protocol failures land in
+    ; a tail-able file even when stderr is eaten by gdm-x-session.
+    ; Done AFTER argv parsing — log_open_glass clobbers rdi/rsi via
+    ; its syscall args, and the argv loop above relied on them.
+    call log_open_glass
 
     ; No dead key pending at startup.
     mov byte [pending_dead], 0xFF
@@ -11194,13 +11198,16 @@ rs_row_loop:
     mov r13d, eax                         ; row
     mov r14d, ecx                         ; start_col
     mov r15d, edx                         ; span cells
-    ; Pick underline colour: cfg_fg_pixel if user set one, else palette[7]
-    cmp byte [cfg_fg_set], 1
+    ; Underline colour: cfg_url_pixel if user set `url_underline` in
+    ; .glassrc, else a soft blue (#5599ff) that reads as a hyperlink
+    ; without colliding with the default fg or with SGR-4/OSC 8
+    ; underlines that already use the run's fg.
+    cmp byte [cfg_url_set], 1
     jne .rs_hover_default_fg
-    mov eax, [cfg_fg_pixel]
+    mov eax, [cfg_url_pixel]
     jmp .rs_hover_have_fg
 .rs_hover_default_fg:
-    mov eax, [palette + 7*4]
+    mov eax, 0x005599FF
 .rs_hover_have_fg:
     cmp dword [x11_argb_colormap], 0
     je .rs_hover_no_alpha
@@ -12643,9 +12650,9 @@ load_config:
 .lc_try_cursor:
     ; Match "cursor" but NOT "cursor_blink" (which we handle separately)
     cmp dword [rsi], 'curs'
-    jne .lc_try_font_size
+    jne .lc_try_url_underline
     cmp word [rsi+4], 'or'
-    jne .lc_try_font_size
+    jne .lc_try_url_underline
     movzx eax, byte [rsi+6]
     cmp al, ' '
     je .lc_cursor_color
@@ -12653,7 +12660,7 @@ load_config:
     je .lc_cursor_color
     cmp al, '='
     je .lc_cursor_color
-    jmp .lc_try_font_size           ; not "cursor", try next
+    jmp .lc_try_url_underline       ; not "cursor", try next
 .lc_cursor_color:
     add rsi, 6
     call lc_skip_to_value
@@ -12663,6 +12670,28 @@ load_config:
     call hex_to_pixel
     mov [cfg_cursor_pixel], eax
     mov byte [cfg_cursor_set], 1
+    jmp .lc_skip_line
+
+.lc_try_url_underline:
+    ; "url_underline = #RRGGBB" — hover-URL underline color. Defaults
+    ; to a soft blue when unset so URLs read distinctly from any
+    ; existing SGR-4 / OSC 8 underlines (which use the run's fg).
+    cmp dword [rsi], 'url_'
+    jne .lc_try_font_size
+    cmp dword [rsi+4], 'unde'
+    jne .lc_try_font_size
+    cmp dword [rsi+8], 'rlin'
+    jne .lc_try_font_size
+    cmp byte [rsi+12], 'e'
+    jne .lc_try_font_size
+    add rsi, 13
+    call lc_skip_to_value
+    cmp byte [rsi], '#'
+    jne .lc_skip_line
+    inc rsi
+    call hex_to_pixel
+    mov [cfg_url_pixel], eax
+    mov byte [cfg_url_set], 1
     jmp .lc_skip_line
 
 .lc_try_font_size:
