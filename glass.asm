@@ -6223,6 +6223,9 @@ handle_keypress:
     ; XK_Tab = 0xFF09
     cmp eax, 0xFF09
     je .hkp_tab
+    ; XK_ISO_Left_Tab = 0xFE20 (Shift+Tab on most layouts)
+    cmp eax, 0xFE20
+    je .hkp_shift_tab
     ; XK_Return = 0xFF0D
     cmp eax, 0xFF0D
     je .hkp_return
@@ -6271,8 +6274,20 @@ handle_keypress:
     jmp .hkp_send_seq
 
 .hkp_tab:
+    ; Shift+Tab: emit CSI Z (\e[Z) — xterm convention. Some keyboard
+    ; layouts send keysym XK_Tab + Shift modifier instead of
+    ; XK_ISO_Left_Tab; both paths funnel to .hkp_shift_tab.
+    test ebx, 1                           ; Shift modifier?
+    jnz .hkp_shift_tab
     mov byte [key_out_buf], 0x09
     mov rdx, 1
+    jmp .hkp_send_seq
+
+.hkp_shift_tab:
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov byte [key_out_buf+2], 'Z'
+    mov rdx, 3
     jmp .hkp_send_seq
 
 .hkp_return:
@@ -9174,6 +9189,46 @@ selection_extract:
     mov r14, [grid_cols]
 .se_col_end_ok:
 
+    ; Compute row base pointer with the same scroll-offset mapping the
+    ; renderer uses, so a selection in the scrollback view extracts the
+    ; scrollback bytes — not whatever happens to live at grid[row]
+    ; right now. (Selecting "hyper /home/geir/..." in scrollback would
+    ; otherwise pull a completely unrelated live-grid line — the bug
+    ; reported when paste returned text the user never highlighted.)
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .se_row_live
+    cmp r12, rax
+    jge .se_row_grid_shifted
+    ; This row comes from scrollback.
+    mov rax, [scroll_write_pos]
+    sub rax, [scroll_offset]
+    add rax, r12
+    test rax, rax
+    jns .se_sb_pos
+    add rax, 1000
+.se_sb_pos:
+    cmp rax, 1000
+    jl .se_sb_ok
+    sub rax, 1000
+.se_sb_ok:
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rbx, [scroll_buf + rax]
+    jmp .se_row_base_done
+.se_row_grid_shifted:
+    mov rax, r12
+    sub rax, [scroll_offset]
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rbx, [grid + rax]
+    jmp .se_row_base_done
+.se_row_live:
+    mov rax, r12
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rbx, [grid + rax]
+.se_row_base_done:
+
     ; Extract characters for this row
 .se_col_loop:
     cmp r13, r14
@@ -9181,15 +9236,13 @@ selection_extract:
     cmp r15, 16380
     jge .se_done                ; buffer limit
 
-    ; Get cell character from grid (16-bit BMP codepoint at byte 0-1).
+    ; Get cell character (16-bit BMP codepoint at byte 0-1).
     ; Encode back to UTF-8 in sel_buf so non-ASCII glyphs (bullets,
     ; arrows, accented letters, etc.) round-trip correctly through
     ; PRIMARY/CLIPBOARD instead of being replaced with literal '?'.
-    mov rax, r12
-    imul rax, MAX_COLS
-    add rax, r13
+    mov rax, r13
     imul rax, CELL_SIZE
-    movzx eax, word [grid + rax]
+    movzx eax, word [rbx + rax]
     test eax, eax
     jnz .se_have_cp
     mov al, ' '                            ; unwritten cell → space
@@ -10129,7 +10182,17 @@ render_screen:
     add rsp, 16
     cmp rax, [bell_flash_until]
     jl .rs_bell_active
+    ; Bell expired during this render. Resetting to 0 isn't enough —
+    ; the per-row dirty-skip will leave the previous frame's gray fill
+    ; under any clean rows (which is "most rows", since the bell is
+    ; usually triggered by a keystroke that didn't mutate the grid).
+    ; Force all_dirty + full bbox here so every cell repaints over the
+    ; gray. Without this, vim ends up with a gray screen and only the
+    ; one cell that *did* change in last frame visible — the user has
+    ; to ^L to recover.
     mov qword [bell_flash_until], 0
+    mov qword [all_dirty], 1
+    call bbox_full_window
     jmp .rs_no_bell
 .rs_bell_active:
     ; Set GC fg to bright color for fill
