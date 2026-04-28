@@ -128,7 +128,7 @@
 %define FOCUS_CHANGE_MASK   0x00200000
 ; BUTTON_PRESS(0x4) | BUTTON_RELEASE(0x8) | BUTTON_MOTION(0x2000)
 ; | KEY_PRESS(0x1) | EXPOSURE(0x8000) | STRUCTURE(0x20000) | FOCUS(0x200000)
-%define EVENT_MASK_ALL      0x0022A00D
+%define EVENT_MASK_ALL      0x0022A04D
 
 ; CreateWindow value mask bits
 %define CW_BACK_PIXEL       0x00000002
@@ -779,6 +779,14 @@ url_count:          resq 1
 url_strings:        resb 8192       ; extracted URL text
 url_str_pos:        resq 1
 
+; Hover state. Tracks which url_list[] entry the mouse pointer is
+; currently over; -1 = none. Drives both the hover-underline render
+; pass and the "click anywhere on the URL to open it" interaction
+; (button-1 press while hovering opens via xdg-open instead of
+; starting a mouse selection).
+hover_url_idx:      resq 1          ; signed; -1 = no hover
+hover_url_pressed:  resb 1          ; 1 between press-on-url and release
+
 ; Config (.glassrc)
 cfg_bg_pixel:       resd 1
 cfg_fg_pixel:       resd 1
@@ -1180,6 +1188,8 @@ _start:
     mov qword [alt_screen_active], 0
     mov qword [mouse_tracking], 0
     mov qword [mouse_sgr], 0
+    mov qword [hover_url_idx], -1
+    mov byte [hover_url_pressed], 0
     mov qword [scroll_top], 0
     mov qword [scroll_bottom], 0      ; 0 = use grid_rows-1
     mov qword [bracketed_paste], 0
@@ -5225,6 +5235,36 @@ handle_x11_events:
     ; Normal click: start selection (button 1 only)
     cmp r13d, 1
     jne .hxe_bp_done2
+    ; If the pointer is currently hovering a URL, plain button-1 press
+    ; opens it (no Ctrl required) and short-circuits the selection
+    ; start. Hover state was set by the motion handler. Drag-from-URL
+    ; isn't supported — copy URL text via Ctrl+drag if needed.
+    mov rax, [hover_url_idx]
+    test rax, rax
+    js .hxe_bp_selection                       ; -1 → no hover, fall through
+    mov rdi, [hover_url_idx]
+    imul rdi, 24
+    mov r14d, [url_list + rdi + 8]             ; str_offset (callee-saved-ish)
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jnz .hxe_bp_url_done                       ; parent
+    sub rsp, 32
+    lea rax, [xdg_open]
+    mov [rsp], rax
+    lea rax, [url_strings + r14]
+    mov [rsp + 8], rax
+    mov qword [rsp + 16], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [xdg_open]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+    mov rdi, 1
+    mov rax, SYS_EXIT
+    syscall
+.hxe_bp_url_done:
+    jmp .hxe_bp_done2
 .hxe_bp_selection:
     ; Save row/col across click_now_ms call (uses syscall)
     push rax
@@ -5451,26 +5491,53 @@ handle_x11_events:
     jmp .hxe_mn_done
 
 .hxe_mn_selection:
-    ; Update selection end if button held (and not in word/line lock)
-    cmp qword [sel_mode], 0
-    jne .hxe_mn_done
-    cmp qword [sel_button_held], 1
-    jne .hxe_mn_done
-    ; Drag in progress: activate selection now (cleared on press)
-    mov qword [sel_active], 1
+    ; Compute the cell (col=r12, row=rax) under the pointer first —
+    ; both hover detection and the drag path use it.
     movzx eax, word [x11_buf + rbx + 24]
     movzx ecx, word [char_width]
     test ecx, ecx
     jz .hxe_mn_done
     xor edx, edx
     div ecx
-    mov [sel_end_col], rax
+    mov r12, rax                              ; col
     movzx eax, word [x11_buf + rbx + 26]
     movzx ecx, word [char_height]
     test ecx, ecx
     jz .hxe_mn_done
     xor edx, edx
     div ecx
+    ; eax = row
+
+    ; Hover detection. Skip while button is held — that's a drag,
+    ; not a hover. Hovering a URL cell sets hover_url_idx so the
+    ; render pass draws an underline at the URL's columns; entering
+    ; / leaving forces a repaint.
+    cmp qword [sel_button_held], 1
+    je .hxe_mn_drag_path
+    push rax
+    push r12
+    mov rdi, rax
+    mov rsi, r12
+    call url_at_cell                          ; eax = idx or -1
+    movsxd rcx, eax                           ; sign-extend (eax may be -1)
+    mov rdx, [hover_url_idx]
+    cmp rcx, rdx
+    je .hxe_mn_hover_same
+    mov [hover_url_idx], rcx
+    mov qword [all_dirty], 1
+    call request_render
+.hxe_mn_hover_same:
+    pop r12
+    pop rax
+    jmp .hxe_mn_done
+
+.hxe_mn_drag_path:
+    ; Update selection end if not in word/line lock.
+    cmp qword [sel_mode], 0
+    jne .hxe_mn_done
+    ; Drag in progress: activate selection now (cleared on press)
+    mov qword [sel_active], 1
+    mov [sel_end_col], r12
     mov [sel_end_row], rax
     ; Trigger re-render to show selection visually (coalesced — actual
     ; paint happens once at end of event-loop iteration even if the X
@@ -11049,6 +11116,98 @@ rs_row_loop:
     jmp .rs_link_row
 .rs_link_done:
 
+    ; Hover-URL underline pass — draws a 1px underline at the cells
+    ; covered by url_list[hover_url_idx], so the user sees an
+    ; affordance ("this is clickable"). Skipped when no hover; the
+    ; pass triggers a full repaint when hover_url_idx changes (set
+    ; by the motion handler), which clears the previous underline by
+    ; repainting all rows fresh.
+    mov r12, [hover_url_idx]
+    test r12, r12
+    js .rs_hover_url_done                ; -1 → not hovering
+    imul r12, 24                          ; byte offset in url_list
+    movzx eax, word [url_list + r12]      ; start_row
+    movzx ecx, word [url_list + r12 + 2]  ; start_col
+    movzx edx, word [url_list + r12 + 6]  ; end_col (inclusive)
+    sub edx, ecx
+    inc edx                               ; span length in cells
+    test edx, edx
+    jle .rs_hover_url_done
+    push rbx
+    push r13
+    push r14
+    push r15
+    mov r13d, eax                         ; row
+    mov r14d, ecx                         ; start_col
+    mov r15d, edx                         ; span cells
+    ; Pick underline colour: cfg_fg_pixel if user set one, else palette[7]
+    cmp byte [cfg_fg_set], 1
+    jne .rs_hover_default_fg
+    mov eax, [cfg_fg_pixel]
+    jmp .rs_hover_have_fg
+.rs_hover_default_fg:
+    mov eax, [palette + 7*4]
+.rs_hover_have_fg:
+    cmp dword [x11_argb_colormap], 0
+    je .rs_hover_no_alpha
+    or eax, 0xFF000000
+.rs_hover_no_alpha:
+    mov ebx, eax                          ; save colour
+    ; ChangeGC fg to underline colour (cache-aware).
+    cmp byte [gc_fg_valid], 1
+    jne .rs_hover_gc_send
+    cmp ebx, [gc_current_fg]
+    je .rs_hover_gc_skip
+.rs_hover_gc_send:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 4
+    mov eax, [gc_id]
+    mov [rdi + 4], eax
+    mov dword [rdi + 8], GC_FOREGROUND
+    mov [rdi + 12], ebx
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov [gc_current_fg], ebx
+    mov byte [gc_fg_valid], 1
+.rs_hover_gc_skip:
+    ; PolyFillRectangle: x = start_col*char_w, y = row*char_h +
+    ; font_ascent + 1 (just below baseline), w = span*char_w, h = 1.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 5
+    mov eax, [draw_drawable]
+    mov [rdi + 4], eax
+    mov eax, [gc_id]
+    mov [rdi + 8], eax
+    movzx ecx, word [char_width]
+    mov eax, r14d
+    imul eax, ecx
+    mov word [rdi + 12], ax
+    movzx eax, word [char_height]
+    imul eax, r13d
+    movzx ecx, word [font_ascent]
+    add eax, ecx
+    inc eax
+    mov word [rdi + 14], ax
+    movzx eax, word [char_width]
+    imul eax, r15d
+    mov word [rdi + 16], ax
+    mov word [rdi + 18], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+.rs_hover_url_done:
+
     ; ─── Fallback-glyph pass (DISABLED) ───────────────────────────────
     ; First-cut fallback had two cell-byte-order bugs that mis-marked
     ; codepoints in glyph_present and sent wrong CHAR2B to ImageText16.
@@ -13371,6 +13530,50 @@ scan_urls:
 .su_done:
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; url_at_cell — returns the url_list[] index whose rect contains
+; (rdi=row, rsi=col), or -1 if no scanned URL covers that cell.
+; Skips the OSC 8 lookup that url_open_at does — hover affordance
+; is for the scanned-text URL set; OSC 8 hyperlinks already render
+; their own underline via the OSC 8 underline pass (cfg_osc8_underline).
+url_at_cell:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+    xor rbx, rbx
+.uac_loop:
+    cmp rbx, [url_count]
+    jge .uac_none
+    mov rax, rbx
+    imul rax, 24
+    movzx ecx, word [url_list + rax]
+    cmp r12d, ecx
+    jl .uac_next
+    movzx ecx, word [url_list + rax + 4]
+    cmp r12d, ecx
+    jg .uac_next
+    movzx ecx, word [url_list + rax + 2]
+    cmp r13d, ecx
+    jl .uac_next
+    movzx ecx, word [url_list + rax + 6]
+    cmp r13d, ecx
+    jg .uac_next
+    mov rax, rbx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.uac_next:
+    inc rbx
+    jmp .uac_loop
+.uac_none:
+    mov rax, -1
     pop r13
     pop r12
     pop rbx
