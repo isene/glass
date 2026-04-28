@@ -4966,8 +4966,39 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_expose:
+    ; Expose tells us a region of win_id was discarded by the X server
+    ; (compositor lost a slice, another window briefly overlapped us,
+    ; tile remapped us, etc.) and needs re-painting. Going through
+    ; render_screen's dirty-skip path skips every row when the grid is
+    ; unchanged from prev_paint_grid, so blt_dirty stays 0 and the
+    ; final BLT no-ops. The exposed pixels then stay stale until the
+    ; next grid mutation that happens to repaint that region — the
+    ; "weechat buflist last-row lingers" symptom. Re-BLT the exposed
+    ; rect directly: back_pixmap is already correct.
     push rbx
     push r12
+    cmp dword [back_pixmap], 0
+    je .hxe_expose_render          ; pseudo-mode: no back buffer to BLT
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    movzx edi, word [x11_buf + rbx + 8]      ; x
+    movzx esi, word [x11_buf + rbx + 10]     ; y
+    movzx edx, word [x11_buf + rbx + 12]     ; width
+    movzx ecx, word [x11_buf + rbx + 14]     ; height
+    call expand_bbox
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    call blt_back_to_window
+    call x11_flush
+    pop r12
+    pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+.hxe_expose_render:
     call request_render
     pop r12
     pop rbx
