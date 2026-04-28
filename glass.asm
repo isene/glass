@@ -10360,14 +10360,10 @@ rs_row_loop:
     ; this row if its own bit is set OR if a neighbour bit is set
     ; (±1 row smear) — glyph bleed from a changed row needs the
     ; neighbour to repaint so the bleed-into-neighbour pixels get
-    ; cleaned. Force-render conditions (all_dirty=1, cursor row,
-    ; scrollback) bypass the bitmap entirely.
+    ; cleaned. Force-render conditions (all_dirty=1, scrollback)
+    ; bypass the bitmap entirely.
     cmp qword [all_dirty], 0
     jne .rs_row_ready
-    cmp r12, [cursor_row]
-    je .rs_row_ready
-    cmp r12, [prev_paint_cursor_row]
-    je .rs_row_ready
     cmp qword [scroll_offset], 0
     jne .rs_row_ready                   ; scrollback always paints
     movzx eax, byte [row_dirty_map + r12]
@@ -10386,10 +10382,71 @@ rs_row_loop:
     mov rax, r12
     inc rax
     cmp rax, [grid_rows]
-    jge .rs_row_skip                    ; no row below → no smear
+    jge .rs_row_check_cursor             ; no row below → check cursor
     movzx eax, byte [row_dirty_map + rax]
     test eax, eax
-    jz .rs_row_skip                     ; clean + clean neighbours → skip
+    jnz .rs_row_dirty
+.rs_row_check_cursor:
+    ; Row is grid-clean (own bit + both neighbours' bits = 0). The
+    ; only remaining reason to paint is the cursor: this row may
+    ; hold the current cursor cell (need to layer the block on top
+    ; of fresh cell content) or the previous cursor cell (need to
+    ; clear last frame's block from back_pixmap so a blink-off frame
+    ; doesn't leave a stuck block). Narrow row_paint_start/end to
+    ; just those columns — for a 200-col vim status line under a
+    ; 500ms blink this is a ~200× reduction in glyph + bg-fill work
+    ; per blink tick.
+    cmp r12, [cursor_row]
+    je .rs_row_cursor_only
+    cmp r12, [prev_paint_cursor_row]
+    je .rs_row_cursor_only
+    jmp .rs_row_skip                     ; truly clean → skip
+.rs_row_cursor_only:
+    ; Compute min/max cursor col on this row. Both current and
+    ; previous cursor positions may land here; pick the union.
+    mov r10, -1                          ; min col (sentinel)
+    mov r11, -1                          ; max col
+    cmp r12, [cursor_row]
+    jne .rs_rco_check_prev
+    mov r10, [cursor_col]
+    mov r11, r10
+.rs_rco_check_prev:
+    cmp r12, [prev_paint_cursor_row]
+    jne .rs_rco_have_range
+    mov rax, [prev_paint_cursor_col]
+    cmp r10, -1
+    jne .rs_rco_pc_min_chk
+    mov r10, rax
+    mov r11, rax
+    jmp .rs_rco_have_range
+.rs_rco_pc_min_chk:
+    cmp rax, r10
+    jge .rs_rco_pc_max_chk
+    mov r10, rax
+.rs_rco_pc_max_chk:
+    cmp rax, r11
+    jle .rs_rco_have_range
+    mov r11, rax
+.rs_rco_have_range:
+    ; Defensive: if both sentinels are still -1 (shouldn't happen —
+    ; we only reached here on a cursor-row match), fall through to
+    ; full-row paint to avoid painting nothing.
+    cmp r10, -1
+    je .rs_row_ready
+    ; Clamp to grid bounds. row_paint_start = r10, row_paint_end =
+    ; r11+1 (end-exclusive). No ±1 padding: cursor block is drawn
+    ; AFTER the row paint pass, so glyph bleed from neighbours into
+    ; this cell would have been handled when those neighbours' rows
+    ; were painted (and is bounded by char_width).
+    mov rax, [grid_cols]
+    cmp r11, rax
+    jl .rs_rco_end_ok
+    lea r11, [rax - 1]
+.rs_rco_end_ok:
+    inc r11                              ; end-exclusive
+    mov [row_paint_start], r10
+    mov [row_paint_end], r11
+    jmp .rs_row_ready
 .rs_row_dirty:
     ; This row paints. Compute paint range from cell-level diff with
     ; ±1 cell padding to cover horizontal glyph bleed.
@@ -10450,6 +10507,46 @@ rs_row_loop:
     jle .rs_row_diff_end_ok
     mov r11, rax
 .rs_row_diff_end_ok:
+    ; Extend the paint range to cover the cursor cell on this row,
+    ; if any. The dirty-column narrowing above only sees grid byte
+    ; changes; the cursor block was painted on top of back_pixmap
+    ; AFTER the row pass, so its cell may need a fresh repaint
+    ; this frame even when the underlying grid bytes didn't change.
+    cmp r12, [cursor_row]
+    jne .rs_row_diff_chk_prev
+    mov rax, [cursor_col]
+    cmp rax, r10
+    jge .rs_row_diff_cur_le_max
+    mov r10, rax
+.rs_row_diff_cur_le_max:
+    inc rax                              ; end-exclusive
+    cmp rax, r11
+    jle .rs_row_diff_chk_prev
+    mov r11, rax
+.rs_row_diff_chk_prev:
+    cmp r12, [prev_paint_cursor_row]
+    jne .rs_row_diff_apply
+    mov rax, [prev_paint_cursor_col]
+    cmp rax, r10
+    jge .rs_row_diff_pc_le_max
+    mov r10, rax
+.rs_row_diff_pc_le_max:
+    inc rax
+    cmp rax, r11
+    jle .rs_row_diff_apply
+    mov r11, rax
+.rs_row_diff_apply:
+    ; Clamp r11 to grid_cols (cursor extension may have pushed it
+    ; one past the right edge) and ensure r10 stays ≥ 0.
+    mov rax, [grid_cols]
+    cmp r11, rax
+    jle .rs_row_diff_end_clamped
+    mov r11, rax
+.rs_row_diff_end_clamped:
+    test r10, r10
+    jns .rs_row_diff_start_ok
+    xor r10d, r10d
+.rs_row_diff_start_ok:
     mov [row_paint_start], r10
     mov [row_paint_end], r11
     pop r11
