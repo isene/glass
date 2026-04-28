@@ -1050,7 +1050,9 @@ render_pending:     resb 1
 child_forked:       resq 1          ; 1 if child has been forked
 
 ; OSC title
-osc_buf:            resb 256
+osc_buf:            resb 4096        ; OSC payload buffer; sized to fit
+                                    ; long OSC 8 hyperlink URIs (mail-merge
+                                    ; tracking URLs commonly exceed 256 b).
 osc_pos:            resq 1
 osc_num:            resq 1          ; OSC number (0, 2, etc.)
 osc_collecting:     resq 1          ; 1 = collecting title text
@@ -4758,8 +4760,14 @@ event_loop:
     jz .ev_child_died
     mov word [poll_fds + 14], 0
 
-    ; Snap to live view on new PTY output (regardless of how many chunks)
-    mov qword [scroll_offset], 0
+    ; Don't snap to live on background PTY output. Earlier code did
+    ; `mov qword [scroll_offset], 0` here, which made Shift+PgUp during
+    ; a CC "thinking" stream impossible — every spinner refresh yanked
+    ; the view back to the live cursor. Match kitty: PTY data updates
+    ; the grid in place; the user's scrollback position survives until
+    ; they hit a key or Shift+PgDn. Keystroke-driven snap-to-live is
+    ; handled in .hkp_send_seq_no_clear (every byte glass writes to
+    ; the PTY clears scroll_offset there).
 
     ; Drain the PTY: read in 4 KB chunks, vt_process each, then peek the
     ; PTY with a non-blocking poll(0). Loop while data is still queued so
@@ -5297,12 +5305,19 @@ handle_x11_events:
     ; opens it (no Ctrl required) and short-circuits the selection
     ; start. Hover state was set by the motion handler. Drag-from-URL
     ; isn't supported — copy URL text via Ctrl+drag if needed.
+    ; Save row (rax) and col (r12) on the stack so the selection
+    ; fall-through still has them — the hover_url_idx load below
+    ; clobbers rax, and a -1 idx (no hover) used to leak that into
+    ; sel_start_row, breaking every selection until next click.
+    push rax
+    push r12
     mov rax, [hover_url_idx]
     test rax, rax
-    js .hxe_bp_selection                       ; -1 → no hover, fall through
-    mov rdi, [hover_url_idx]
+    js .hxe_bp_no_hover_url
+    mov rdi, rax
     imul rdi, 24
-    mov r14d, [url_list + rdi + 8]             ; str_offset (callee-saved-ish)
+    mov r14d, [url_list + rdi + 8]             ; str_offset
+    add rsp, 16                                 ; drop saved row/col
     mov rax, SYS_FORK
     syscall
     test rax, rax
@@ -5323,6 +5338,9 @@ handle_x11_events:
     syscall
 .hxe_bp_url_done:
     jmp .hxe_bp_done2
+.hxe_bp_no_hover_url:
+    pop r12
+    pop rax
 .hxe_bp_selection:
     ; Save row/col across click_now_ms call (uses syscall)
     push rax
@@ -5880,7 +5898,10 @@ handle_x11_events:
     ; r12d = number of bytes of paste data
     test r12d, r12d
     jz .hxe_sn_done
-    ; Write paste data to PTY (with optional bracketed paste)
+    ; Write paste data to PTY (with optional bracketed paste).
+    ; Snap to live view so the pasted text is visible (matches the
+    ; keystroke-input snap in .hkp_send_seq_no_clear).
+    mov qword [scroll_offset], 0
     ; Send bracket start if bracketed paste mode is on
     cmp qword [bracketed_paste], 1
     jne .hxe_sn_no_bracket_start
@@ -6477,6 +6498,13 @@ handle_keypress:
     ; buffer, advancing the cursor).
     mov rdx, 1
 .hkp_send_seq_no_clear:
+    ; Any keystroke that produces input bytes snaps the view back
+    ; to live so the user sees their typed character / its echo.
+    ; Scrollback-only keys (Shift+PgUp, Shift+PgDn, Ctrl+L's special
+    ; handling) don't pass through here, so background PTY output
+    ; — CC's thinking spinner, a long build log, etc. — leaves the
+    ; user's scrollback position intact.
+    mov qword [scroll_offset], 0
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
     lea rsi, [key_out_buf]
@@ -6985,8 +7013,8 @@ vt_process:
     cmp qword [osc_collecting], 1
     jne .vtp_loop
     mov rcx, [osc_pos]
-    cmp rcx, 254
-    jge .vtp_loop            ; buffer full
+    cmp rcx, 4094
+    jge .vtp_loop            ; buffer full (osc_buf is 4096; reserve 1 for null)
     mov [osc_buf + rcx], al
     inc rcx
     mov [osc_pos], rcx
@@ -9153,16 +9181,61 @@ selection_extract:
     cmp r15, 16380
     jge .se_done                ; buffer limit
 
-    ; Get cell character from grid (16-bit UCS-2, use low byte for ASCII)
+    ; Get cell character from grid (16-bit BMP codepoint at byte 0-1).
+    ; Encode back to UTF-8 in sel_buf so non-ASCII glyphs (bullets,
+    ; arrows, accented letters, etc.) round-trip correctly through
+    ; PRIMARY/CLIPBOARD instead of being replaced with literal '?'.
     mov rax, r12
     imul rax, MAX_COLS
     add rax, r13
     imul rax, CELL_SIZE
     movzx eax, word [grid + rax]
+    test eax, eax
+    jnz .se_have_cp
+    mov al, ' '                            ; unwritten cell → space
+.se_have_cp:
     cmp eax, 0x7F
-    jbe .se_ascii_char
-    mov al, '?'              ; non-ASCII: placeholder in selection
-.se_ascii_char:
+    jbe .se_emit_1byte
+    cmp eax, 0x7FF
+    jbe .se_emit_2byte
+    ; 3-byte UTF-8: 1110xxxx 10xxxxxx 10xxxxxx
+    cmp r15, 16378
+    jge .se_done
+    mov edx, eax
+    shr edx, 12
+    or  dl, 0xE0
+    mov [sel_buf + r15], dl
+    inc r15
+    mov edx, eax
+    shr edx, 6
+    and dl, 0x3F
+    or  dl, 0x80
+    mov [sel_buf + r15], dl
+    inc r15
+    mov edx, eax
+    and dl, 0x3F
+    or  dl, 0x80
+    mov [sel_buf + r15], dl
+    inc r15
+    inc r13
+    jmp .se_col_loop
+.se_emit_2byte:
+    ; 2-byte UTF-8: 110xxxxx 10xxxxxx
+    cmp r15, 16379
+    jge .se_done
+    mov edx, eax
+    shr edx, 6
+    or  dl, 0xC0
+    mov [sel_buf + r15], dl
+    inc r15
+    mov edx, eax
+    and dl, 0x3F
+    or  dl, 0x80
+    mov [sel_buf + r15], dl
+    inc r15
+    inc r13
+    jmp .se_col_loop
+.se_emit_1byte:
     mov [sel_buf + r15], al
     inc r15
     inc r13
@@ -11277,6 +11350,12 @@ rs_row_loop:
     ; pass triggers a full repaint when hover_url_idx changes (set
     ; by the motion handler), which clears the previous underline by
     ; repainting all rows fresh.
+    ; Also skip while the user is in scrollback (scroll_offset != 0).
+    ; The url_list rows index the LIVE grid; in scrollback view the
+    ; same rows show different cells, so painting the underline there
+    ; would just stamp an orphan blue bar over unrelated text.
+    cmp qword [scroll_offset], 0
+    jne .rs_hover_url_done
     mov r12, [hover_url_idx]
     test r12, r12
     js .rs_hover_url_done                ; -1 → not hovering
@@ -13510,7 +13589,7 @@ scan_urls:
 
 .su_row_loop:
     cmp r12, [grid_rows]
-    jge .su_done
+    jge .su_o8_init                    ; http walk done → continue to OSC 8 sweep
     xor r13, r13             ; current col
 
 .su_col_loop:
@@ -13707,6 +13786,112 @@ scan_urls:
     inc r12
     jmp .su_row_loop
 
+    ; ─── OSC 8 hyperlink sweep ────────────────────────────────────────
+    ; Walk every cell looking for runs of identical non-zero osc8 link
+    ; ids (cell.attrs byte 5 holds the id, populated by the OSC 8
+    ; parser). Emit one url_list entry per contiguous run on a row,
+    ; copying the URI text out of osc8_uris into url_strings so the
+    ; hover/click code paths treat OSC 8 spans the same as scanned
+    ; http(s):// substrings — discoverable via hover-underline,
+    ; click-to-open without Ctrl, mouse-over cursor change.
+.su_o8_init:
+    xor r12, r12                          ; row
+.su_o8_row:
+    cmp r12, [grid_rows]
+    jge .su_done
+    xor r13, r13                          ; col
+    xor r14d, r14d                        ; current run's link id (0 = no run)
+    xor r15, r15                          ; current run's start col
+.su_o8_col:
+    cmp r13, [grid_cols]
+    jl .su_o8_have_col
+    ; End of row: flush any run still open.
+    test r14d, r14d
+    jz .su_o8_row_end
+    ; Run ends at grid_cols-1
+    mov rax, [grid_cols]
+    dec rax
+    push rax
+    call .su_o8_emit
+    pop rax
+    jmp .su_o8_row_end
+.su_o8_have_col:
+    ; Read this cell's link id at offset 5.
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r13
+    imul rax, CELL_SIZE
+    movzx eax, byte [grid + rax + 5]
+    cmp eax, r14d
+    je .su_o8_col_next                    ; same id → still in run
+    ; Id changed. If a run was open, emit it (run ends at col r13-1).
+    test r14d, r14d
+    jz .su_o8_start_new
+    push rax                              ; save new id across .su_o8_emit
+    mov rax, r13
+    dec rax
+    push rax
+    call .su_o8_emit
+    pop rax
+    pop rax                               ; restore new id into rax
+.su_o8_start_new:
+    mov r14d, eax
+    test eax, eax
+    jz .su_o8_col_next                    ; new id 0 → no run, skip
+    mov r15, r13                          ; run starts at this col
+.su_o8_col_next:
+    inc r13
+    jmp .su_o8_col
+.su_o8_row_end:
+    inc r12
+    jmp .su_o8_row
+
+    ; Inner emit helper (uses the row-loop's r12/r14/r15; takes the
+    ; run's end_col on the stack at [rsp + 8] — return addr at [rsp]).
+.su_o8_emit:
+    mov rax, [url_count]
+    cmp rax, 32
+    jge .su_o8_emit_ret
+    ; Resolve URI: osc8_uri_offsets[r14] → offset into osc8_uris.
+    mov edx, [osc8_uri_offsets + r14*4]
+    test edx, edx
+    jz .su_o8_emit_ret                    ; id has no URI registered
+    ; Copy NUL-terminated URI from osc8_uris[edx] into url_strings at
+    ; the current url_str_pos. Bail if no room.
+    mov rcx, [url_str_pos]
+    mov rdi, rcx                          ; saved start offset for the entry
+    mov r8, rcx                           ; copy cursor
+.su_o8_cp:
+    cmp r8, 8190
+    jge .su_o8_emit_ret
+    movzx r9d, byte [osc8_uris + rdx]
+    test r9b, r9b
+    jz .su_o8_cp_done
+    mov [url_strings + r8], r9b
+    inc rdx
+    inc r8
+    jmp .su_o8_cp
+.su_o8_cp_done:
+    mov byte [url_strings + r8], 0        ; null-terminate
+    mov r9, r8
+    sub r9, rdi                           ; URI length
+    inc r8                                ; skip NUL for next entry
+    mov [url_str_pos], r8
+    ; Build url_list entry. End col was pushed by caller at [rsp + 8].
+    mov rax, [url_count]
+    imul rax, 24
+    mov word [url_list + rax], r12w       ; start_row
+    mov word [url_list + rax + 2], r15w   ; start_col
+    mov word [url_list + rax + 4], r12w   ; end_row (same row)
+    mov rdx, [rsp + 8]
+    mov word [url_list + rax + 6], dx     ; end_col
+    mov [url_list + rax + 8], edi         ; str_offset
+    mov [url_list + rax + 12], r9d        ; str_len
+    mov qword [url_list + rax + 16], 0    ; pad
+    inc qword [url_count]
+.su_o8_emit_ret:
+    ret
+
 .su_done:
     pop r15
     pop r14
@@ -13717,9 +13902,9 @@ scan_urls:
 
 ; url_at_cell — returns the url_list[] index whose rect contains
 ; (rdi=row, rsi=col), or -1 if no scanned URL covers that cell.
-; Skips the OSC 8 lookup that url_open_at does — hover affordance
-; is for the scanned-text URL set; OSC 8 hyperlinks already render
-; their own underline via the OSC 8 underline pass (cfg_osc8_underline).
+; Returns matches for both scanned http(s):// substrings AND for
+; OSC 8 hyperlink spans (the latter populated by scan_urls' OSC 8
+; sweep). Hover + click paths now work uniformly for both.
 url_at_cell:
     push rbx
     push r12
