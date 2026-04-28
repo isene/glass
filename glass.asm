@@ -925,6 +925,14 @@ gc_fg_valid:           resb 1
 ;   blt_dirty=0  → bbox empty, skip BLT entirely
 ;   blt_dirty=1  → bbox holds [x0,y0)..[x1,y1) inclusive-exclusive
 blt_dirty:             resb 1
+
+; Captured value of blt_dirty at the end of render_screen (before
+; the all_dirty/blt_dirty reset for the next frame). The event-loop
+; tail uses it to gate scan_urls — walking the whole grid for
+; "http"-shaped substrings on every render_pending is wasted work
+; when nothing actually painted (cursor blink ticks, Expose-only
+; events, focus changes that didn't touch grid bytes, etc.).
+last_frame_painted:    resb 1
 blt_x0:                resq 1
 blt_y0:                resq 1
 blt_x1:                resq 1
@@ -4738,7 +4746,14 @@ event_loop:
     je .ev_loop
     mov byte [render_pending], 0
     call render_screen
+    ; Skip scan_urls when render didn't actually paint anything (the
+    ; grid bytes are unchanged from last scan, so the URL index can't
+    ; have changed either). Saves a full grid walk on cursor blinks,
+    ; Expose-only redraws, focus-change repaints, etc.
+    cmp byte [last_frame_painted], 0
+    je .ev_render_no_url_scan
     call scan_urls
+.ev_render_no_url_scan:
     call x11_flush
     jmp .ev_loop
 
@@ -11660,6 +11675,13 @@ rs_row_loop:
     ; in pseudo-mode). BLT it to the window in one shot — the user only
     ; ever sees complete frames, no intermediate bg-fill flash.
     call blt_back_to_window
+
+    ; Snapshot blt_dirty for the event-loop tail (scan_urls gating).
+    ; Any change to the grid contents would have made at least one row
+    ; dirty and therefore set blt_dirty=1; if nothing painted, the URL
+    ; index can't have changed.
+    mov al, [blt_dirty]
+    mov [last_frame_painted], al
 
     ; all_dirty was a one-shot flag set by handlers that need a full
     ; repaint (configure, focus, alt-screen toggle, bg_cycle, opacity,
