@@ -7518,6 +7518,13 @@ vt_process:
 .vtp_alt_screen_on:
     cmp qword [alt_screen_active], 1
     je .vtp_loop                ; already on alt screen
+    ; Switching to alt screen wipes the user's view; any selection on
+    ; the main grid now points at content the user can no longer see.
+    cmp qword [sel_active], 0
+    je .vtp_alt_on_no_sel
+    mov qword [sel_active], 0
+    call selection_release_all
+.vtp_alt_on_no_sel:
     ; Save cursor position
     mov rax, [cursor_row]
     mov [alt_cursor_row], rax
@@ -7567,6 +7574,13 @@ vt_process:
 .vtp_alt_screen_off:
     cmp qword [alt_screen_active], 0
     je .vtp_loop                ; already on main screen
+    ; Selection on the alt screen no longer matches anything we'll
+    ; show post-restore.
+    cmp qword [sel_active], 0
+    je .vtp_alt_off_no_sel
+    mov qword [sel_active], 0
+    call selection_release_all
+.vtp_alt_off_no_sel:
     ; Drop any kitty-graphics placements from the alt screen so they
     ; don't bleed onto the restored main screen (e.g. pointer leaving
     ; an image visible after exit).
@@ -8845,6 +8859,16 @@ grid_scroll_up:
     push r12
     push r13
 .gsu_entry:
+    ; Any active mouse selection is now meaningless: rows are about to
+    ; shift, so sel_start_row/sel_end_row would still point at display
+    ; positions that no longer hold the user's selected content. Clear
+    ; PRIMARY ownership too so other apps re-poll instead of pasting
+    ; whatever the now-shifted selection extracts.
+    cmp qword [sel_active], 0
+    je .gsu_no_sel_clear
+    mov qword [sel_active], 0
+    call selection_release_all
+.gsu_no_sel_clear:
 
     ; Save top row to scrollback circular buffer before scrolling
     mov rax, [scroll_write_pos]
@@ -8975,6 +8999,13 @@ grid_scroll_region_down:
     push rbx
     push r12
     push r13
+    ; Same rationale as grid_scroll_up: rows are about to shift, so any
+    ; active selection now points at content that's about to move.
+    cmp qword [sel_active], 0
+    je .gsrd_no_sel_clear
+    mov qword [sel_active], 0
+    call selection_release_all
+.gsrd_no_sel_clear:
     mov r12, [scroll_top]
     mov r13, [scroll_bottom]
     test r13, r13
