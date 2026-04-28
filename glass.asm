@@ -891,6 +891,17 @@ row_paint_end:         resq 1
 ; survived into the row below.
 row_dirty_map:         resb MAX_ROWS
 
+; Selection-dirty tracking. When the selection rect changes shape
+; (start/end row/col) or activates/deactivates, only the rows in
+; the union of OLD ∪ NEW selection bands need a repaint to redraw
+; the inverse-video highlight — NOT the whole window. Set during
+; render_screen's force-full check, OR'd into row_dirty_map after
+; the dirty pre-pass, and cleared after the row loop. Pre-fix this
+; path set all_dirty=1 → a single-cell drag repainted every cell.
+sel_dirty_flag:        resb 1
+sel_dirty_min:         resq 1
+sel_dirty_max:         resq 1
+
 ; GC foreground cache. Tracks what fg pixel was last loaded into
 ; gc_id via ChangeGC. Lets adjacent runs that share fg (or share
 ; bg, since many cells use default bg) skip the redundant ChangeGC.
@@ -9631,6 +9642,7 @@ render_screen:
     ; Detect any change vs the last paint and force all_dirty=1 so the
     ; per-row memcmp skip is bypassed for this frame.
     ; ─────────────────────────────────────────────────────────────────
+    mov byte [sel_dirty_flag], 0
     cmp byte [pseudo_full], 1
     je .rs_force_full
     mov rax, [bell_flash_until]
@@ -9639,23 +9651,82 @@ render_screen:
     mov rax, [scroll_offset]
     cmp rax, [prev_paint_scroll_off]
     jne .rs_force_full
+    ; Selection state diff: any change → mark only the OLD ∪ NEW row
+    ; band as dirty (later, after the dmap pre-pass) instead of the
+    ; old all_dirty=1 hammer. A single-cell drag affects one row,
+    ; not the whole window.
     mov rax, [sel_active]
     cmp rax, [prev_paint_sel_active]
-    jne .rs_force_full
+    jne .rs_sel_changed
     test rax, rax
     jz .rs_after_force_check
     mov rax, [sel_start_row]
     cmp rax, [prev_paint_sel_sr]
-    jne .rs_force_full
+    jne .rs_sel_changed
     mov rax, [sel_start_col]
     cmp rax, [prev_paint_sel_sc]
-    jne .rs_force_full
+    jne .rs_sel_changed
     mov rax, [sel_end_row]
     cmp rax, [prev_paint_sel_er]
-    jne .rs_force_full
+    jne .rs_sel_changed
     mov rax, [sel_end_col]
     cmp rax, [prev_paint_sel_ec]
-    jne .rs_force_full
+    jne .rs_sel_changed
+    jmp .rs_after_force_check
+.rs_sel_changed:
+    ; Compute the row band as min/max over {prev_sel_sr, prev_sel_er}
+    ; (only when prev_sel_active=1) ∪ {sel_start_row, sel_end_row}
+    ; (only when sel_active=1). r11 = min, r10 = max. Sentinels:
+    ; min = grid_rows (so any real row is smaller), max = -1.
+    mov r11, [grid_rows]
+    mov r10, -1
+    cmp qword [prev_paint_sel_active], 0
+    je .rs_sel_skip_old
+    mov rax, [prev_paint_sel_sr]
+    cmp rax, r11
+    jge .rs_sel_old_a_min
+    mov r11, rax
+.rs_sel_old_a_min:
+    cmp rax, r10
+    jle .rs_sel_old_a_max
+    mov r10, rax
+.rs_sel_old_a_max:
+    mov rax, [prev_paint_sel_er]
+    cmp rax, r11
+    jge .rs_sel_old_b_min
+    mov r11, rax
+.rs_sel_old_b_min:
+    cmp rax, r10
+    jle .rs_sel_old_b_max
+    mov r10, rax
+.rs_sel_old_b_max:
+.rs_sel_skip_old:
+    cmp qword [sel_active], 0
+    je .rs_sel_skip_new
+    mov rax, [sel_start_row]
+    cmp rax, r11
+    jge .rs_sel_new_a_min
+    mov r11, rax
+.rs_sel_new_a_min:
+    cmp rax, r10
+    jle .rs_sel_new_a_max
+    mov r10, rax
+.rs_sel_new_a_max:
+    mov rax, [sel_end_row]
+    cmp rax, r11
+    jge .rs_sel_new_b_min
+    mov r11, rax
+.rs_sel_new_b_min:
+    cmp rax, r10
+    jle .rs_sel_new_b_max
+    mov r10, rax
+.rs_sel_new_b_max:
+.rs_sel_skip_new:
+    cmp r11, r10
+    jg .rs_after_force_check                ; both selections were inactive
+    mov [sel_dirty_min], r11
+    mov [sel_dirty_max], r10
+    mov byte [sel_dirty_flag], 1
     jmp .rs_after_force_check
 .rs_force_full:
     mov qword [all_dirty], 1
@@ -9726,6 +9797,37 @@ render_screen:
 .rs_dmap_done:
     pop r12
     pop rbx
+
+    ; OR selection-affected rows into the dirty map. The selection's
+    ; visual highlight is applied per-cell via is_cell_selected during
+    ; paint, not stored in grid bytes — so a selection-only change
+    ; never trips the grid-vs-prev pre-pass and these rows must be
+    ; force-painted explicitly. Skipped under all_dirty / scrollback
+    ; (both already paint every row).
+    cmp byte [sel_dirty_flag], 0
+    je .rs_sel_dmap_done
+    cmp qword [all_dirty], 0
+    jne .rs_sel_dmap_done
+    cmp qword [scroll_offset], 0
+    jne .rs_sel_dmap_done
+    push rcx
+    mov rcx, [sel_dirty_min]
+    test rcx, rcx
+    jns .rs_sel_dmap_min_ok
+    xor ecx, ecx
+.rs_sel_dmap_min_ok:
+    mov rax, [sel_dirty_max]
+.rs_sel_dmap_loop:
+    cmp rcx, rax
+    jg .rs_sel_dmap_loop_done
+    cmp rcx, [grid_rows]
+    jge .rs_sel_dmap_loop_done
+    mov byte [row_dirty_map + rcx], 1
+    inc rcx
+    jmp .rs_sel_dmap_loop
+.rs_sel_dmap_loop_done:
+    pop rcx
+.rs_sel_dmap_done:
 
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
