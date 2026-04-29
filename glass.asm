@@ -578,6 +578,14 @@ section .bss
 ; means no -e was passed; use the default shell.
 exec_argv:           resq 32
 
+; --class <name> argv override. NULL until parse-argv finds the flag,
+; then points at argv[N+1]. Used by create_window to publish WM_CLASS
+; with both instance and class set to <name>; falls back to the literal
+; "glass\0Glass\0" when no override was given. Tile's `assign <class>
+; <ws>` rule matches the second NUL-terminated half (the class), so
+; setting --class Weechat lets tile route the window via that rule.
+class_arg:           resq 1
+
 ; Dead-key composition state. Holds the dead-key offset (0..0x2f,
 ; relative to 0xFE50) of the most-recent dead-keysym press; 0xFF means
 ; "no dead key pending". When the next keypress arrives we look up
@@ -1152,7 +1160,29 @@ _start:
     jz .es_arg_done
     cmp word [rax], 0x652d  ; "-e" little-endian (0x65 0x2d wrong way → "-e" is bytes 0x2d 0x65)
     je .es_check_e
-    cmp dword [rax], 0x002d2d ; "--\0" → length 2
+    ; "--class\0" → 8 bytes. First check the "--cl" dword, then "ass\0".
+    cmp dword [rax], 0x6c632d2d
+    jne .es_check_dashdash
+    cmp dword [rax+4], 0x00737361
+    jne .es_arg_loop
+    ; --class found. Save argv[N+1] as class_arg, advance past it.
+    inc r10
+    cmp r10, r8
+    jge .es_arg_done
+    mov rax, [r9 + r10*8]
+    test rax, rax
+    jz .es_arg_done
+    mov [class_arg], rax
+    jmp .es_arg_loop
+.es_check_dashdash:
+    ; "--\0" — 2 chars + NUL. The dword compare we used to do here read
+    ; byte [rax+3] too, which is the first byte of the *next* argv
+    ; string in the kernel's contiguous argv block. So `glass -- foo`
+    ; was silently ignored unless the next arg happened to start with
+    ; NUL. Match the `-e` check style: word for "--", byte for the NUL.
+    cmp word [rax], 0x2d2d
+    jne .es_arg_loop
+    cmp byte [rax + 2], 0
     jne .es_arg_loop
     jmp .es_collect
 .es_check_e:
@@ -4137,6 +4167,79 @@ x11_set_wm_hints:
     call x11_buffer
     inc dword [x11_seq]
 
+    ; ChangeProperty: WM_CLASS = "instance\0class\0"
+    ; If --class <name> was passed, both halves are <name> so
+    ; tile's `assign <name> <ws>` rule (which matches the class half
+    ; via str_eq on the second NUL-terminated string) routes the
+    ; window. Otherwise use the built-in "glass\0Glass\0" literal so
+    ; window managers can still identify generic glass terminals.
+    mov rsi, [class_arg]
+    test rsi, rsi
+    jnz .xwm_class_arg
+    ; Default: copy the 12-byte "glass\0Glass\0" literal.
+    lea rdi, [tmp_buf + 24]
+    lea rsi, [wm_class]
+    mov ecx, wm_class_len
+    rep movsb
+    mov edx, wm_class_len
+    jmp .xwm_class_emit
+.xwm_class_arg:
+    ; Custom: copy <name>\0<name>\0 (instance == class).
+    mov rdi, rsi
+    call strlen                          ; rax = strlen(class_arg)
+    test eax, eax
+    jz .xwm_skip_class                   ; empty string → skip property
+    cmp eax, 64
+    jbe .xwm_class_len_ok
+    mov eax, 64                          ; cap absurd values
+.xwm_class_len_ok:
+    push rax                              ; save per-half length
+    mov ecx, eax                          ; per-half length (no NUL)
+    lea rdi, [tmp_buf + 24]
+    push rcx
+    rep movsb
+    mov byte [rdi], 0
+    inc rdi
+    pop rcx
+    mov rsi, [class_arg]
+    rep movsb
+    mov byte [rdi], 0
+    pop rax                              ; per-half length
+    shl eax, 1                           ; 2 * length
+    add eax, 2                           ; + 2 NULs
+    mov edx, eax
+.xwm_class_emit:
+    ; Build the X11 ChangeProperty header (24 bytes) in tmp_buf[0..24],
+    ; with the data already copied into tmp_buf[24..]. Total request
+    ; length is (24 + edx) padded up to a 4-byte multiple.
+    push rdx                              ; save data length
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                   ; mode = Replace
+    mov eax, edx
+    add eax, 3
+    shr eax, 2                            ; data length in 4-byte units
+    add eax, 6                            ; + 6-word fixed header
+    mov [rdi+2], ax                       ; request length (in 4-byte units)
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 67                 ; WM_CLASS atom (predefined)
+    mov dword [rdi+12], 31                ; type = STRING
+    mov byte [rdi+16], 8                  ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    pop rdx                               ; data length in bytes
+    mov [rdi+20], edx                     ; value length (bytes, since format=8)
+    mov rax, rdx                          ; total bytes to send
+    add rax, 3
+    and rax, ~3                           ; round up to 4-byte boundary
+    add rax, 24                           ; + header
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+.xwm_skip_class:
+
     pop r12
     pop rbx
     ret
@@ -6191,6 +6294,17 @@ handle_keypress:
     jmp .hkp_done
 
 .hkp_no_dead:
+
+    ; XK_ISO_Left_Tab (0xFE20) is what most layouts emit for Shift+Tab.
+    ; It lives in the 0xFE00..0xFEFF block (XKB function keys / dead-key
+    ; markers) which sits BELOW the 0xFF00 special-keys cutoff, so without
+    ; this explicit dispatch it would fall into the UTF-8 path and get
+    ; dropped at `cmp eax, 0x07FF / ja .hkp_done`. Any tool that uses
+    ; Shift+Tab to walk backwards (Claude Code's permission cycler,
+    ; vim's <S-Tab>, weechat /buffer prev) needs CSI Z to arrive on the
+    ; PTY; without it the shift-tab keystroke is silently lost.
+    cmp eax, 0xFE20
+    je .hkp_shift_tab
 
     ; Dispatch on keysym ranges
     ; Special keys (0xFF00-0xFFFF)
@@ -9125,6 +9239,14 @@ grid_scroll_down:
 ; Scroll view backward (into scrollback history)
 scroll_view_up:
     push rbx
+    ; Drop any active selection: scrolling exposes different rows under
+    ; the highlighted band. Just clear the flag — the render path keys
+    ; off sel_active and re-paints the previously-highlighted rows
+    ; without the selection mask. Don't call selection_release_all
+    ; here: queueing SetSelectionOwner(None) makes the X server bounce
+    ; a SelectionClear event back to glass that falls through the
+    ; unhandled-event dispatch and produces user-visible side effects.
+    mov qword [sel_active], 0
     mov rax, [scroll_offset]
     mov rbx, [grid_rows]
     shr rbx, 1                       ; scroll by half a screen
@@ -9147,6 +9269,7 @@ scroll_view_up:
 ; Scroll view forward (toward live terminal)
 scroll_view_down:
     push rbx
+    mov qword [sel_active], 0
     mov rax, [scroll_offset]
     test rax, rax
     jz .svd_done                     ; already at live view
