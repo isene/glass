@@ -5045,6 +5045,24 @@ handle_x11_events:
     je .hxe_focus_in
     cmp al, EV_FOCUS_OUT
     je .hxe_focus_out
+    ; Event type 13 (GraphicsExpose) and 14 (NoExposure) are informational
+    ; events the X server generates for every CopyArea — the former when
+    ; the source had pixels unavailable (parent obscured, etc.), the latter
+    ; when the copy completed fully. Glass's BLT path doesn't need them
+    ; (back_pixmap is fully owned by us, so the dst always renders right
+    ; on the next normal frame). Silently drop both — without this they
+    ; fall through to the error path below and are logged as fake errors,
+    ; producing megabytes of "code=0 major=62" spam during workspace
+    ; switches that move windows under each other.
+    cmp al, 13                                 ; GraphicsExpose
+    je .hxe_drop
+    cmp al, 14                                 ; NoExposure
+    je .hxe_drop
+    ; All other unknown event codes also fall through here. byte 0 == 0
+    ; means a real X11 error; everything else is an event we don't care
+    ; about — drop without logging.
+    test al, al
+    jnz .hxe_drop
 
 .hxe_x11_error:
     ; X11 error event (32 bytes):
@@ -5109,6 +5127,10 @@ handle_x11_events:
     call log_write_buf
     pop r12
     pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_drop:
     add rbx, 32
     jmp .hxe_loop
 
@@ -5231,8 +5253,18 @@ handle_x11_events:
     ; rect directly: back_pixmap is already correct.
     push rbx
     push r12
+    ; Pseudo-transparency mode renders straight to the window with no
+    ; back-pixmap to BLT from. Gate on pseudo_full (the truthful "pseudo
+    ; is active" flag), NOT on back_pixmap == 0 — back_pixmap may still
+    ; hold a leftover XID from the pre-Alt+t opaque session, in which
+    ; case the BLT path early-returns inside blt_back_to_window because
+    ; needs_blt = 0 (set by the pseudo branch of ensure_back_buffer).
+    ; That early-return without a request_render left pseudo windows
+    ; blank after a workspace round-trip in non-tabbed layouts.
+    cmp byte [pseudo_full], 1
+    je .hxe_expose_render
     cmp dword [back_pixmap], 0
-    je .hxe_expose_render          ; pseudo-mode: no back buffer to BLT
+    je .hxe_expose_render
     push rdi
     push rsi
     push rdx
@@ -5380,22 +5412,32 @@ handle_x11_events:
     ; reallocated, and rows past the new height/width have stale ink.
     mov qword [all_dirty], 1
 .hxe_cfg_done:
-    ; ConfigureNotify: (re)sample the wallpaper for pseudo-transparency.
-    ; Tile may MOVE us when cycling layouts (without changing our size),
-    ; so resampling on every CN is required — otherwise the bg pixmap
-    ; still holds the slice from the previous root position and the
-    ; transparency looks broken until the user toggles opacity.
+    ; Pseudo-transparency setup is a one-shot. We must NOT re-run
+    ; setup_pseudo_transparency from inside the CN handler at runtime:
+    ; it issues round-trips via x11_drain_until_reply, which reads
+    ; replies INTO x11_buf — the same buffer the chunk-dispatch loop is
+    ; walking. The MapNotify and Expose right after the workspace-
+    ; switch CN get clobbered, the Expose-driven request_render never
+    ; fires, and pseudo-transparent panes come up blank in non-tabbed
+    ; layouts. (Tabbed dodged it because that path doesn't go through
+    ; configure_window_rect.)
+    ;
+    ; Gate on pseudo_full — the truthful "pseudo is currently active"
+    ; flag — rather than pseudo_setup_done, which Alt+t / Mod1+t
+    ; (opacity_toggle_apply) explicitly resets to 0 every time it
+    ; flips pseudo on. With pseudo_full as the gate, we set up pseudo
+    ; exactly once per session: at the first CN if it was configured
+    ; via .glassrc, and on toggle-on (which calls setup_pseudo
+    ; directly, no CN-handler dependency). Layout cycles that move
+    ; the window will have a stale wallpaper crop; user can refresh
+    ; with Alt+t-twice.
     cmp byte [cfg_opacity_set], 1
     jne .hxe_cfg_no_pseudo
     cmp byte [compositor_active], 1
     je .hxe_cfg_no_pseudo
-    ; First time only: mark setup done so the rest of the codebase
-    ; (palette tinting, etc.) knows the pseudo path is in play. After
-    ; that, every CN unconditionally re-samples.
-    cmp byte [pseudo_setup_done], 0
-    jne .hxe_cfg_resample
+    cmp byte [pseudo_full], 1
+    je .hxe_cfg_no_pseudo
     mov byte [pseudo_setup_done], 1
-.hxe_cfg_resample:
     call setup_pseudo_transparency
     call request_render
 .hxe_cfg_no_pseudo:
