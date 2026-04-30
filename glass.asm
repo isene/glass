@@ -6676,6 +6676,20 @@ handle_keypress:
     ; buffer, advancing the cursor).
     mov rdx, 1
 .hkp_send_seq_no_clear:
+    ; Drop any active mouse selection: an input keystroke means the
+    ; user is done picking text. Without this, typing into a selected
+    ; region leaves the highlight band underneath the typed glyphs
+    ; (and the next paste / Shift+Insert pulls stale content). xterm,
+    ; kitty, and st all do this. selection_release_all clobbers rdx,
+    ; which is the byte count the SYS_WRITE below needs — save it.
+    cmp qword [sel_active], 0
+    je .hkp_keep_no_sel_clear
+    push rdx
+    mov qword [sel_active], 0
+    call selection_release_all
+    pop rdx
+    mov qword [all_dirty], 1
+.hkp_keep_no_sel_clear:
     ; Any keystroke that produces input bytes snaps the view back
     ; to live so the user sees their typed character / its echo.
     ; Scrollback-only keys (Shift+PgUp, Shift+PgDn, Ctrl+L's special
@@ -8892,6 +8906,18 @@ grid_scroll_region_up:
     push rbx
     push r12
     push r13
+    ; Active mouse selection is now meaningless: content under the
+    ; selection band is about to shift. grid_scroll_up handles this
+    ; for the no-region path; we have to do it here for the
+    ; CSI-r-region path because CC and other TUIs scroll with a
+    ; restricted region (top-row banner / bottom-row status bar).
+    ; Without this clear, the selection's pixel position stays put
+    ; while the underlying text scrolls past — what the user reported.
+    cmp qword [sel_active], 0
+    je .gsru_no_sel_clear
+    mov qword [sel_active], 0
+    call selection_release_all
+.gsru_no_sel_clear:
     mov r12, [scroll_top]
     mov r13, [scroll_bottom]
     test r13, r13
