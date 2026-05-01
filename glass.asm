@@ -6958,6 +6958,119 @@ vt_process:
     cmp r14, r13
     jge .vtp_done
 
+    ; ASCII fast path: a long-paste benchmark hits this loop millions
+    ; of times for printable bytes. The per-byte state machine + per-
+    ; cell grid_put_char averages ~30 instructions per char even for
+    ; trivial ASCII (most of which is checking states that aren't
+    ; active). Detect a contiguous run of "boring" bytes (printable
+    ; ASCII, no control / ESC / DEL) while we're in plain VT_NORMAL
+    ; state with no pending UTF-8, no deferred wrap, no scroll
+    ; offset (scrollback inputs go through grid_put_char's snap-to-
+    ; live path), no autowrap pending, and bulk-write them straight
+    ; into the grid row. Falls back to the original per-byte path on
+    ; ANY non-ASCII byte / non-default state — correctness over
+    ; cleverness.
+    cmp qword [vt_state], 0            ; VT_NORMAL == 0
+    jne .vtp_loop_slow
+    cmp dword [utf8_remaining], 0
+    jne .vtp_loop_slow
+    cmp byte [pending_wrap], 0
+    jne .vtp_loop_slow
+    movzx eax, byte [r12 + r14]
+    cmp al, 0x20
+    jb .vtp_loop_slow                  ; control byte — slow path
+    cmp al, 0x7E
+    ja .vtp_loop_slow                  ; DEL or 8-bit — slow path
+    ; Compute how many bytes of room we have on the current row. Stop
+    ; the run at end-of-row so the autowrap / pending_wrap state stays
+    ; consistent with what grid_put_char would have set.
+    mov rbx, [grid_cols]
+    sub rbx, [cursor_col]              ; rbx = cells left on this row
+    test rbx, rbx
+    jle .vtp_loop_slow                 ; no room (or already past)
+    mov rcx, r13
+    sub rcx, r14                       ; rcx = bytes left in input
+    cmp rcx, rbx
+    jle .vtp_fp_have_max
+    mov rcx, rbx
+.vtp_fp_have_max:
+    ; rcx = max run length we'd accept (cells AND bytes available)
+    ; Scan forward while bytes are in [0x20, 0x7E].
+    xor rdx, rdx                       ; rdx = run length so far
+    mov rsi, r12
+    add rsi, r14                       ; rsi = current input start
+.vtp_fp_scan:
+    cmp rdx, rcx
+    jge .vtp_fp_scan_done
+    movzx eax, byte [rsi + rdx]
+    cmp al, 0x20
+    jb .vtp_fp_scan_done
+    cmp al, 0x7E
+    ja .vtp_fp_scan_done
+    inc rdx
+    jmp .vtp_fp_scan
+.vtp_fp_scan_done:
+    test rdx, rdx
+    jz .vtp_loop_slow                  ; run length 0 (shouldn't happen post-check)
+    ; rdx = run length (≥1, ≤ cells_left, all bytes in [0x20, 0x7E]).
+    ; Compute cell base for first write: row*MAX_COLS + col, *CELL_SIZE.
+    mov rax, [cursor_row]
+    imul rax, MAX_COLS
+    add rax, [cursor_col]
+    imul rax, CELL_SIZE
+    lea rdi, [grid + rax]              ; rdi = first cell ptr
+    ; Cache the per-cell metadata template once (all cells in the run
+    ; share the same fg/bg/attrs/OSC8/emoji-idx).
+    movzx r8d, byte [cur_fg_default]
+    movzx r9d, byte [cur_bg_default]
+    movzx r10d, byte [cur_attrs]
+    movzx r11d, byte [cur_osc8_id]
+    mov ebx, [cur_fg_pixel]
+    mov ebp, [cur_bg_pixel]
+    push rbp                            ; save rbp / restore on exit
+    mov rsi, r12
+    add rsi, r14                       ; rsi = current input ptr
+    mov rcx, rdx                       ; rcx = remaining run length
+.vtp_fp_write:
+    movzx eax, byte [rsi]
+    mov [rdi], ax                      ; cell[0-1] = char (16-bit)
+    mov [rdi+2], r8b                   ; cell[2] fg default flag
+    mov [rdi+3], r9b                   ; cell[3] bg default flag
+    mov [rdi+4], r10b                  ; cell[4] attrs
+    mov [rdi+5], r11b                  ; cell[5] OSC 8 link id
+    mov word [rdi+6], 0                ; cell[6-7] emoji idx (none in ASCII)
+    mov [rdi+8], ebx                   ; cell[8-11] fg pixel
+    mov [rdi+12], ebp                  ; cell[12-15] bg pixel
+    add rdi, CELL_SIZE
+    inc rsi
+    dec rcx
+    jnz .vtp_fp_write
+    pop rbp
+    ; Mark this row dirty so the per-row paint scanner picks it up.
+    mov rax, [cursor_row]
+    mov byte [row_dirty_map + rax], 1
+    ; Advance cursor + input by run length. If we hit end-of-row,
+    ; mirror grid_put_char's autowrap behaviour: clamp to last col,
+    ; set pending_wrap (autowrap) or just clamp (no autowrap).
+    add r14, rdx
+    add [cursor_col], rdx
+    mov rax, [cursor_col]
+    cmp rax, [grid_cols]
+    jl .vtp_loop                       ; still room, keep looping
+    cmp qword [autowrap], 0
+    je .vtp_fp_clamp
+    mov rax, [grid_cols]
+    dec rax
+    mov [cursor_col], rax
+    mov byte [pending_wrap], 1
+    jmp .vtp_loop
+.vtp_fp_clamp:
+    mov rax, [grid_cols]
+    dec rax
+    mov [cursor_col], rax
+    jmp .vtp_loop
+
+.vtp_loop_slow:
     movzx eax, byte [r12 + r14]
     inc r14
 
