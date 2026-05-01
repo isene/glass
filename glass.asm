@@ -125,6 +125,7 @@
 %define EV_MOTION_NOTIFY    6
 %define EV_FOCUS_IN         9
 %define EV_FOCUS_OUT        10
+%define EV_SELECTION_CLEAR   29
 %define EV_SELECTION_REQUEST 30
 %define EV_SELECTION_NOTIFY  31
 
@@ -784,6 +785,8 @@ click_count:        resq 1          ; 1=single, 2=double, 3=triple
 click_ts_buf:       resq 2          ; scratch for clock_gettime (sec, nsec)
 sel_mode:           resq 1          ; 0=char, 1=word, 2=line (locks drag/release)
 sel_drag_scroll_dir: resb 1         ; 0=none, 1=above (scroll up), 2=below (scroll down)
+owns_primary:       resq 1          ; 1 when glass holds the PRIMARY selection
+owns_clipboard:     resq 1          ; 1 when glass holds the CLIPBOARD selection
 
 ; UTF-8 decoder state
 utf8_char:          resd 1
@@ -5124,6 +5127,8 @@ handle_x11_events:
     je .hxe_configure
     cmp al, EV_CLIENT_MESSAGE
     je .hxe_client_msg
+    cmp al, EV_SELECTION_CLEAR
+    je .hxe_sel_clear
     cmp al, EV_SELECTION_REQUEST
     je .hxe_sel_request
     cmp al, EV_SELECTION_NOTIFY
@@ -6104,11 +6109,31 @@ handle_x11_events:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov qword [owns_primary], 1
     call x11_flush
 .hxe_br_done2:
     pop r13
     pop r12
     pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_sel_clear:
+    ; SelectionClear event (type 29): another client took ownership of
+    ; a selection we held. Format: pad(1), pad(1), seq(2), time(4),
+    ;   owner(4), selection(4), pad(16). selection at offset 12.
+    ; Just clear our local owns_* flag for that selection so a later
+    ; selection_release_all doesn't yank ownership from the new owner.
+    mov eax, [x11_buf + rbx + 12]
+    cmp eax, 1                       ; XA_PRIMARY
+    jne .hxe_sc_check_clip
+    mov qword [owns_primary], 0
+    jmp .hxe_sc_done
+.hxe_sc_check_clip:
+    cmp eax, [clipboard_atom]
+    jne .hxe_sc_done
+    mov qword [owns_clipboard], 0
+.hxe_sc_done:
     add rbx, 32
     jmp .hxe_loop
 
@@ -10144,12 +10169,20 @@ selection_claim_primary:
     call x11_flush
     ret
 
-; selection_release_all: SetSelectionOwner(window=None) on both
-; PRIMARY and CLIPBOARD so other apps stop seeing glass as the
-; selection owner. Used when Ctrl+L drops the active selection —
-; otherwise a middle-click paste in another app would still pull
-; the no-longer-highlighted text from us.
+; selection_release_all: SetSelectionOwner(window=None) on the
+; selections WE actually own. Releasing a selection we don't own
+; clobbers the real owner (X server's SetSelectionOwner accepts
+; CurrentTime requests from any client and replaces whoever was
+; there) — that's exactly the bug behind "select in glass-X, paste
+; into glass-Y, select in glass-Y, type into glass-X, then
+; Shift+Insert in glass-X pastes nothing": the keystroke fired
+; selection_release_all → glass-X yanked PRIMARY ownership away
+; from glass-Y → next ConvertSelection PRIMARY had no owner →
+; SelectionNotify with property=None → silent paste failure. We
+; only release what owns_primary / owns_clipboard track.
 selection_release_all:
+    cmp qword [owns_primary], 0
+    je .sra_check_clip
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_SET_SELECTION_OWNER
     mov byte [rdi+1], 0
@@ -10161,6 +10194,10 @@ selection_release_all:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov qword [owns_primary], 0
+.sra_check_clip:
+    cmp qword [owns_clipboard], 0
+    je .sra_done
     cmp dword [clipboard_atom], 0
     je .sra_done
     lea rdi, [tmp_buf]
@@ -10175,6 +10212,7 @@ selection_release_all:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov qword [owns_clipboard], 0
 .sra_done:
     ret
 
@@ -10196,6 +10234,7 @@ selection_claim_clipboard:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
+    mov qword [owns_clipboard], 1
     call x11_flush
 .scc_done:
     ret
