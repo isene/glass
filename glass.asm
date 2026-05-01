@@ -80,6 +80,13 @@
 %define X11_QUERY_EXTENSION   98
 %define CW_BACK_PIXMAP        0x00000001
 
+; Paste GetProperty reply lands at this offset in x11_buf so the live
+; event batch (read up to 8192 bytes into x11_buf+0) is not clobbered
+; while the SelectionNotify handler runs in the middle of iteration.
+; 32768 leaves a clear 24 KB gap above the event window and 16 KB
+; below x11_buf's 65536-byte tail for the reply itself.
+%define PASTE_REPLY_OFFSET           32768
+
 ; XRender extension minor opcodes (sent with major = render_major_opcode)
 %define RENDER_QUERY_VERSION         0
 %define RENDER_QUERY_PICT_FORMATS    1
@@ -2077,6 +2084,77 @@ x11_buffer:
     ret
 
 ; Send and receive (synchronous request)
+; x11_drain_until_reply_at: like x11_drain_until_reply but writes the
+; reply to x11_buf + rdi (caller-supplied offset). Used by the paste
+; path so the GetProperty reply doesn't clobber events still queued
+; in x11_buf at offsets above the SelectionNotify event being
+; processed (handle_x11_events reads up to 8192 bytes of events into
+; x11_buf at offset 0, and the iterator preserves rbx across handler
+; calls — without this, the reply lands on top of the next pending
+; event and the loop reinterprets reply bytes as fake events,
+; producing keystroke garbage on the PTY).
+;
+; Inputs:  rdi = offset within x11_buf (must leave room for header +
+;                length*4 bytes; PASTE_REPLY_OFFSET = 32768 fits any
+;                4096-word reply with > 16 KB headroom).
+; Returns: rax = 0 on success, -1 on read failure or X11 error reply.
+x11_drain_until_reply_at:
+    push r12
+    push r13
+    push r14
+    mov r14, rdi                    ; r14 = offset within x11_buf
+.xdra_read_hdr:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    add rsi, r14
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .xdra_fail
+    movzx eax, byte [x11_buf + r14]
+    test al, al
+    jz .xdra_fail                   ; X11 error
+    cmp al, 1
+    jne .xdra_read_hdr              ; event, drop and reuse slot
+    mov eax, [x11_buf + r14 + 4]
+    shl eax, 2
+    test eax, eax
+    jz .xdra_done
+    mov r12, rax
+    mov r13, 32
+.xdra_extra:
+    test r12, r12
+    jz .xdra_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    add rsi, r14
+    add rsi, r13
+    mov rdx, r12
+    cmp rdx, 32768
+    jle .xdra_extra_ok
+    mov rdx, 32768
+.xdra_extra_ok:
+    syscall
+    test rax, rax
+    jle .xdra_fail
+    sub r12, rax
+    add r13, rax
+    jmp .xdra_extra
+.xdra_done:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    ret
+.xdra_fail:
+    mov rax, -1
+    pop r14
+    pop r13
+    pop r12
+    ret
+
 ; x11_drain_until_reply: read from x11_fd into x11_buf until a reply
 ; (type 1) lands. Events (type 2..127) that arrive in the meantime are
 ; discarded — fine while we're inside a one-shot setup, missed events
@@ -4947,68 +5025,6 @@ event_loop:
     test rax, rax
     jle .ev_pty_drain_done             ; EOF / error → child likely dead
     mov rcx, rax
-    ; DEBUG: dump every PTY byte to /tmp/glass-pty.log
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    mov r9, rax                        ; r9 = bytes read
-    mov rax, SYS_OPEN
-    lea rdi, [.pty_dbg_path]
-    mov rsi, 0x441                     ; O_WRONLY|O_CREAT|O_APPEND
-    mov rdx, 0o644
-    syscall
-    test rax, rax
-    js .pty_dbg_skip
-    mov r10, rax
-    ; Push separator chars on the stack; write chunk between them.
-    sub rsp, 16
-    mov byte [rsp], '<'
-    mov byte [rsp+1], '>'
-    mov byte [rsp+2], 10
-    mov rax, SYS_WRITE
-    mov rdi, r10
-    mov rsi, rsp
-    mov rdx, 1                         ; '<'
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, r10
-    lea rsi, [pty_read_buf]
-    mov rdx, r9
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, r10
-    lea rsi, [rsp+1]
-    mov rdx, 1                         ; '>'
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, r10
-    lea rsi, [rsp+2]
-    mov rdx, 1                         ; '\n'
-    syscall
-    add rsp, 16
-    mov rax, SYS_CLOSE
-    mov rdi, r10
-    syscall
-.pty_dbg_skip:
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    jmp .pty_dbg_after
-.pty_dbg_path: db "/tmp/glass-pty.log", 0
-.pty_dbg_after:
-    mov rcx, rax
     lea rsi, [pty_read_buf]
     call vt_process
     inc r12
@@ -6253,24 +6269,27 @@ handle_x11_events:
     mov rdx, 24
     call x11_buffer
     inc dword [x11_seq]
-    ; Flush and read the GetProperty reply. The previous code did a
-    ; single 65 KB read into x11_buf, which silently picked up whatever
-    ; arrived first on the socket — almost always the reply, but not
-    ; if any X event slipped in ahead (motion, focus, expose, the
-    ; SelectionClear that fires when we acquire the selection back from
-    ; the previous owner). Fast / repeated pastes hit this race —
-    ; user sees garbage where the paste should have been. Use
-    ; x11_drain_until_reply, which discards interleaved events and
-    ; keeps reading until type=1 (reply) lands.
+    ; Flush and read the GetProperty reply into x11_buf at
+    ; PASTE_REPLY_OFFSET (32768). x11_buf at offset 0 still holds the
+    ; live event batch — we're being called mid-iteration of
+    ; handle_x11_events with rbx pointing at this SelectionNotify and
+    ; potentially more events queued at higher offsets. Writing the
+    ; reply at offset 0 (the previous behaviour) clobbered those
+    ; pending events; the iterator then re-interpreted reply bytes as
+    ; phantom KEY_PRESS / MOTION events and wrote keystroke garbage to
+    ; the PTY. (v0.3.17's earlier "race" comment described a related
+    ; but distinct kernel-side race — the buffer-clobber is the real
+    ; producer of paste-time garbage.)
     call x11_flush
-    call x11_drain_until_reply
+    mov edi, PASTE_REPLY_OFFSET
+    call x11_drain_until_reply_at
     test rax, rax
     js .hxe_sn_done
-    ; Reply: type at offset 8, bytes-after at offset 16, value-length at offset 16
-    ; Format at offset 1, length at offset 4 (in 4-byte units)
-    ; Data at offset 32, data length = value_length (at offset 16)
-    mov r12d, [x11_buf + 16]        ; value_length (number of items)
-    movzx eax, byte [x11_buf + 1]   ; format (8, 16, or 32 bits)
+    ; Reply layout (header at PASTE_REPLY_OFFSET):
+    ;   +1: format (8/16/32), +4: length-in-words, +16: value_length,
+    ;   +32: data
+    mov r12d, [x11_buf + PASTE_REPLY_OFFSET + 16]   ; value_length (items)
+    movzx eax, byte [x11_buf + PASTE_REPLY_OFFSET + 1]   ; format
     cmp al, 8
     jne .hxe_sn_done                 ; we only handle 8-bit format
     ; r12d = number of bytes of paste data
@@ -6292,7 +6311,7 @@ handle_x11_events:
     ; Write the actual paste data
     mov rax, SYS_WRITE
     mov rdi, [pty_master]
-    lea rsi, [x11_buf + 32]
+    lea rsi, [x11_buf + PASTE_REPLY_OFFSET + 32]
     mov edx, r12d
     syscall
     ; Send bracket end if bracketed paste mode is on
