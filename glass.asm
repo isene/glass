@@ -5439,6 +5439,62 @@ handle_x11_events:
     mov [prev_grid_cols], rax
     mov rax, [grid_rows]
     mov [prev_grid_rows], rax
+    ; Clamp scroll region + cursor + saved cursor to the new grid bounds.
+    ; A shorter window (e.g. tile vertical-split) leaves scroll_bottom
+    ; pointing past grid_rows-1 if the child app set DECSTBM at the old
+    ; height (vim sends `\x1b[1;55r` in 55-row layouts; if we resize to
+    ; 25 rows the scroll region still claims rows 0..54). Subsequent
+    ; index/scroll operations then walk past the visible grid and
+    ; mash up the rendered output. Clamp on every resize so the next
+    ; SIGWINCH-driven full repaint from the child lands in valid bounds.
+    mov rax, [grid_rows]
+    test rax, rax
+    jz .hxe_cfg_clamp_done
+    dec rax                            ; rax = max-row index
+    cmp [scroll_bottom], rax
+    jbe .hxe_cfg_clamp_st
+    mov [scroll_bottom], rax
+.hxe_cfg_clamp_st:
+    cmp [scroll_top], rax
+    jbe .hxe_cfg_clamp_cur_row
+    mov [scroll_top], rax
+.hxe_cfg_clamp_cur_row:
+    cmp [cursor_row], rax
+    jbe .hxe_cfg_clamp_alt_row
+    mov [cursor_row], rax
+.hxe_cfg_clamp_alt_row:
+    cmp [alt_cursor_row], rax
+    jbe .hxe_cfg_clamp_saved_row
+    mov [alt_cursor_row], rax
+.hxe_cfg_clamp_saved_row:
+    cmp [cursor_saved_row], rax
+    jbe .hxe_cfg_clamp_alt_saved_row
+    mov [cursor_saved_row], rax
+.hxe_cfg_clamp_alt_saved_row:
+    cmp [alt_saved_cursor_row], rax
+    jbe .hxe_cfg_clamp_col
+    mov [alt_saved_cursor_row], rax
+.hxe_cfg_clamp_col:
+    mov rax, [grid_cols]
+    test rax, rax
+    jz .hxe_cfg_clamp_done
+    dec rax                            ; rax = max-col index
+    cmp [cursor_col], rax
+    jbe .hxe_cfg_clamp_alt_col
+    mov [cursor_col], rax
+.hxe_cfg_clamp_alt_col:
+    cmp [alt_cursor_col], rax
+    jbe .hxe_cfg_clamp_saved_col
+    mov [alt_cursor_col], rax
+.hxe_cfg_clamp_saved_col:
+    cmp [cursor_saved_col], rax
+    jbe .hxe_cfg_clamp_alt_saved_col
+    mov [cursor_saved_col], rax
+.hxe_cfg_clamp_alt_saved_col:
+    cmp [alt_saved_cursor_col], rax
+    jbe .hxe_cfg_clamp_done
+    mov [alt_saved_cursor_col], rax
+.hxe_cfg_clamp_done:
     ; Resize PTY. Fill ws_xpixel/ws_ypixel so kitty-graphics clients
     ; (pointer, etc.) can size images to the actual pane in pixels.
     sub rsp, 8
@@ -6143,15 +6199,19 @@ handle_x11_events:
     mov rdx, 24
     call x11_buffer
     inc dword [x11_seq]
-    ; Flush and read reply
+    ; Flush and read the GetProperty reply. The previous code did a
+    ; single 65 KB read into x11_buf, which silently picked up whatever
+    ; arrived first on the socket — almost always the reply, but not
+    ; if any X event slipped in ahead (motion, focus, expose, the
+    ; SelectionClear that fires when we acquire the selection back from
+    ; the previous owner). Fast / repeated pastes hit this race —
+    ; user sees garbage where the paste should have been. Use
+    ; x11_drain_until_reply, which discards interleaved events and
+    ; keeps reading until type=1 (reply) lands.
     call x11_flush
-    mov rax, SYS_READ
-    mov rdi, [x11_fd]
-    lea rsi, [x11_buf]
-    mov rdx, 65536
-    syscall
-    cmp rax, 32
-    jl .hxe_sn_done
+    call x11_drain_until_reply
+    test rax, rax
+    js .hxe_sn_done
     ; Reply: type at offset 8, bytes-after at offset 16, value-length at offset 16
     ; Format at offset 1, length at offset 4 (in 4-byte units)
     ; Data at offset 32, data length = value_length (at offset 16)
