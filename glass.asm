@@ -776,6 +776,7 @@ last_click_col:     resq 1
 click_count:        resq 1          ; 1=single, 2=double, 3=triple
 click_ts_buf:       resq 2          ; scratch for clock_gettime (sec, nsec)
 sel_mode:           resq 1          ; 0=char, 1=word, 2=line (locks drag/release)
+sel_drag_scroll_dir: resb 1         ; 0=none, 1=above (scroll up), 2=below (scroll down)
 
 ; UTF-8 decoder state
 utf8_char:          resd 1
@@ -5933,8 +5934,60 @@ handle_x11_events:
     jne .hxe_mn_done
     ; Drag in progress: activate selection now (cleared on press)
     mov qword [sel_active], 1
+    ; Auto-scroll when the pointer leaves the window vertically. Read y
+    ; as SIGNED int16 — X11 grabs the pointer during a button drag and
+    ; delivers motion events with negative y when the user drags above
+    ; the window (and y >= win_height when below). Without signed
+    ; handling y wraps to a huge unsigned, sel_end_row lands in the
+    ; thousands, and selection beyond the viewport is meaningless.
+    movsx r13, word [x11_buf + rbx + 26]   ; y as signed
+    test r13, r13
+    js .hxe_mn_drag_above
+    cmp r13, [win_height]
+    jge .hxe_mn_drag_below
+    ; In-bounds: regular sel_end update.
     mov [sel_end_col], r12
     mov [sel_end_row], rax
+    mov byte [sel_drag_scroll_dir], 0
+    jmp .hxe_mn_drag_render
+.hxe_mn_drag_above:
+    ; Mouse above the window: scroll back ONE row; pin selection at
+    ; row 0 col 0. One-row-per-motion is the right granularity for
+    ; drag (X delivers motion events per pixel of travel).
+    mov byte [sel_drag_scroll_dir], 1
+    push rax
+    push rbx
+    push r12
+    call selection_scroll_step_up
+    pop r12
+    pop rbx
+    pop rax
+    mov qword [sel_end_col], 0
+    mov qword [sel_end_row], 0
+    jmp .hxe_mn_drag_render
+.hxe_mn_drag_below:
+    ; Mouse below the window: scroll forward ONE row; pin selection at
+    ; the visible last row, last column.
+    mov byte [sel_drag_scroll_dir], 2
+    push rax
+    push rbx
+    push r12
+    call selection_scroll_step_down
+    pop r12
+    pop rbx
+    pop rax
+    mov rax, [grid_cols]
+    test rax, rax
+    jz .hxe_mn_drag_below_no_grid
+    dec rax
+.hxe_mn_drag_below_no_grid:
+    mov [sel_end_col], rax
+    mov rax, [grid_rows]
+    test rax, rax
+    jz .hxe_mn_drag_render
+    dec rax
+    mov [sel_end_row], rax
+.hxe_mn_drag_render:
     ; Trigger re-render to show selection visually (coalesced — actual
     ; paint happens once at end of event-loop iteration even if the X
     ; server delivered dozens of MotionNotify events in this batch).
@@ -5997,6 +6050,7 @@ handle_x11_events:
     cmp r13d, 1
     jne .hxe_br_done2
     mov qword [sel_button_held], 0
+    mov byte [sel_drag_scroll_dir], 0
     cmp qword [sel_active], 1
     jne .hxe_br_done2
     ; Word/line selections were finalized at button-press; skip release update
@@ -9630,6 +9684,32 @@ scroll_view_down:
     call request_render
 .svd_done:
     pop rbx
+    ret
+
+; selection_scroll_step_up / _down
+; Scroll the viewport by ONE row in either direction WITHOUT clearing
+; sel_active. Used by the drag-beyond-edge select-scroll path. Half-a-
+; screen jumps (the wheel/keyboard contract) are far too aggressive when
+; the X server delivers a motion event per pixel of pointer travel.
+selection_scroll_step_up:
+    mov rax, [scroll_offset]
+    mov rcx, [scroll_lines]
+    cmp rax, rcx
+    jge .sssu_done
+    inc rax
+    mov [scroll_offset], rax
+    call request_render
+.sssu_done:
+    ret
+
+selection_scroll_step_down:
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .sssd_done
+    dec rax
+    mov [scroll_offset], rax
+    call request_render
+.sssd_done:
     ret
 
 ; Returns AL=1 if (r12=row, rbx=col) is in current selection range.
