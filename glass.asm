@@ -15865,12 +15865,23 @@ handle_kitty_apc:
     push r14
     call apc_parse_header
 
-    ; If continuation chunk, infer action from pending state.
+    ; Track whether the action key was carried in this chunk's header.
+    ; Continuation chunks omit `a=` and only carry `m=` + payload, so we
+    ; have to infer the action from pending state. But if the chunk DOES
+    ; carry `a=t` or `a=T`, that's authoritative — it's the start of a
+    ; new transmission and any pending state from a previous interrupted
+    ; transmission (e.g. pointer killed mid-stream while glow was still
+    ; chunking) MUST be reset, not fused into. r14 = 1 if action was
+    ; explicit, 0 if inferred.
+    xor r14, r14
     movzx eax, byte [apc_kv_a]
     test al, al
-    jnz .hka_have_action
+    jz .hka_action_inferred
+    mov r14, 1
+    jmp .hka_have_action
+.hka_action_inferred:
     cmp byte [apc_pending_active], 1
-    jne .hka_done                    ; orphan chunk — drop
+    jne .hka_done                    ; orphan chunk with no pending → drop
     mov al, 't'
     mov [apc_kv_a], al
 .hka_have_action:
@@ -15893,11 +15904,11 @@ handle_kitty_apc:
     xor al, al
 .hka_xmit_common:
     ; al = "place after finalize" flag for THIS chunk's action.
-    ; Only honor it on the first chunk; on continuations the action
-    ; is inferred as 't', which would otherwise wipe the pending
-    ; place flag set by the original a=T.
-    cmp byte [apc_pending_active], 1
-    je .hka_append
+    ; Honor a/T only on chunks that carried `a=` explicitly. Inferred-as-
+    ; 't' continuations must NOT touch the pending flags or they would
+    ; wipe the place flag set by the original a=T.
+    test r14, r14
+    jz .hka_append                   ; inferred: pure continuation, append
     mov [apc_pending_place], al
     mov eax, [apc_kv_i]
     mov [apc_pending_id], eax
