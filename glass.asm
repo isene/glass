@@ -4946,6 +4946,68 @@ event_loop:
     test rax, rax
     jle .ev_pty_drain_done             ; EOF / error → child likely dead
     mov rcx, rax
+    ; DEBUG: dump every PTY byte to /tmp/glass-pty.log
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r9, rax                        ; r9 = bytes read
+    mov rax, SYS_OPEN
+    lea rdi, [.pty_dbg_path]
+    mov rsi, 0x441                     ; O_WRONLY|O_CREAT|O_APPEND
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .pty_dbg_skip
+    mov r10, rax
+    ; Push separator chars on the stack; write chunk between them.
+    sub rsp, 16
+    mov byte [rsp], '<'
+    mov byte [rsp+1], '>'
+    mov byte [rsp+2], 10
+    mov rax, SYS_WRITE
+    mov rdi, r10
+    mov rsi, rsp
+    mov rdx, 1                         ; '<'
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r10
+    lea rsi, [pty_read_buf]
+    mov rdx, r9
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r10
+    lea rsi, [rsp+1]
+    mov rdx, 1                         ; '>'
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r10
+    lea rsi, [rsp+2]
+    mov rdx, 1                         ; '\n'
+    syscall
+    add rsp, 16
+    mov rax, SYS_CLOSE
+    mov rdi, r10
+    syscall
+.pty_dbg_skip:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .pty_dbg_after
+.pty_dbg_path: db "/tmp/glass-pty.log", 0
+.pty_dbg_after:
+    mov rcx, rax
     lea rsi, [pty_read_buf]
     call vt_process
     inc r12
@@ -8167,8 +8229,20 @@ vt_process:
     mov [cursor_saved_col], rax
     jmp .vtp_loop
 
-; CSI u - Restore Cursor Position
+; CSI u — Restore Cursor Position (ANSI), DECRC equivalent.
+;
+; CSI ? u and CSI > u — kitty keyboard protocol queries (request /
+; pop active flags). Vim sends `[?u` immediately after `[?25h` to
+; ask for the current keyboard mode flags; treating that as Restore
+; Cursor warps the cursor to whatever cursor_saved holds (post-
+; alt-screen-entry that's (0,0)) and the user sees a ghost cursor
+; block at top-left while their typed text still goes to the right
+; place. Ignore both private variants here.
 .vtp_csi_restore_cursor:
+    cmp byte [vt_private], '?'
+    je .vtp_loop
+    cmp byte [vt_private], '>'
+    je .vtp_loop
     mov byte [pending_wrap], 0
     mov rax, [cursor_saved_row]
     mov [cursor_row], rax
