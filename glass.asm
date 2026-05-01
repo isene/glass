@@ -1026,6 +1026,14 @@ palette:            resd 256
 alt_grid:           resb MAX_COLS * MAX_ROWS * CELL_SIZE
 alt_cursor_row:     resq 1
 alt_cursor_col:     resq 1
+alt_saved_cursor_row: resq 1   ; cursor_saved_row/col stash across alt-screen.
+alt_saved_cursor_col: resq 1   ; The shell's ESC[s ("save cursor for editline
+                                ; redraws") writes cursor_saved_*; on
+                                ; alt-screen entry that save is from main
+                                ; screen and would mis-position the alt-
+                                ; screen app if it issues ESC[u or ESC 8.
+                                ; Stash here on enter, reset cursor_saved_*
+                                ; to (0,0), and restore on exit.
 alt_screen_active:  resq 1          ; 0 = main, 1 = alt
 
 ; DECSET mode flags
@@ -7753,6 +7761,18 @@ vt_process:
     mov [alt_cursor_row], rax
     mov rax, [cursor_col]
     mov [alt_cursor_col], rax
+    ; Stash the ESC[s / ESC 7 save register so the alt-screen app can use
+    ; it independently. Without this, anything the shell saved with ESC[s
+    ; (bare's read_line entry-point save) leaks into the alt-screen app's
+    ; ESC 8 / ESC[u and lands the cursor at end-of-prompt instead of
+    ; wherever the app expects (vim opening with the cursor stuck at the
+    ; column where bare's edit cursor was when Enter was pressed).
+    mov rax, [cursor_saved_row]
+    mov [alt_saved_cursor_row], rax
+    mov rax, [cursor_saved_col]
+    mov [alt_saved_cursor_col], rax
+    mov qword [cursor_saved_row], 0
+    mov qword [cursor_saved_col], 0
     ; Save main grid to alt_grid: only the active grid_rows × grid_cols
     ; cells, copied a row at a time via rep movsq.
     push rdi
@@ -7839,6 +7859,13 @@ vt_process:
     mov [cursor_row], rax
     mov rax, [alt_cursor_col]
     mov [cursor_col], rax
+    ; Restore the ESC[s save register that the shell had set before
+    ; switching to alt screen, so its next redraw lands cursor where it
+    ; expects.
+    mov rax, [alt_saved_cursor_row]
+    mov [cursor_saved_row], rax
+    mov rax, [alt_saved_cursor_col]
+    mov [cursor_saved_col], rax
     mov qword [alt_screen_active], 0
     ; Reset scroll region, modes, and attributes
     mov qword [scroll_top], 0
