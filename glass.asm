@@ -686,6 +686,7 @@ png_out_read:       resd 1          ; parent reads RGBA bytes here
 png_out_write:      resd 1          ; child stdout target (parent: closed)
 run_bold:           resb 1          ; current run's bold bit (renderer)
 run_underline:      resb 1          ; current run's underline bit (renderer)
+run_italic:         resb 1          ; current run's italic bit (renderer)
 wm_protocols_atom:  resd 1
 
 ; XRender extension state. render_major is 0 if RENDER is unavailable
@@ -8869,12 +8870,16 @@ vt_process:
     jz .vtp_sgr_reset
     cmp eax, 1
     je .vtp_sgr_bold
+    cmp eax, 3
+    je .vtp_sgr_italic
     cmp eax, 4
     je .vtp_sgr_underline
     cmp eax, 7
     je .vtp_sgr_inverse
     cmp eax, 22
     je .vtp_sgr_no_bold
+    cmp eax, 23
+    je .vtp_sgr_no_italic
     cmp eax, 24
     je .vtp_sgr_no_underline
     cmp eax, 27
@@ -9049,6 +9054,9 @@ vt_process:
 .vtp_sgr_inverse:
     or byte [cur_attrs], 4
     jmp .vtp_sgr_next
+.vtp_sgr_italic:
+    or byte [cur_attrs], 16          ; bit 4 — bit 3 is reserved for ATTR_IS_EMOJI
+    jmp .vtp_sgr_next
 .vtp_sgr_no_bold:
     and byte [cur_attrs], ~1
     jmp .vtp_sgr_next
@@ -9057,6 +9065,9 @@ vt_process:
     jmp .vtp_sgr_next
 .vtp_sgr_no_inverse:
     and byte [cur_attrs], ~4
+    jmp .vtp_sgr_next
+.vtp_sgr_no_italic:
+    and byte [cur_attrs], ~16
     jmp .vtp_sgr_next
 .vtp_sgr_default_fg:
     mov byte [cur_fg_default], 1
@@ -11503,7 +11514,8 @@ rs_row_loop:
     cmovz r15d, edx
     movzx edx, byte [rax + 4]   ; attrs (read before is_cell_selected
                                 ; clobbers rax — cell pointer dies there)
-    ; Capture this run's bold + underline bits (cell[4] bits 0/1).
+    ; Capture this run's bold + underline + italic bits (cell[4]
+    ; bits 0/1/4). Bit 2 (inverse) is consumed below.
     mov ecx, edx
     and ecx, 1
     mov [run_bold], cl
@@ -11511,6 +11523,10 @@ rs_row_loop:
     shr ecx, 1
     and ecx, 1
     mov [run_underline], cl
+    mov ecx, edx
+    shr ecx, 4
+    and ecx, 1
+    mov [run_italic], cl
     and edx, 4                  ; inverse bit
     ; XOR with selection state at (r12, r13)
     push rbx
@@ -11572,18 +11588,25 @@ rs_row_loop:
     jne .rs_run_draw
     cmp esi, r15d
     jne .rs_run_draw
-    ; Also break on bold/underline change so we can switch GC font and
-    ; draw an underline rectangle that matches just this run.
+    ; Also break on bold/underline/italic change so we can switch GC
+    ; font / glyphset / underline span to match just this run.
     movzx edx, byte [rax + 4]
     mov esi, edx
     and esi, 1                       ; this cell's bold
     movzx r11d, byte [run_bold]
     cmp esi, r11d
     jne .rs_run_draw
-    shr edx, 1
-    and edx, 1                       ; this cell's underline
+    mov esi, edx
+    shr esi, 1
+    and esi, 1                       ; this cell's underline
     movzx r11d, byte [run_underline]
-    cmp edx, r11d
+    cmp esi, r11d
+    jne .rs_run_draw
+    mov esi, edx
+    shr esi, 4
+    and esi, 1                       ; this cell's italic
+    movzx r11d, byte [run_italic]
+    cmp esi, r11d
     jne .rs_run_draw
     ; Same color, add to run as CHAR2B (big-endian: byte1=high, byte2=low)
     movzx edx, word [rax]           ; UCS-2 char (little-endian)
