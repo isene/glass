@@ -8395,9 +8395,12 @@ vt_process:
     cmp eax, 2
     je .vtp_ed_all
     cmp eax, 1
-    je .vtp_loop            ; TODO: erase above
+    je .vtp_ed_above
     ; Default: erase below
     call grid_clear_below
+    jmp .vtp_loop
+.vtp_ed_above:
+    call grid_clear_above
     jmp .vtp_loop
 .vtp_ed_all:
     call grid_clear
@@ -8409,9 +8412,12 @@ vt_process:
     cmp eax, 2
     je .vtp_el_all
     cmp eax, 1
-    je .vtp_loop            ; TODO: erase left
+    je .vtp_el_left
     ; Default: erase to right
     call grid_clear_right
+    jmp .vtp_loop
+.vtp_el_left:
+    call grid_clear_left
     jmp .vtp_loop
 .vtp_el_all:
     call grid_clear_line
@@ -9282,6 +9288,80 @@ grid_clear_right:
 .gcr_done:
     pop rax                           ; discard cell_hi
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Erase from start of line through cursor (inclusive). xterm's CSI 1 K.
+; Uses BCE (Background Color Erase) so an inverse-video bar drawn this
+; way extends with the current attributes — matches grid_clear_right.
+; Without this, weechat's left-pane channel list and CC's reflowing
+; status banner leave stale prefix bytes behind every redraw.
+grid_clear_left:
+    push rbx
+    push r12
+    push r13
+    mov r12, [cursor_row]
+    imul r12, MAX_COLS
+    movzx eax, byte [cur_fg_default]
+    shl eax, 16
+    movzx edx, byte [cur_bg_default]
+    shl edx, 24
+    or eax, edx
+    movzx edx, byte [cur_attrs]
+    shl rdx, 32
+    or rax, rdx
+    or rax, 0x20
+    mov r13, rax
+    mov eax, [cur_bg_pixel]
+    shl rax, 32
+    mov edx, [cur_fg_pixel]
+    or rax, rdx
+    push rax
+    xor rbx, rbx
+.gcl2_loop:
+    cmp rbx, [cursor_col]
+    jg .gcl2_done
+    cmp rbx, [grid_cols]
+    jge .gcl2_done
+    mov rax, r12
+    add rax, rbx
+    imul rax, CELL_SIZE
+    mov [grid + rax], r13
+    mov rdx, [rsp]
+    mov [grid + rax + 8], rdx
+    inc rbx
+    jmp .gcl2_loop
+.gcl2_done:
+    pop rax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Erase from grid origin through cursor (inclusive). xterm's CSI 1 J.
+; Symmetric counterpart to grid_clear_below; uses default cell (no BCE)
+; for parity with how grid_clear_below was built. CC, vim, less, htop
+; all use ESC[1J during scroll-region redraws — without it, content
+; above the new region stays visible underneath the new draw.
+grid_clear_above:
+    push rbx
+    push r12
+    mov rbx, [cursor_row]
+    imul rbx, MAX_COLS
+    add rbx, [cursor_col]
+    inc rbx                           ; inclusive of cursor cell
+    xor r12, r12
+.gca_loop:
+    cmp r12, rbx
+    jge .gca_done
+    mov rax, r12
+    imul rax, CELL_SIZE
+    mov qword [grid + rax], DEFAULT_CELL_LO
+    mov qword [grid + rax + 8], 0
+    inc r12
+    jmp .gca_loop
+.gca_done:
     pop r12
     pop rbx
     ret
