@@ -1100,6 +1100,28 @@ cfg_font_size:      resq 1          ; 0 = default, else pixel size
 ; ---- TTF font (glyph engine) ----
 cfg_font_path:      resb 512        ; null-terminated path to TTF file (empty = use X core font)
 cfg_font_path_set:  resq 1          ; 1 if cfg_font_path is populated
+
+; Per-style font paths. Each is null-terminated. cfg_font_path_*_set
+; flags whether the user explicitly configured that path; if 0 we
+; auto-detect siblings of cfg_font_path at startup (foo.ttf →
+; foo-Italic.ttf / foo-Oblique.ttf / foo-Bold.ttf / foo-BoldItalic.ttf).
+cfg_font_path_italic:           resb 512
+cfg_font_path_italic_set:       resq 1
+cfg_font_path_bold:             resb 512
+cfg_font_path_bold_set:         resq 1
+cfg_font_path_bold_italic:      resb 512
+cfg_font_path_bold_italic_set:  resq 1
+
+; 4-slot per-style font snapshot pool. Each slot holds one
+; glyph_save_pf_state output. Slot index = (italic ? 1 : 0) | (bold ? 2 : 0):
+;   0 = regular, 1 = italic, 2 = bold, 3 = bold-italic.
+; ttf_font_slot_loaded[idx] = 1 if that slot was successfully loaded
+; via glyph_load_font + glyph_save_pf_state at startup; 0 falls back
+; to slot 0 + the synthetic shear / alpha-dilation post-process.
+%define TTF_FONT_SLOT_SIZE 512
+ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 4
+ttf_font_slot_loaded:   resb 4
+ttf_font_active_slot:   resq 1          ; index of the currently-restored slot
 cfg_ttf_weight:     resq 1          ; variation weight (0 = font's fvar default)
 ttf_active:         resq 1          ; 1 once glyph_load_font succeeds
 dyn_font_name:      resb 128
@@ -1292,18 +1314,74 @@ _start:
     mov rax, [cfg_font_size]
     mov [original_font_size], rax
 
-    ; If font_path is configured, load the TTF via the embedded glyph
-    ; engine. On failure we silently fall back to X core fonts so a
-    ; bad path never bricks glass.
+    ; If font_path is configured, load up to four TTFs (regular,
+    ; italic, bold, bold-italic) into separate per-font snapshots
+    ; so per-cell italic/bold can render with the real designed
+    ; glyphs instead of synthetic shear / alpha-dilation. Auto-
+    ; detect Italic / Oblique / Bold / BoldItalic siblings of the
+    ; configured cfg_font_path when the explicit per-style key is
+    ; absent. Any failure of a non-regular slot is silent: that
+    ; slot stays unloaded and the render path falls back to the
+    ; synthetic post-process.
     cmp qword [cfg_font_path_set], 0
     je .ttf_skip
+    ; Auto-detect missing per-style paths from cfg_font_path siblings.
+    call ttf_autodetect_style_paths
+    ; Load regular font (slot 0) — required, no synthesis fallback.
     lea rdi, [cfg_font_path]
     call glyph_load_font
     test rax, rax
     jnz .ttf_failed
     mov rdi, [cfg_ttf_weight]
     call glyph_set_weight
+    lea rdi, [ttf_font_slot_buf]
+    call glyph_save_pf_state
+    mov byte [ttf_font_slot_loaded + 0], 1
+    mov qword [ttf_font_active_slot], 0
     mov qword [ttf_active], 1
+    ; Load italic (slot 1).
+    cmp qword [cfg_font_path_italic_set], 0
+    je .ttf_no_italic
+    lea rdi, [cfg_font_path_italic]
+    call glyph_load_font
+    test rax, rax
+    jnz .ttf_no_italic
+    mov rdi, [cfg_ttf_weight]
+    call glyph_set_weight
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE]
+    call glyph_save_pf_state
+    mov byte [ttf_font_slot_loaded + 1], 1
+.ttf_no_italic:
+    ; Load bold (slot 2).
+    cmp qword [cfg_font_path_bold_set], 0
+    je .ttf_no_bold
+    lea rdi, [cfg_font_path_bold]
+    call glyph_load_font
+    test rax, rax
+    jnz .ttf_no_bold
+    mov rdi, [cfg_ttf_weight]
+    call glyph_set_weight
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * 2]
+    call glyph_save_pf_state
+    mov byte [ttf_font_slot_loaded + 2], 1
+.ttf_no_bold:
+    ; Load bold-italic (slot 3).
+    cmp qword [cfg_font_path_bold_italic_set], 0
+    je .ttf_no_bi
+    lea rdi, [cfg_font_path_bold_italic]
+    call glyph_load_font
+    test rax, rax
+    jnz .ttf_no_bi
+    mov rdi, [cfg_ttf_weight]
+    call glyph_set_weight
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * 3]
+    call glyph_save_pf_state
+    mov byte [ttf_font_slot_loaded + 3], 1
+.ttf_no_bi:
+    ; Restore regular as the active slot for the first render.
+    lea rdi, [ttf_font_slot_buf]
+    call glyph_restore_pf_state
+    mov qword [ttf_font_active_slot], 0
     jmp .ttf_skip
 .ttf_failed:
     mov qword [ttf_active], 0
@@ -13842,14 +13920,56 @@ load_config:
     jmp .lc_skip_line
 
 .lc_handle_font_path:
-    ; "font_path = /full/path/to/font.ttf"
+    ; "font_path = /full/path/to/font.ttf"          → cfg_font_path
+    ; "font_path_italic = ..."                      → cfg_font_path_italic
+    ; "font_path_bold = ..."                        → cfg_font_path_bold
+    ; "font_path_bold_italic = ..."                 → cfg_font_path_bold_italic
     cmp dword [rsi+4], '_pat'
     jne .lc_try_blink
     cmp byte [rsi+8], 'h'
     jne .lc_try_blink
+    ; Byte 9 distinguishes between bare "font_path" (next byte is = / WS)
+    ; and the longer per-style keys (next byte is '_').
+    movzx eax, byte [rsi+9]
+    cmp al, '_'
+    jne .lc_fp_regular
+    ; Per-style: dispatch on what follows "_".
+    cmp dword [rsi+10], 'ital'
+    je .lc_fp_italic_check
+    cmp dword [rsi+10], 'bold'
+    je .lc_fp_bold_or_bi
+    jmp .lc_skip_line
+.lc_fp_italic_check:
+    cmp word [rsi+14], 'ic'
+    jne .lc_skip_line
+    add rsi, 16
+    lea rdi, [cfg_font_path_italic]
+    lea r8, [cfg_font_path_italic_set]
+    jmp .lc_fp_copy_value
+.lc_fp_bold_or_bi:
+    ; "bold" + either '\0/WS/=' or "_italic"
+    movzx eax, byte [rsi+14]
+    cmp al, '_'
+    je .lc_fp_bi_check
+    add rsi, 14
+    lea rdi, [cfg_font_path_bold]
+    lea r8, [cfg_font_path_bold_set]
+    jmp .lc_fp_copy_value
+.lc_fp_bi_check:
+    cmp dword [rsi+15], 'ital'
+    jne .lc_skip_line
+    cmp word [rsi+19], 'ic'
+    jne .lc_skip_line
+    add rsi, 21
+    lea rdi, [cfg_font_path_bold_italic]
+    lea r8, [cfg_font_path_bold_italic_set]
+    jmp .lc_fp_copy_value
+.lc_fp_regular:
     add rsi, 9
-    call lc_skip_to_value
     lea rdi, [cfg_font_path]
+    lea r8, [cfg_font_path_set]
+.lc_fp_copy_value:
+    call lc_skip_to_value
     xor rcx, rcx
 .lc_fp_copy:
     movzx eax, byte [rsi]
@@ -13869,7 +13989,7 @@ load_config:
     mov byte [rdi + rcx], 0
     test rcx, rcx
     jz .lc_skip_line
-    mov qword [cfg_font_path_set], 1
+    mov qword [r8], 1
     jmp .lc_skip_line
 
 .lc_handle_font_weight:
@@ -17413,6 +17533,218 @@ src_glyph_w:            resq 1          ; unclipped W from glyph engine,
 section .text
 
 ; ---------------------------------------------------------------------
+; ttf_autodetect_style_paths — fill cfg_font_path_italic/bold/bold_italic
+; from siblings of cfg_font_path when the user hasn't explicitly set
+; them in .glassrc. Tries common naming conventions:
+;   foo.ttf → foo-Italic.ttf, foo-Oblique.ttf,
+;             foo-Bold.ttf, foo-BoldItalic.ttf, foo-BoldOblique.ttf
+; Stops at the first existing file per slot. Best-effort — silent
+; when nothing matches (slot stays unloaded → synthetic fallback).
+ttf_autodetect_style_paths:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    cmp qword [cfg_font_path_set], 0
+    je .tasp_ret
+
+    ; Find the last '.' in cfg_font_path (extension separator) so we
+    ; can splice "-Italic" before it. r12 = byte index of the '.', or
+    ; total length if none.
+    lea rsi, [cfg_font_path]
+    xor r12, r12
+    xor rcx, rcx
+.tasp_scan:
+    movzx eax, byte [rsi + rcx]
+    test al, al
+    jz .tasp_scan_done
+    cmp al, '.'
+    jne .tasp_scan_inc
+    mov r12, rcx
+.tasp_scan_inc:
+    inc rcx
+    jmp .tasp_scan
+.tasp_scan_done:
+    test r12, r12
+    jnz .tasp_have_dot
+    mov r12, rcx                     ; no '.', append at end
+.tasp_have_dot:
+    mov r13, rcx                     ; r13 = total length
+
+    ; Italic slot: try -Italic, then -Oblique.
+    cmp qword [cfg_font_path_italic_set], 0
+    jne .tasp_skip_italic
+    lea rdi, [cfg_font_path_italic]
+    lea rsi, [.tasp_italic_suffix]
+    call .tasp_try_suffix
+    test rax, rax
+    jz .tasp_italic_set
+    lea rdi, [cfg_font_path_italic]
+    lea rsi, [.tasp_oblique_suffix]
+    call .tasp_try_suffix
+    test rax, rax
+    jnz .tasp_skip_italic
+.tasp_italic_set:
+    mov qword [cfg_font_path_italic_set], 1
+.tasp_skip_italic:
+
+    ; Bold slot: try -Bold.
+    cmp qword [cfg_font_path_bold_set], 0
+    jne .tasp_skip_bold
+    lea rdi, [cfg_font_path_bold]
+    lea rsi, [.tasp_bold_suffix]
+    call .tasp_try_suffix
+    test rax, rax
+    jnz .tasp_skip_bold
+    mov qword [cfg_font_path_bold_set], 1
+.tasp_skip_bold:
+
+    ; Bold-italic slot: try -BoldItalic, then -BoldOblique.
+    cmp qword [cfg_font_path_bold_italic_set], 0
+    jne .tasp_skip_bi
+    lea rdi, [cfg_font_path_bold_italic]
+    lea rsi, [.tasp_boldit_suffix]
+    call .tasp_try_suffix
+    test rax, rax
+    jz .tasp_bi_set
+    lea rdi, [cfg_font_path_bold_italic]
+    lea rsi, [.tasp_boldob_suffix]
+    call .tasp_try_suffix
+    test rax, rax
+    jnz .tasp_skip_bi
+.tasp_bi_set:
+    mov qword [cfg_font_path_bold_italic_set], 1
+.tasp_skip_bi:
+
+.tasp_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .tasp_try_suffix: rdi = destination buffer (will be filled with the
+;                   constructed candidate path), rsi = suffix string
+;                   (null-terminated, e.g. "-Italic"). Splices the
+;                   suffix before the '.' in cfg_font_path. Stat()s the
+;                   result; returns rax = 0 if file exists, else nonzero
+;                   (and dst is left as a discardable scratch pad).
+;                   Uses r12 (dot-pos) and r13 (total len) from caller.
+.tasp_try_suffix:
+    push rbx
+    push rcx
+    push r14
+    push r15
+    mov r14, rdi                     ; destination
+    mov r15, rsi                     ; suffix
+    ; Copy cfg_font_path[0..r12) to dst[0..r12).
+    xor rcx, rcx
+.tasp_pre:
+    cmp rcx, r12
+    jge .tasp_pre_done
+    mov al, [cfg_font_path + rcx]
+    mov [r14 + rcx], al
+    inc rcx
+    jmp .tasp_pre
+.tasp_pre_done:
+    ; Append suffix.
+    xor rbx, rbx
+.tasp_suf:
+    movzx eax, byte [r15 + rbx]
+    test al, al
+    jz .tasp_suf_done
+    mov [r14 + rcx], al
+    inc rcx
+    inc rbx
+    jmp .tasp_suf
+.tasp_suf_done:
+    ; Append the original extension cfg_font_path[r12..r13).
+    mov rbx, r12
+.tasp_post:
+    cmp rbx, r13
+    jge .tasp_post_done
+    mov al, [cfg_font_path + rbx]
+    mov [r14 + rcx], al
+    inc rbx
+    inc rcx
+    jmp .tasp_post
+.tasp_post_done:
+    mov byte [r14 + rcx], 0
+    ; stat(dst, &stat_buf) — present-and-readable if rax == 0.
+    mov rax, 4                       ; SYS_STAT
+    mov rdi, r14
+    lea rsi, [tmp_buf]
+    syscall
+    pop r15
+    pop r14
+    pop rcx
+    pop rbx
+    ret
+
+.tasp_italic_suffix:    db "-Italic", 0
+.tasp_oblique_suffix:   db "-Oblique", 0
+.tasp_bold_suffix:      db "-Bold", 0
+.tasp_boldit_suffix:    db "-BoldItalic", 0
+.tasp_boldob_suffix:    db "-BoldOblique", 0
+
+; ---------------------------------------------------------------------
+; ttf_select_font_slot — restore the per-font snapshot that matches
+; the requested style, OR (when that slot wasn't loaded at startup)
+; restore slot 0 and arm the synthetic post-process flags so the
+; render still produces an italic / bold-looking glyph.
+;   in : edi bit 0 = italic, edi bit 1 = bold
+ttf_select_font_slot:
+    mov eax, edi
+    and eax, 3                            ; slot index 0..3
+    cmp eax, [ttf_font_active_slot]
+    je .tsfs_set_post                     ; already on this slot
+    movzx ecx, byte [ttf_font_slot_loaded + rax]
+    test ecx, ecx
+    jz .tsfs_use_regular
+    push rdi
+    mov rdi, rax
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
+    call glyph_restore_pf_state
+    pop rdi
+    mov [ttf_font_active_slot], rax
+.tsfs_set_post:
+    ; Real font loaded for this style: turn synthetic post-process OFF.
+    push rdi
+    xor edi, edi
+    call glyph_set_oblique
+    xor edi, edi
+    call glyph_set_synthetic_bold
+    pop rdi
+    ret
+.tsfs_use_regular:
+    ; Slot wasn't loaded — fall back to slot 0 + synthetic post-process
+    ; mirroring the requested style bits.
+    cmp qword [ttf_font_active_slot], 0
+    je .tsfs_synth
+    push rdi
+    lea rdi, [ttf_font_slot_buf]
+    call glyph_restore_pf_state
+    pop rdi
+    mov qword [ttf_font_active_slot], 0
+.tsfs_synth:
+    push rdi
+    mov eax, edi
+    and eax, 1                            ; italic bit → oblique mode
+    movzx edi, al
+    call glyph_set_oblique
+    pop rdi
+    push rdi
+    mov eax, edi
+    shr eax, 1
+    and eax, 1                            ; bold bit → synthetic-bold
+    movzx edi, al
+    call glyph_set_synthetic_bold
+    pop rdi
+    ret
+
+; ---------------------------------------------------------------------
 ttf_xrender_init:
     cmp dword [render_format_a8], 0
     je .skip
@@ -17694,27 +18026,31 @@ ttf_upload_glyph:
     ; below still work without per-site rewrites.
     mov [ttf_upload_styled_gid], rdi
 
-    ; Configure post-process flags from gid's high bits BEFORE the
-    ; cp-extract — the engine reads these during glyph_render_to_alpha.
-    push rdi
-    mov rax, rdi
-    shr rax, TTF_GID_ITALIC_BIT
-    and rax, 1
-    mov rdi, rax
-    call glyph_set_oblique
-    pop rdi
-    push rdi
-    mov rax, rdi
-    shr rax, TTF_GID_BOLD_BIT
-    and rax, 1
-    mov rdi, rax
-    call glyph_set_synthetic_bold
-    pop rdi
-
     cmp rdi, TTF_GID_TABLE_SIZE
     jge .ret
     cmp byte [ttf_glyph_uploaded + rdi], 0
     jne .ret
+
+    ; Select the font slot matching this style. If the user has a
+    ; real Italic / Bold / BoldItalic TTF loaded for this slot,
+    ; ttf_select_font_slot restores its per-font snapshot and turns
+    ; OFF the synthetic shear / dilation. If the slot wasn't loaded
+    ; at startup, it stays on slot 0 and turns ON the synthetic
+    ; post-process matching the requested style. Either way, the
+    ; subsequent glyph_render_to_alpha produces the right look.
+    push rdi
+    mov rax, rdi
+    shr rax, TTF_GID_ITALIC_BIT
+    and rax, 1                          ; italic → bit 0
+    mov rdx, rdi
+    shr rdx, TTF_GID_BOLD_BIT
+    and rdx, 1
+    shl rdx, 1                          ; bold → bit 1
+    or eax, edx
+    mov edi, eax
+    call ttf_select_font_slot
+    pop rdi
+
     and rdi, 0xFFFF                    ; rdi = codepoint only
     mov rbx, rdi                       ; remember cp
 
