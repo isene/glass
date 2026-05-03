@@ -683,7 +683,7 @@ place_table:        resb PLACE_SLOTS * PLACE_SLOT_SIZE
 place_count:        resq 1
 img_decode_buf:     resq 1          ; mmap'd RGBA scratch (decoded PNG)
 img_decode_len:     resq 1          ; allocated bytes
-png_argv:           resq 8          ; argv[] for the convert child
+png_argv:           resq 16         ; argv[] for the convert child
 ; Pipe fds for the convert pipeline. Kept in BSS rather than scratch
 ; registers because syscall clobbers r11 every call, and there aren't
 ; enough callee-saved regs to spare without juggling.
@@ -17224,6 +17224,14 @@ font_change_step:
     ; Alt+plus. Zeroing back_size_w trips ensure_back_buffer's mismatch
     ; check, freeing + reallocating a clean pixmap.
     mov qword [back_size_w], 0
+    ; The freshly-allocated pixmap is blank, but render_screen's row-
+    ; dirty pre-pass compares grid vs prev_paint_grid cell-by-cell;
+    ; the grid bytes haven't changed (only the metrics did), so every
+    ; row would be marked clean and skipped — leaving the entire
+    ; window blank until the user typed a key (which dirtied a cell
+    ; and triggered partial repaint). all_dirty=1 bypasses the
+    ; pre-pass so every cell repaints onto the new back-pixmap.
+    mov qword [all_dirty], 1
 
     ; Tell the GC about the new font and refresh tracking.
     lea rdi, [tmp_buf]
@@ -17812,22 +17820,48 @@ png_decode_to_emoji_buf:
     inc ebx
     mov byte [emoji_size_arg + rbx], 0
 
-    ; argv: convert png:- -resize WxH! -depth 8 rgba:-
+    ; argv: convert png:- -background none -alpha set
+    ;       -resize WxH! -depth 8 rgba:-
+    ;
+    ; -background none + -alpha set are critical for emoji resize: the
+    ; embedded PNGs in CBDT have non-zero RGB values in fully-transparent
+    ; pixels (artist tooling stores the under-color even where alpha=0).
+    ; Without -background none, ImageMagick's downsample blends those
+    ; phantom RGBs into the partially-transparent EDGE pixels, producing
+    ; a visible 1-2 pixel halo around every emoji (the "ugly edge"
+    ; reported on the moon glyph). With -background none, the resize
+    ; resampler treats transparent pixels as having zero contribution.
+    ; XRender's OP_OVER assumes the source has alpha-PREMULTIPLIED
+    ; colour channels. Noto Color Emoji's PNGs ship with non-zero
+    ; RGB even in fully-transparent pixels (artist tooling keeps the
+    ; under-color where alpha=0); piping straight in renders an
+    ; opaque gray square surrounding every emoji. Convert outputs
+    ; non-premultiplied; the post-read pass below multiplies RGB by
+    ; A/255 in the asm. (IM7's `-alpha premultiply` is rejected as
+    ; "UnrecognizedAlphaChannelOption" on this system version.)
     lea rax, [convert_path]
     mov [png_argv + 0*8], rax
     lea rax, [convert_arg_png_in]
     mov [png_argv + 1*8], rax
-    lea rax, [.pde_resize_arg]
+    lea rax, [.pde_bg_arg]
     mov [png_argv + 2*8], rax
-    lea rax, [emoji_size_arg]
+    lea rax, [.pde_bg_none_arg]
     mov [png_argv + 3*8], rax
-    lea rax, [convert_arg_depth]
+    lea rax, [.pde_filter_arg]
     mov [png_argv + 4*8], rax
-    lea rax, [convert_arg_8]
+    lea rax, [.pde_filter_lanczos_arg]
     mov [png_argv + 5*8], rax
-    lea rax, [convert_arg_rgba_lower]
+    lea rax, [.pde_resize_arg]
     mov [png_argv + 6*8], rax
-    mov qword [png_argv + 7*8], 0
+    lea rax, [emoji_size_arg]
+    mov [png_argv + 7*8], rax
+    lea rax, [convert_arg_depth]
+    mov [png_argv + 8*8], rax
+    lea rax, [convert_arg_8]
+    mov [png_argv + 9*8], rax
+    lea rax, [convert_arg_rgba_lower]
+    mov [png_argv + 10*8], rax
+    mov qword [png_argv + 11*8], 0
 
     ; Two pipes (parent → child PNG, child → parent RGBA).
     sub rsp, 16
@@ -17953,6 +17987,42 @@ png_decode_to_emoji_buf:
     add rsp, 8
     test rbx, rbx
     jz .pde_fail_norestore
+
+    ; Premultiply alpha: walk emoji_raster_buf 4 bytes at a time,
+    ; replace (R, G, B, A) with (R*A/256, G*A/256, B*A/256, A). The
+    ; /256 (shr 8) is one off from /255 at the very brightest values
+    ; — invisible for emoji compositing.
+    push rbx
+    xor rcx, rcx
+.pde_premul:
+    cmp rcx, rbx
+    jge .pde_premul_done
+    movzx eax, byte [emoji_raster_buf + rcx + 3]   ; alpha
+    cmp al, 0xFF
+    je .pde_premul_skip                            ; opaque: no-op
+    test al, al
+    jz .pde_premul_zero                            ; transparent: zero RGB
+    movzx edx, byte [emoji_raster_buf + rcx + 0]
+    imul edx, eax
+    shr edx, 8
+    mov [emoji_raster_buf + rcx + 0], dl
+    movzx edx, byte [emoji_raster_buf + rcx + 1]
+    imul edx, eax
+    shr edx, 8
+    mov [emoji_raster_buf + rcx + 1], dl
+    movzx edx, byte [emoji_raster_buf + rcx + 2]
+    imul edx, eax
+    shr edx, 8
+    mov [emoji_raster_buf + rcx + 2], dl
+    jmp .pde_premul_skip
+.pde_premul_zero:
+    mov dword [emoji_raster_buf + rcx], 0
+.pde_premul_skip:
+    add rcx, 4
+    jmp .pde_premul
+.pde_premul_done:
+    pop rbx
+
     mov rax, rbx
     jmp .pde_ret
 
@@ -17977,7 +18047,14 @@ png_decode_to_emoji_buf:
     pop rbx
     ret
 
-.pde_resize_arg: db "-resize", 0
+.pde_resize_arg:    db "-resize", 0
+.pde_bg_arg:        db "-background", 0
+.pde_bg_none_arg:   db "none", 0
+.pde_alpha_arg:     db "-alpha", 0
+.pde_alpha_set_arg: db "set", 0
+.pde_alpha_premul_arg: db "premultiply", 0
+.pde_filter_arg:    db "-filter", 0
+.pde_filter_lanczos_arg: db "Lanczos", 0
 
 ; ---------------------------------------------------------------------
 ; ttf_render_smp_to_raster — render an SMP codepoint via the embedded
