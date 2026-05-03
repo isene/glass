@@ -1111,16 +1111,23 @@ cfg_font_path_bold:             resb 512
 cfg_font_path_bold_set:         resq 1
 cfg_font_path_bold_italic:      resb 512
 cfg_font_path_bold_italic_set:  resq 1
+cfg_font_path_emoji:            resb 512
+cfg_font_path_emoji_set:        resq 1
 
-; 4-slot per-style font snapshot pool. Each slot holds one
-; glyph_save_pf_state output. Slot index = (italic ? 1 : 0) | (bold ? 2 : 0):
-;   0 = regular, 1 = italic, 2 = bold, 3 = bold-italic.
+; 5-slot per-style font snapshot pool. Slots 0-3 are the outline
+; styles; slot 4 is the color-bitmap emoji font (Noto Color Emoji)
+; used by the CBDT path. Outline slot index = (italic ? 1 : 0) |
+; (bold ? 2 : 0):
+;   0 = regular, 1 = italic, 2 = bold, 3 = bold-italic, 4 = emoji.
 ; ttf_font_slot_loaded[idx] = 1 if that slot was successfully loaded
-; via glyph_load_font + glyph_save_pf_state at startup; 0 falls back
-; to slot 0 + the synthetic shear / alpha-dilation post-process.
-%define TTF_FONT_SLOT_SIZE 512
-ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 4
-ttf_font_slot_loaded:   resb 4
+; via glyph_load_font + glyph_save_pf_state at startup; 0 falls back.
+; Slot size must be ≥ glyph's GLYPH_PF_STATE_SIZE (currently 520 bytes
+; after phase 3's CBDT additions). 768 leaves headroom for future
+; per-font state without another bump.
+%define TTF_FONT_SLOT_SIZE 768
+%define TTF_FONT_SLOT_EMOJI 4
+ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 5
+ttf_font_slot_loaded:   resb 5
 ttf_font_active_slot:   resq 1          ; index of the currently-restored slot
 cfg_ttf_weight:     resq 1          ; variation weight (0 = font's fvar default)
 ttf_active:         resq 1          ; 1 once glyph_load_font succeeds
@@ -1378,6 +1385,23 @@ _start:
     call glyph_save_pf_state
     mov byte [ttf_font_slot_loaded + 3], 1
 .ttf_no_bi:
+    ; Load color-emoji font (slot 4). Auto-detects NotoColorEmoji.ttf
+    ; at the standard Linux paths if the user hasn't set
+    ; font_path_emoji explicitly.
+    cmp qword [cfg_font_path_emoji_set], 0
+    jne .ttf_emoji_have_path
+    call ttf_autodetect_emoji_path
+.ttf_emoji_have_path:
+    cmp qword [cfg_font_path_emoji_set], 0
+    je .ttf_no_emoji
+    lea rdi, [cfg_font_path_emoji]
+    call glyph_load_font
+    test rax, rax
+    jnz .ttf_no_emoji
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * TTF_FONT_SLOT_EMOJI]
+    call glyph_save_pf_state
+    mov byte [ttf_font_slot_loaded + TTF_FONT_SLOT_EMOJI], 1
+.ttf_no_emoji:
     ; Restore regular as the active slot for the first render.
     lea rdi, [ttf_font_slot_buf]
     call glyph_restore_pf_state
@@ -3761,14 +3785,24 @@ render_emoji_glyph:
     je .reg_have_raster
 
 .reg_no_cache:
-    ; Try TTF rendering first. cmap fmt 12 (glyph v0.4.7) lets us
-    ; resolve SMP codepoints — math symbols, CJK extensions B-G,
-    ; some monochrome dingbats — that DejaVu Sans Mono / similar
-    ; fonts ship outline glyphs for. Falls through to convert when
-    ; the active font doesn't cover this cp (Color emoji codepoints,
-    ; uncommon SMP ranges). Phase 3 will preempt this with CBDT.
+    ; (1) Try CBDT-based color emoji first. Noto Color Emoji ships
+    ; PNG bitmaps embedded in CBDT for every standard emoji codepoint.
+    ; Pulls the PNG out of the font, pipes through `convert -resize`
+    ; to land at our cell pixmap size — single PNG decode + resize,
+    ; no Pango / fontconfig.
     cmp qword [ttf_active], 0
     je .reg_no_cache_convert
+    cmp byte [ttf_font_slot_loaded + TTF_FONT_SLOT_EMOJI], 0
+    je .reg_no_cbdt
+    call cbdt_render_emoji_to_raster
+    test rax, rax
+    jns .reg_have_raster                 ; success
+.reg_no_cbdt:
+    ; (2) Try outline TTF rendering. cmap fmt 12 lets us resolve SMP
+    ; codepoints — math symbols, CJK extensions B-G, monochrome
+    ; dingbats — that DejaVu Sans Mono / similar fonts ship outlines
+    ; for. Falls through to convert when the active font doesn't
+    ; cover the cp.
     push r12
     push r13
     push r14
@@ -9277,41 +9311,15 @@ grid_put_char:
     mov ecx, [cur_bg_pixel]
     mov [grid + rbx + 12], ecx       ; [12-15] bg pixel
 
-    ; Emoji codepoints are East Asian Wide (EAW=W) per Unicode UAX-11:
-    ; CC, vim, less, weechat all assume an emoji consumes TWO terminal
-    ; cells when computing line-wrap columns and tab/column alignment.
-    ; Glass used to advance the cursor by 1, so every emoji on a long
-    ; line nudged subsequent text one column to the LEFT of where the
-    ; sender expected it; in CC's table renders the desync compounds
-    ; across multiple wrap rows and shows up as content collapsing
-    ; onto the same x-positions as the row above. Fix: when this cell
-    ; carries ATTR_IS_EMOJI, write a wide-continuation marker into the
-    ; next cell (cp=0, attrs unchanged) so it renders as background
-    ; only, then advance cursor by 2 instead of 1.
-    test byte [cur_attrs], 8
-    jz .gpc_no_wide_pad
-    mov rax, [cursor_col]
-    inc rax
-    cmp rax, [grid_cols]
-    jge .gpc_no_wide_pad              ; emoji on last col: leave as 1-cell
-    mov rdx, [cursor_row]
-    imul rdx, MAX_COLS
-    add rdx, rax
-    imul rdx, CELL_SIZE
-    mov word [grid + rdx], 0          ; cp = 0 (renders as space)
-    movzx ecx, byte [cur_fg_default]
-    mov [grid + rdx + 2], cl
-    movzx ecx, byte [cur_bg_default]
-    mov [grid + rdx + 3], cl
-    mov byte [grid + rdx + 4], 0      ; clear ATTR_IS_EMOJI on the pad cell
-    mov byte [grid + rdx + 5], 0
-    mov word [grid + rdx + 6], 0
-    mov ecx, [cur_fg_pixel]
-    mov [grid + rdx + 8], ecx
-    mov ecx, [cur_bg_pixel]
-    mov [grid + rdx + 12], ecx
-    inc qword [cursor_col]            ; first of the two-step advance
-.gpc_no_wide_pad:
+    ; (v0.3.25's emoji EAW=W pad-cell write reverted in v0.3.30 — it
+    ; created more bugs than it solved: cursor stepped into the middle
+    ; of every emoji, selection_extract emitted spurious spaces from
+    ; the pad cells, scroll-pause work needed extra dance to dodge it,
+    ; and the wrap-mangling symptom it was meant to fix was never
+    ; reproducible. Emoji bitmaps render 2 cells wide visually but the
+    ; cursor advances 1 cell per emoji — same as kitty-graphics-style
+    ; visual overflow. The emoji-overlay pass runs LAST so the bitmap
+    ; covers any text in the right-half cell.)
 
     ; Advance cursor
     mov rax, [cursor_col]
@@ -10143,13 +10151,25 @@ selection_extract:
     cmp r15, 16380
     jge .se_done                ; buffer limit
 
-    ; Get cell character (16-bit BMP codepoint at byte 0-1).
-    ; Encode back to UTF-8 in sel_buf so non-ASCII glyphs (bullets,
-    ; arrows, accented letters, etc.) round-trip correctly through
-    ; PRIMARY/CLIPBOARD instead of being replaced with literal '?'.
-    mov rax, r13
-    imul rax, CELL_SIZE
-    movzx eax, word [rbx + rax]
+    ; Get cell character. The cell stores a 16-bit cp at offset 0-1.
+    ; Emoji cells (cp > 0xFFFF after UTF-8 decode) store 0x20 (space)
+    ; with ATTR_IS_EMOJI bit set in attrs[4] and the emoji-cache
+    ; index in [6-7] — the actual codepoint lives in
+    ; emoji_codepoints[idx]. Without the special case, every
+    ; selection over emoji content turned them all into spaces in
+    ; PRIMARY/CLIPBOARD (the user's "🎨 🚀 ❤️" came back "      ").
+    mov rdx, r13
+    imul rdx, CELL_SIZE                    ; rdx = cell byte offset (preserved)
+    test byte [rbx + rdx + 4], 8           ; ATTR_IS_EMOJI
+    jz .se_no_emoji_cell
+    movzx ecx, word [rbx + rdx + 6]        ; emoji index
+    cmp ecx, MAX_EMOJI
+    jae .se_no_emoji_cell                  ; defensive
+    mov eax, [emoji_codepoints + rcx*4]
+    test eax, eax
+    jnz .se_have_cp
+.se_no_emoji_cell:
+    movzx eax, word [rbx + rdx]
     test eax, eax
     jnz .se_have_cp
     mov al, ' '                            ; unwritten cell → space
@@ -10158,12 +10178,42 @@ selection_extract:
     jbe .se_emit_1byte
     cmp eax, 0x7FF
     jbe .se_emit_2byte
+    cmp eax, 0xFFFF
+    ja  .se_emit_4byte
     ; 3-byte UTF-8: 1110xxxx 10xxxxxx 10xxxxxx
     cmp r15, 16378
     jge .se_done
     mov edx, eax
     shr edx, 12
     or  dl, 0xE0
+    mov [sel_buf + r15], dl
+    inc r15
+    mov edx, eax
+    shr edx, 6
+    and dl, 0x3F
+    or  dl, 0x80
+    mov [sel_buf + r15], dl
+    inc r15
+    mov edx, eax
+    and dl, 0x3F
+    or  dl, 0x80
+    mov [sel_buf + r15], dl
+    inc r15
+    inc r13
+    jmp .se_col_loop
+.se_emit_4byte:
+    ; 4-byte UTF-8: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+    cmp r15, 16377
+    jge .se_done
+    mov edx, eax
+    shr edx, 18
+    or  dl, 0xF0
+    mov [sel_buf + r15], dl
+    inc r15
+    mov edx, eax
+    shr edx, 12
+    and dl, 0x3F
+    or  dl, 0x80
     mov [sel_buf + r15], dl
     inc r15
     mov edx, eax
@@ -12658,6 +12708,15 @@ rs_row_loop:
     ; Emoji pass: composite each ATTR_IS_EMOJI cell's cached Picture
     ; onto the window via XRender. Lazy: any not-yet-rendered emoji
     ; gets forked-and-rasterized here on first sight.
+    ;
+    ; Skip when scrolled into history. The grid still holds the live
+    ; cells, but the displayed content is scrollback (which doesn't
+    ; carry emoji indices); painting the live emojis at their grid
+    ; (row, col) puts them on top of the wrong content. The user
+    ; reported live emojis "moving along with the scrolling and
+    ; clobbering the text" — that's this pass running unconditionally.
+    cmp qword [scroll_offset], 0
+    jne .rs_emoji_done
     cmp dword [render_major], 0
     je .rs_emoji_done
     xor r12, r12
@@ -13960,6 +14019,8 @@ load_config:
     je .lc_fp_italic_check
     cmp dword [rsi+10], 'bold'
     je .lc_fp_bold_or_bi
+    cmp dword [rsi+10], 'emoj'
+    je .lc_fp_emoji_check
     jmp .lc_skip_line
 .lc_fp_italic_check:
     cmp word [rsi+14], 'ic'
@@ -13967,6 +14028,13 @@ load_config:
     add rsi, 16
     lea rdi, [cfg_font_path_italic]
     lea r8, [cfg_font_path_italic_set]
+    jmp .lc_fp_copy_value
+.lc_fp_emoji_check:
+    cmp word [rsi+14], 'ji'
+    jne .lc_skip_line
+    add rsi, 16
+    lea rdi, [cfg_font_path_emoji]
+    lea r8, [cfg_font_path_emoji_set]
     jmp .lc_fp_copy_value
 .lc_fp_bold_or_bi:
     ; "bold" + either '\0/WS/=' or "_italic"
@@ -17553,6 +17621,363 @@ src_glyph_w:            resq 1          ; unclipped W from glyph engine,
                                         ; during ttf_upload_glyph copy
 
 section .text
+
+; ---------------------------------------------------------------------
+; ttf_autodetect_emoji_path — set cfg_font_path_emoji to the first
+; existing standard NotoColorEmoji.ttf path. No-op when none of the
+; candidates exist (the emoji slot stays unloaded; render_emoji_glyph
+; falls through to convert).
+ttf_autodetect_emoji_path:
+    lea rdi, [.taep_paths]
+.taep_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .taep_done                   ; sentinel — list exhausted
+    ; Stat the candidate path.
+    push rdi
+    mov rax, 4                      ; SYS_STAT
+    lea rsi, [tmp_buf]
+    syscall
+    pop rdi
+    test rax, rax
+    jnz .taep_next
+    ; Hit — copy this path into cfg_font_path_emoji.
+    push rdi
+    lea rdi, [cfg_font_path_emoji]
+    pop rsi
+    xor rcx, rcx
+.taep_copy:
+    movzx eax, byte [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .taep_copy_done
+    inc rcx
+    cmp rcx, 510
+    jl .taep_copy
+.taep_copy_done:
+    mov byte [rdi + rcx], 0
+    mov qword [cfg_font_path_emoji_set], 1
+    ret
+.taep_next:
+    ; Advance rdi past the current null-terminated string.
+.taep_skip:
+    movzx eax, byte [rdi]
+    inc rdi
+    test al, al
+    jnz .taep_skip
+    jmp .taep_loop
+.taep_done:
+    ret
+.taep_paths:
+    db "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 0
+    db "/usr/share/fonts/noto/NotoColorEmoji.ttf", 0
+    db "/usr/share/fonts/google-noto-color-emoji-fonts/NotoColorEmoji.ttf", 0
+    db 0                             ; list terminator
+
+; ---------------------------------------------------------------------
+; cbdt_render_emoji_to_raster — pull the PNG for this codepoint out of
+; the loaded color-emoji TTF (Noto Color Emoji), pipe it through
+; convert(1) to RGBA at the cell-pixmap size, and leave the result in
+; emoji_raster_buf for the existing PutImage path. Saves the existing
+; render_emoji_glyph from the Pango+fontconfig+font-cache fork dance —
+; just a single PNG decode + resize.
+;
+; Inputs:  r12 = emoji index, r13 = pixmap width, r14 = pixmap height
+; Returns: rax = 0 on success, -1 on failure.
+cbdt_render_emoji_to_raster:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Need the emoji slot loaded; otherwise fail fast.
+    cmp byte [ttf_font_slot_loaded + TTF_FONT_SLOT_EMOJI], 0
+    je .crer_fail
+
+    ; Save the currently-active slot so we can restore it after the
+    ; lookup. (The CBDT lookup re-reads cmap from the emoji font, so
+    ; we must NOT leave the emoji slot active for subsequent outline
+    ; renders.)
+    mov rbx, [ttf_font_active_slot]
+
+    ; Switch to the emoji slot.
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * TTF_FONT_SLOT_EMOJI]
+    call glyph_restore_pf_state
+    mov qword [ttf_font_active_slot], TTF_FONT_SLOT_EMOJI
+
+    ; Look up the cp.
+    mov edi, [emoji_codepoints + r12*4]
+    call glyph_color_bitmap_for_cp
+    test rax, rax
+    jz .crer_restore_fail
+    mov r15, rax                          ; r15 = PNG ptr
+    mov rbp, rcx                          ; rbp = PNG length
+
+    ; Restore the previous slot BEFORE the convert pipe (which can be
+    ; slow and might race with another emoji upload).
+    push rbp
+    push r15
+    cmp rbx, TTF_FONT_SLOT_EMOJI
+    je .crer_no_slot_restore               ; was already on emoji
+    cmp rbx, 5
+    jae .crer_no_slot_restore               ; defensive
+    movzx eax, byte [ttf_font_slot_loaded + rbx]
+    test eax, eax
+    jz .crer_no_slot_restore
+    mov rdi, rbx
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
+    call glyph_restore_pf_state
+    mov [ttf_font_active_slot], rbx
+.crer_no_slot_restore:
+    pop r15
+    pop rbp
+
+    ; Decode the PNG via convert with -resize WxH! to land at our cell
+    ; pixmap dimensions exactly. Reuses png_decode_to_rgba_resized
+    ; which writes RGBA bytes into emoji_raster_buf and returns total
+    ; bytes received.
+    mov rdi, r15                          ; PNG ptr
+    mov rsi, rbp                          ; PNG length
+    mov edx, r13d                         ; target W
+    mov ecx, r14d                         ; target H
+    call png_decode_to_emoji_buf
+    test rax, rax
+    js .crer_fail
+
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.crer_restore_fail:
+    ; Restore the previous slot before bailing.
+    cmp rbx, TTF_FONT_SLOT_EMOJI
+    je .crer_fail_after_restore
+    cmp rbx, 5
+    jae .crer_fail_after_restore
+    movzx eax, byte [ttf_font_slot_loaded + rbx]
+    test eax, eax
+    jz .crer_fail_after_restore
+    mov rdi, rbx
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
+    call glyph_restore_pf_state
+    mov [ttf_font_active_slot], rbx
+.crer_fail_after_restore:
+    jmp .crer_fail
+.crer_fail:
+    mov rax, -1
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---------------------------------------------------------------------
+; png_decode_to_emoji_buf — fork convert with `png:- -resize WxH! -depth 8 rgba:-`,
+; pipe the PNG bytes in, read RGBA bytes into emoji_raster_buf.
+;   in : rdi = PNG ptr, rsi = PNG length,
+;        edx = target W, ecx = target H
+;   out: rax = total RGBA bytes received (= W*H*4) on success, -1 on fail
+png_decode_to_emoji_buf:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r12, rdi                          ; PNG ptr
+    mov r13, rsi                          ; PNG length
+    mov r14d, edx                         ; W
+    mov r15d, ecx                         ; H
+
+    ; Build "WxH!\0" into emoji_size_arg
+    mov edi, r14d
+    lea rsi, [emoji_size_arg]
+    call itoa_decimal
+    mov ebx, eax
+    mov byte [emoji_size_arg + rbx], 'x'
+    inc ebx
+    mov edi, r15d
+    lea rsi, [emoji_size_arg + rbx]
+    call itoa_decimal
+    add ebx, eax
+    mov byte [emoji_size_arg + rbx], '!'
+    inc ebx
+    mov byte [emoji_size_arg + rbx], 0
+
+    ; argv: convert png:- -resize WxH! -depth 8 rgba:-
+    lea rax, [convert_path]
+    mov [png_argv + 0*8], rax
+    lea rax, [convert_arg_png_in]
+    mov [png_argv + 1*8], rax
+    lea rax, [.pde_resize_arg]
+    mov [png_argv + 2*8], rax
+    lea rax, [emoji_size_arg]
+    mov [png_argv + 3*8], rax
+    lea rax, [convert_arg_depth]
+    mov [png_argv + 4*8], rax
+    lea rax, [convert_arg_8]
+    mov [png_argv + 5*8], rax
+    lea rax, [convert_arg_rgba_lower]
+    mov [png_argv + 6*8], rax
+    mov qword [png_argv + 7*8], 0
+
+    ; Two pipes (parent → child PNG, child → parent RGBA).
+    sub rsp, 16
+    mov rax, SYS_PIPE
+    lea rdi, [rsp]
+    syscall
+    test rax, rax
+    js .pde_pipe1_fail
+    mov eax, [rsp]
+    mov [png_in_read], eax
+    mov eax, [rsp + 4]
+    mov [png_in_write], eax
+    mov rax, SYS_PIPE
+    lea rdi, [rsp]
+    syscall
+    test rax, rax
+    js .pde_pipe2_fail
+    mov eax, [rsp]
+    mov [png_out_read], eax
+    mov eax, [rsp + 4]
+    mov [png_out_write], eax
+    add rsp, 16
+
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .pde_fork_fail
+    jnz .pde_parent
+
+    ; Child
+    mov rax, SYS_DUP2
+    mov edi, [png_in_read]
+    xor esi, esi
+    syscall
+    mov rax, SYS_DUP2
+    mov edi, [png_out_write]
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_read]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_write]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_out_read]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_out_write]
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [convert_path]
+    lea rsi, [png_argv]
+    mov rdx, [envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov rdi, 127
+    syscall
+
+.pde_parent:
+    push rax                              ; child pid
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_read]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_out_write]
+    syscall
+
+    ; Write PNG bytes to png_in_write.
+    mov rbx, 0                            ; bytes written
+.pde_write_loop:
+    cmp rbx, r13
+    jge .pde_write_done
+    mov rax, SYS_WRITE
+    mov edi, [png_in_write]
+    mov rsi, r12
+    add rsi, rbx
+    mov rdx, r13
+    sub rdx, rbx
+    syscall
+    test rax, rax
+    jle .pde_write_done
+    add rbx, rax
+    jmp .pde_write_loop
+.pde_write_done:
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_write]
+    syscall
+
+    ; Read RGBA bytes into emoji_raster_buf.
+    mov eax, r14d
+    imul eax, r15d
+    shl eax, 2
+    mov rbp, rax                          ; expected
+    xor rbx, rbx                          ; received
+.pde_read_loop:
+    cmp rbx, rbp
+    jge .pde_read_done
+    cmp rbx, EMOJI_RASTER_MAX
+    jge .pde_read_done
+    mov rax, SYS_READ
+    mov edi, [png_out_read]
+    lea rsi, [emoji_raster_buf + rbx]
+    mov rdx, rbp
+    sub rdx, rbx
+    syscall
+    test rax, rax
+    jle .pde_read_done
+    add rbx, rax
+    jmp .pde_read_loop
+.pde_read_done:
+    mov rax, SYS_CLOSE
+    mov edi, [png_out_read]
+    syscall
+    pop r15                               ; child pid
+    sub rsp, 8
+    mov rax, SYS_WAIT4
+    mov rdi, r15
+    mov rsi, rsp
+    xor edx, edx
+    xor r10, r10
+    syscall
+    add rsp, 8
+    test rbx, rbx
+    jz .pde_fail_norestore
+    mov rax, rbx
+    jmp .pde_ret
+
+.pde_pipe2_fail:
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_read]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [png_in_write]
+    syscall
+.pde_pipe1_fail:
+    add rsp, 16
+.pde_fork_fail:
+.pde_fail_norestore:
+    mov rax, -1
+.pde_ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.pde_resize_arg: db "-resize", 0
 
 ; ---------------------------------------------------------------------
 ; ttf_render_smp_to_raster — render an SMP codepoint via the embedded
