@@ -87,6 +87,13 @@
 ; below x11_buf's 65536-byte tail for the reply itself.
 %define PASTE_REPLY_OFFSET           32768
 
+; Styled-glyph cache key bits. TTF cache (ttf_glyph_uploaded) is indexed
+; by `cp | (italic<<16) | (bold<<17)` so each italic/bold/regular variant
+; of a codepoint gets its own AddGlyphs slot.
+%define TTF_GID_ITALIC_BIT 16
+%define TTF_GID_BOLD_BIT   17
+%define TTF_GID_TABLE_SIZE (65536 * 4)
+
 ; XRender extension minor opcodes (sent with major = render_major_opcode)
 %define RENDER_QUERY_VERSION         0
 %define RENDER_QUERY_PICT_FORMATS    1
@@ -11921,6 +11928,15 @@ rs_row_loop:
     jnz .rs_ttf_upload_have_cp
     mov edi, 0x20
 .rs_ttf_upload_have_cp:
+    ; OR in italic/bold bits so the engine renders this style and the
+    ; cache + AddGlyphs gid are uniquely keyed (run_italic / run_bold
+    ; are uniform across this run — the run-scan break enforces it).
+    movzx eax, byte [run_italic]
+    shl eax, TTF_GID_ITALIC_BIT
+    or edi, eax
+    movzx eax, byte [run_bold]
+    shl eax, TTF_GID_BOLD_BIT
+    or edi, eax
     call ttf_upload_glyph
     inc rbx
     jmp .rs_ttf_upload_loop
@@ -11985,9 +12001,15 @@ rs_row_loop:
     add eax, edx
     mov [rdi+34], ax
 
-    ; Glyph IDs at offset 36..36+4*N. Each cell's UCS-2 codepoint IS the
-    ; glyph id (we used cp as the gid in AddGlyphs). cp=0 → 0x20 to match
-    ; the upload-loop substitution.
+    ; Glyph IDs at offset 36..36+4*N. Gid = cp | (italic<<16) | (bold<<17),
+    ; matching what ttf_upload_glyph used as the AddGlyphs gid for this
+    ; run's italic/bold style. Run-scan above guarantees uniform style
+    ; across the run, so we OR the same bits onto every cell. cp=0 → 0x20.
+    movzx esi, byte [run_italic]
+    shl esi, TTF_GID_ITALIC_BIT
+    movzx edx, byte [run_bold]
+    shl edx, TTF_GID_BOLD_BIT
+    or esi, edx                           ; esi = style bits (constant)
     xor ebx, ebx
 .rs_ttf_id_loop:
     cmp rbx, rcx
@@ -12001,6 +12023,7 @@ rs_row_loop:
     jnz .rs_ttf_id_have_cp
     mov eax, 0x20
 .rs_ttf_id_have_cp:
+    or eax, esi                           ; OR in style bits → styled gid
     mov rdx, rbx
     shl rdx, 2
     mov [rdi + rdx + 36], eax
@@ -17332,11 +17355,21 @@ opacity_toggle_apply:
 ;                             Composites one glyph at (x, y).
 ; ---------------------------------------------------------------------
 
-; Per-codepoint upload state. Linear bitmap: 1 byte per BMP cp.
-; 64KB BSS; only touched pages cost RAM (typically a handful of KB).
+; Per-styled-codepoint upload state. Indexed by an 18-bit composite
+; key: bits 0..15 = codepoint, bit 16 = italic, bit 17 = bold. Four
+; buckets (regular / italic / bold / bold-italic) so the glyph engine
+; can re-rasterise a cp with different post-process flags and each
+; variant gets its own CompositeGlyphs32 gid. Only touched pages cost
+; RAM (typically tens of KB even with mixed bold/italic content).
+; (TTF_GID_* equates moved to the top-of-file %define block so callers
+; in earlier render code can see them.)
 
 section .bss
-ttf_glyph_uploaded:     resb 65536
+ttf_glyph_uploaded:     resb TTF_GID_TABLE_SIZE
+; Holds the styled-gid argument for the in-flight ttf_upload_glyph call,
+; so the existing cp-based comparisons (`cmp rbx, 0x20` etc.) can stay
+; while AddGlyphs / cache-mark use the full italic|bold|cp triple.
+ttf_upload_styled_gid:  resq 1
 src_glyph_w:            resq 1          ; unclipped W from glyph engine,
                                         ; used as output_buf row stride
                                         ; during ttf_upload_glyph copy
@@ -17457,14 +17490,14 @@ ttf_invalidate_glyph_cache:
     call x11_buffer
     inc dword [x11_seq]
 
-    ; Zero the per-cp uploaded bitmap so subsequent ttf_upload_glyph
-    ; calls actually re-upload (now into the new glyphset). 65536 bytes
-    ; via rep stosq. rdi/rcx/rax are caller-saved; restored by saver.
+    ; Zero the per-styled-cp uploaded bitmap so subsequent ttf_upload_glyph
+    ; calls actually re-upload (now into the new glyphset). All four
+    ; buckets (regular / italic / bold / bold-italic) cleared.
     push rdi
     push rcx
     push rax
     lea rdi, [ttf_glyph_uploaded]
-    mov ecx, 65536 / 8
+    mov ecx, TTF_GID_TABLE_SIZE / 8
     xor eax, eax
     rep stosq
     pop rax
@@ -17605,9 +17638,12 @@ ttf_compute_metrics:
     ret
 
 ; ---------------------------------------------------------------------
-; ttf_upload_glyph — rdi = codepoint. Renders the glyph via the
-; embedded engine, then sends AddGlyphs to install it in the glyphset.
-; Marks ttf_glyph_uploaded[cp]. No-op if already uploaded.
+; ttf_upload_glyph — rdi = styled gid (cp | italic<<16 | bold<<17).
+; Renders the glyph via the embedded engine with italic/bold post-
+; process flags set per the high bits, then sends AddGlyphs to install
+; it in the glyphset under THIS gid. Marks ttf_glyph_uploaded[gid].
+; No-op if already uploaded. The X server stores the (gid, alpha)
+; pair, so the same cp at different attrs gets distinct cached glyphs.
 ttf_upload_glyph:
     push rbx
     push r12
@@ -17616,10 +17652,34 @@ ttf_upload_glyph:
     push r15
     push rbp
 
-    cmp rdi, 65536
+    ; Stash the full styled gid for AddGlyphs / cache-mark; mask rbx
+    ; down to the codepoint (low 16 bits) so the existing braille,
+    ; substitution, underscore-pack and speckle-trim cp comparisons
+    ; below still work without per-site rewrites.
+    mov [ttf_upload_styled_gid], rdi
+
+    ; Configure post-process flags from gid's high bits BEFORE the
+    ; cp-extract — the engine reads these during glyph_render_to_alpha.
+    push rdi
+    mov rax, rdi
+    shr rax, TTF_GID_ITALIC_BIT
+    and rax, 1
+    mov rdi, rax
+    call glyph_set_oblique
+    pop rdi
+    push rdi
+    mov rax, rdi
+    shr rax, TTF_GID_BOLD_BIT
+    and rax, 1
+    mov rdi, rax
+    call glyph_set_synthetic_bold
+    pop rdi
+
+    cmp rdi, TTF_GID_TABLE_SIZE
     jge .ret
     cmp byte [ttf_glyph_uploaded + rdi], 0
     jne .ret
+    and rdi, 0xFFFF                    ; rdi = codepoint only
     mov rbx, rdi                       ; remember cp
 
     ; Render via engine. The X server's default-glyph behaviour for a
@@ -18064,7 +18124,8 @@ ttf_upload_glyph:
     mov eax, [ttf_glyphset]
     mov [rdi+4], eax
     mov dword [rdi+8], 1                ; num_glyphs
-    mov [rdi+12], ebx                   ; gid = cp
+    mov rax, [ttf_upload_styled_gid]    ; gid = cp | italic<<16 | bold<<17
+    mov [rdi+12], eax
     ; glyphInfo
     mov [rdi+16], r12w                  ; w
     mov [rdi+18], r13w                  ; h
@@ -18128,7 +18189,8 @@ ttf_upload_glyph:
     inc dword [x11_seq]
 
 .skip:
-    mov byte [ttf_glyph_uploaded + rbx], 1
+    mov rax, [ttf_upload_styled_gid]
+    mov byte [ttf_glyph_uploaded + rax], 1
 .ret:
     pop rbp
     pop r15
