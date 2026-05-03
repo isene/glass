@@ -3761,6 +3761,28 @@ render_emoji_glyph:
     je .reg_have_raster
 
 .reg_no_cache:
+    ; Try TTF rendering first. cmap fmt 12 (glyph v0.4.7) lets us
+    ; resolve SMP codepoints — math symbols, CJK extensions B-G,
+    ; some monochrome dingbats — that DejaVu Sans Mono / similar
+    ; fonts ship outline glyphs for. Falls through to convert when
+    ; the active font doesn't cover this cp (Color emoji codepoints,
+    ; uncommon SMP ranges). Phase 3 will preempt this with CBDT.
+    cmp qword [ttf_active], 0
+    je .reg_no_cache_convert
+    push r12
+    push r13
+    push r14
+    mov edi, [emoji_codepoints + r12*4]
+    call glyph_has_glyph
+    pop r14
+    pop r13
+    pop r12
+    test rax, rax
+    jz .reg_no_cache_convert
+    call ttf_render_smp_to_raster
+    test rax, rax
+    jz .reg_have_raster                  ; success — raster filled
+.reg_no_cache_convert:
     ; Build "WxH\0" into emoji_size_arg
     mov edi, r13d
     lea rsi, [emoji_size_arg]
@@ -17531,6 +17553,146 @@ src_glyph_w:            resq 1          ; unclipped W from glyph engine,
                                         ; during ttf_upload_glyph copy
 
 section .text
+
+; ---------------------------------------------------------------------
+; ttf_render_smp_to_raster — render an SMP codepoint via the embedded
+; glyph engine into emoji_raster_buf in the same RGBA layout the
+; convert shell-out produces, so the existing pixmap-upload path
+; (.reg_have_raster) can pick it up unchanged. Cell colour is white
+; (palette[7]) — emoji-cache slots are keyed only by cp, so we can't
+; cache per-fg-colour without a bigger redesign; phase 3 handles
+; coloured emoji directly via CBDT.
+;
+; Inputs:  r12 = emoji index, r13 = pixmap width, r14 = pixmap height
+; Returns: rax = 0 on success (emoji_raster_buf filled with W×H RGBA),
+;          rax = -1 on failure (engine couldn't render or geometry
+;          out of range — caller falls through to convert).
+ttf_render_smp_to_raster:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov ebx, [emoji_codepoints + r12*4]   ; cp
+
+    ; Render via engine into output_buf.
+    mov edi, ebx
+    movzx esi, word [char_height]
+    mov rax, [cfg_font_size]
+    test rax, rax
+    jz .trsr_use_height
+    mov rsi, rax
+.trsr_use_height:
+    call glyph_render_to_alpha
+    test eax, eax
+    jnz .trsr_fail
+
+    ; rcx=W rdx=H r8=bearing_x r9=bearing_y from the engine.
+    mov r15, rcx                          ; src W
+    mov r10, rdx                          ; src H
+    test r15, r15
+    jz .trsr_fail
+    test r10, r10
+    jz .trsr_fail
+
+    ; Zero the destination (r13 × r14 × 4 bytes).
+    mov rax, r13
+    imul rax, r14
+    shl rax, 2
+    push rax
+    lea rdi, [emoji_raster_buf]
+    mov rcx, rax
+    shr rcx, 3
+    xor eax, eax
+    rep stosq
+    pop rax
+
+    ; Compute placement offsets.
+    ;   dst_x = max(0, (pix_W - src_W) / 2)            (centre horizontally)
+    ;   dst_y = max(0, font_ascent - bearing_y)        (baseline at ascent)
+    mov rcx, r13
+    sub rcx, r15
+    sar rcx, 1                            ; (pix_W - src_W) / 2
+    js .trsr_dx_zero
+    jmp .trsr_dx_have
+.trsr_dx_zero:
+    xor rcx, rcx
+.trsr_dx_have:
+    mov rax, rcx                          ; rax = dst_x
+
+    movzx ecx, word [font_ascent]
+    sub rcx, r9                           ; font_ascent - bearing_y
+    js .trsr_dy_zero
+    jmp .trsr_dy_have
+.trsr_dy_zero:
+    xor rcx, rcx
+.trsr_dy_have:
+    ; Stack layout for compose loop: [rsp]=dst_x [rsp+8]=dst_y
+    push rax                              ; dst_x
+    push rcx                              ; dst_y
+
+    ; Compose: for each src pixel (sx, sy) with non-zero alpha, write
+    ; an opaque white BGRA quad at (dst_x + sx, dst_y + sy). Output
+    ; format must match `convert rgba:-` so .reg_have_raster's PutImage
+    ; sees the same byte layout — RGBA: R,G,B,A in stream order.
+    xor r8, r8                            ; sy
+.trsr_row:
+    cmp r8, r10
+    jge .trsr_done
+    mov rax, [rsp + 8]                    ; dst_y
+    add rax, r8
+    cmp rax, r14
+    jge .trsr_done
+    xor r9, r9                            ; sx
+.trsr_col:
+    cmp r9, r15
+    jge .trsr_next_row
+    mov rcx, [rsp]                        ; dst_x
+    add rcx, r9
+    cmp rcx, r13
+    jge .trsr_next_row
+    mov rdi, r8
+    imul rdi, r15
+    add rdi, r9                           ; src offset
+    movzx eax, byte [output_buf + rdi]
+    test eax, eax
+    jz .trsr_next_col
+    ; dst pixel byte offset = (dst_y+sy)*pix_W + (dst_x+sx)) * 4
+    mov rdx, [rsp + 8]
+    add rdx, r8                           ; dst row
+    imul rdx, r13
+    add rdx, rcx                          ; dst pixel
+    shl rdx, 2
+    mov byte [emoji_raster_buf + rdx + 0], 0xFF       ; R
+    mov byte [emoji_raster_buf + rdx + 1], 0xFF       ; G
+    mov byte [emoji_raster_buf + rdx + 2], 0xFF       ; B
+    mov byte [emoji_raster_buf + rdx + 3], al         ; A
+.trsr_next_col:
+    inc r9
+    jmp .trsr_col
+.trsr_next_row:
+    inc r8
+    jmp .trsr_row
+
+.trsr_done:
+    add rsp, 16                           ; pop dst_x / dst_y
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.trsr_fail:
+    mov rax, -1
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; ---------------------------------------------------------------------
 ; ttf_autodetect_style_paths — fill cfg_font_path_italic/bold/bold_italic
