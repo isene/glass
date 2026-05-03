@@ -17864,11 +17864,22 @@ ttf_select_font_slot:
     movzx ecx, byte [ttf_font_slot_loaded + rax]
     test ecx, ecx
     jz .tsfs_use_regular
+    ; Switch to the requested slot. Save BOTH the original style bits
+    ; (rdi) AND the slot index (rax) across glyph_restore_pf_state —
+    ; that helper calls compute_norm_coord which clobbers rax. An
+    ; earlier draft did `mov [active_slot], rax` after the call, which
+    ; stored garbage from compute_norm_coord and broke the active-slot
+    ; cache on the very NEXT call: a regular cell after a bold cell
+    ; matched the corrupted active_slot, skipped the restore, and
+    ; uploaded its glyph from the still-loaded bold slot — visible as
+    ; selectively-bold characters scattered through regular text.
     push rdi
+    push rax
     mov rdi, rax
     imul rdi, TTF_FONT_SLOT_SIZE
     lea rdi, [ttf_font_slot_buf + rdi]
     call glyph_restore_pf_state
+    pop rax
     pop rdi
     mov [ttf_font_active_slot], rax
 .tsfs_set_post:
