@@ -9177,6 +9177,42 @@ grid_put_char:
     mov ecx, [cur_bg_pixel]
     mov [grid + rbx + 12], ecx       ; [12-15] bg pixel
 
+    ; Emoji codepoints are East Asian Wide (EAW=W) per Unicode UAX-11:
+    ; CC, vim, less, weechat all assume an emoji consumes TWO terminal
+    ; cells when computing line-wrap columns and tab/column alignment.
+    ; Glass used to advance the cursor by 1, so every emoji on a long
+    ; line nudged subsequent text one column to the LEFT of where the
+    ; sender expected it; in CC's table renders the desync compounds
+    ; across multiple wrap rows and shows up as content collapsing
+    ; onto the same x-positions as the row above. Fix: when this cell
+    ; carries ATTR_IS_EMOJI, write a wide-continuation marker into the
+    ; next cell (cp=0, attrs unchanged) so it renders as background
+    ; only, then advance cursor by 2 instead of 1.
+    test byte [cur_attrs], 8
+    jz .gpc_no_wide_pad
+    mov rax, [cursor_col]
+    inc rax
+    cmp rax, [grid_cols]
+    jge .gpc_no_wide_pad              ; emoji on last col: leave as 1-cell
+    mov rdx, [cursor_row]
+    imul rdx, MAX_COLS
+    add rdx, rax
+    imul rdx, CELL_SIZE
+    mov word [grid + rdx], 0          ; cp = 0 (renders as space)
+    movzx ecx, byte [cur_fg_default]
+    mov [grid + rdx + 2], cl
+    movzx ecx, byte [cur_bg_default]
+    mov [grid + rdx + 3], cl
+    mov byte [grid + rdx + 4], 0      ; clear ATTR_IS_EMOJI on the pad cell
+    mov byte [grid + rdx + 5], 0
+    mov word [grid + rdx + 6], 0
+    mov ecx, [cur_fg_pixel]
+    mov [grid + rdx + 8], ecx
+    mov ecx, [cur_bg_pixel]
+    mov [grid + rdx + 12], ecx
+    inc qword [cursor_col]            ; first of the two-step advance
+.gpc_no_wide_pad:
+
     ; Advance cursor
     mov rax, [cursor_col]
     inc rax
