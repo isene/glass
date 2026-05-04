@@ -112,9 +112,9 @@
 ; Kitty graphics protocol
 %define APC_BODY_MAX        16384            ; one APC body cap (glow chunks ~4K)
 %define APC_PAYLOAD_MAX     16777216         ; 16MB accumulator for base64 chunks
-%define IMG_SLOTS           32
+%define IMG_SLOTS           256
 %define IMG_SLOT_SIZE       32
-%define PLACE_SLOTS         32
+%define PLACE_SLOTS         256
 %define PLACE_SLOT_SIZE     16
 %define MAX_IMG_DIM         8192             ; sanity cap on width/height
 %define IMG_DECODE_MAX      67108864         ; 64MB max decoded RGBA
@@ -1206,7 +1206,7 @@ _start:
     ; other CLI flags yet.
     mov r8, rdi             ; argc
     mov r9, rsi             ; argv
-    xor r10, r10            ; iterator
+    xor r10d, r10d            ; iterator
 .es_arg_loop:
     inc r10                 ; skip argv[0]
     cmp r10, r8
@@ -1246,7 +1246,7 @@ _start:
     jne .es_arg_loop
 .es_collect:
     inc r10                 ; advance past the marker
-    xor r11, r11            ; dest index
+    xor r11d, r11d            ; dest index
 .es_collect_loop:
     cmp r10, r8
     jge .es_collect_done
@@ -1821,7 +1821,7 @@ x11_connect:
     syscall
 
     ; Read full setup reply (may need multiple reads)
-    xor r12, r12              ; total bytes read
+    xor r12d, r12d              ; total bytes read
 .xc_read_loop:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
@@ -2653,7 +2653,7 @@ build_primary_glyph_map:
     jz .bpgm_done
 
     ; Stream-read CHARINFOs in 1200-byte chunks (= 100 entries each).
-    xor r14, r14                        ; iterator i = 0..m-1
+    xor r14d, r14d                        ; iterator i = 0..m-1
 .bpgm_ci_loop:
     cmp r14, rbx
     jge .bpgm_done
@@ -2674,7 +2674,7 @@ build_primary_glyph_map:
     test rax, rax
     jle .bpgm_done
     ; Walk r8 entries.
-    xor r9, r9                          ; entry index in chunk
+    xor r9d, r9d                          ; entry index in chunk
 .bpgm_ci_walk:
     cmp r9, r8
     jge .bpgm_chunk_done
@@ -3325,7 +3325,7 @@ find_or_alloc_emoji:
     push rbx
     push r12
     mov r12, [emoji_count]
-    xor rbx, rbx
+    xor ebx, ebx
 .foe_search:
     cmp rbx, r12
     jge .foe_alloc
@@ -3934,7 +3934,7 @@ render_emoji_glyph:
     imul eax, edx
     shl eax, 2
     mov r13, rax                   ; total bytes expected
-    xor r14, r14                   ; bytes received so far
+    xor r14d, r14d                   ; bytes received so far
 .reg_read_loop:
     cmp r14, r13
     jge .reg_read_done
@@ -3963,7 +3963,7 @@ render_emoji_glyph:
     mov rdi, r15
     mov rsi, rsp
     xor edx, edx
-    xor r10, r10
+    xor r10d, r10d
     syscall
     add rsp, 8
     pop r14
@@ -5160,7 +5160,7 @@ event_loop:
     ; the whole grid before reading the next chunk. With drain-then-render,
     ; the user sees one paint at the final state. Cap at 64 iterations
     ; (256 KB) per tick so a runaway child can't starve X11 events.
-    xor r12, r12                       ; iteration counter
+    xor r12d, r12d                       ; iteration counter
 .ev_pty_drain:
     mov rax, SYS_READ
     mov rdi, [pty_master]
@@ -5243,7 +5243,7 @@ handle_x11_events:
     jle .hxe_done
     mov r12, rax             ; bytes read
 
-    xor rbx, rbx             ; offset
+    xor ebx, ebx             ; offset
 .hxe_loop:
     cmp rbx, r12
     jge .hxe_done
@@ -7192,7 +7192,7 @@ vt_process:
 
     mov r12, rsi             ; buffer
     mov r13, rcx             ; length
-    xor r14, r14             ; current position
+    xor r14d, r14d             ; current position
 
 .vtp_loop:
     cmp r14, r13
@@ -7226,7 +7226,6 @@ vt_process:
     ; consistent with what grid_put_char would have set.
     mov rbx, [grid_cols]
     sub rbx, [cursor_col]              ; rbx = cells left on this row
-    test rbx, rbx
     jle .vtp_loop_slow                 ; no room (or already past)
     mov rcx, r13
     sub rcx, r14                       ; rcx = bytes left in input
@@ -7236,7 +7235,7 @@ vt_process:
 .vtp_fp_have_max:
     ; rcx = max run length we'd accept (cells AND bytes available)
     ; Scan forward while bytes are in [0x20, 0x7E].
-    xor rdx, rdx                       ; rdx = run length so far
+    xor edx, edx                       ; rdx = run length so far
     mov rsi, r12
     add rsi, r14                       ; rsi = current input start
 .vtp_fp_scan:
@@ -7314,24 +7313,27 @@ vt_process:
     movzx eax, byte [r12 + r14]
     inc r14
 
-    ; Dispatch based on state
-    mov rcx, [vt_state]
-    cmp rcx, VT_ESC
-    je .vtp_esc
-    cmp rcx, VT_CSI
-    je .vtp_csi
-    cmp rcx, VT_CSI_PARAM
-    je .vtp_csi
-    cmp rcx, VT_OSC
-    je .vtp_osc
-    cmp rcx, VT_CHARSET
-    je .vtp_charset
-    cmp rcx, VT_STRING
-    je .vtp_string_discard
-    cmp rcx, VT_APC
-    je .vtp_apc_capture
+    ; Dispatch based on state. Indirect jump through a 64-byte table
+    ; replaces a 7-link cmp/je chain. Modern branch predictors handle
+    ; the BTB-backed indirect jump as well as the chain of conditional
+    ; branches did, in fewer bytes of i-cache.
+    mov ecx, [vt_state]                  ; state fits in 4 bits
+    cmp ecx, 7
+    ja .vtp_normal                       ; out-of-range → safe default
+    lea rdx, [rel .vtp_jmp_tab]
+    jmp [rdx + rcx*8]
+    align 8
+.vtp_jmp_tab:
+    dq .vtp_normal                       ; VT_NORMAL    = 0
+    dq .vtp_esc                          ; VT_ESC       = 1
+    dq .vtp_csi                          ; VT_CSI       = 2
+    dq .vtp_csi                          ; VT_CSI_PARAM = 3 (same handler)
+    dq .vtp_osc                          ; VT_OSC       = 4
+    dq .vtp_charset                      ; VT_CHARSET   = 5
+    dq .vtp_string_discard               ; VT_STRING    = 6
+    dq .vtp_apc_capture                  ; VT_APC       = 7
 
-    ; VT_NORMAL
+.vtp_normal:
     cmp al, 27               ; ESC
     je .vtp_start_esc
     cmp al, 13               ; CR
@@ -7772,7 +7774,6 @@ vt_process:
     inc ecx                       ; first byte of base64 data
     mov rdx, [osc_pos]
     sub rdx, rcx                  ; data length
-    test rdx, rdx
     jz .vtp_loop                  ; empty: ignore (clear semantics not implemented)
     cmp byte [osc_buf + rcx], '?'
     je .vtp_loop                  ; query: we don't reply
@@ -7813,7 +7814,6 @@ vt_process:
     inc ecx                     ; ecx = offset of first URI byte
     mov rdx, [osc_pos]
     sub rdx, rcx                ; URI length
-    test rdx, rdx
     jz .vtp_osc8_close
     ; Allocate next link id (1..255). Wrap when full.
     mov rax, [osc8_count]
@@ -7937,7 +7937,7 @@ vt_process:
     push rcx
     push r12
     push r13
-    xor r12, r12                     ; row index
+    xor r12d, r12d                     ; row index
     mov r13, [grid_rows]
 .vtp_fr_row:
     cmp r12, r13
@@ -8255,7 +8255,7 @@ vt_process:
     push rcx
     push r12
     push r13
-    xor r12, r12
+    xor r12d, r12d
     mov r13, [grid_rows]
 .vtp_alt_save_row:
     cmp r12, r13
@@ -8309,7 +8309,7 @@ vt_process:
     push rcx
     push r12
     push r13
-    xor r12, r12
+    xor r12d, r12d
     mov r13, [grid_rows]
 .vtp_alt_restore_row:
     cmp r12, r13
@@ -8430,7 +8430,6 @@ vt_process:
 .vtp_cuu_go:
     mov rcx, [cursor_row]
     sub rcx, rax
-    test rcx, rcx
     jns .vtp_cuu_ok
     xor ecx, ecx
 .vtp_cuu_ok:
@@ -8485,7 +8484,6 @@ vt_process:
 .vtp_cub_go:
     mov rcx, [cursor_col]
     sub rcx, rax
-    test rcx, rcx
     jns .vtp_cub_ok
     xor ecx, ecx
 .vtp_cub_ok:
@@ -9356,7 +9354,7 @@ grid_put_char:
 grid_clear:
     push rbx
     push r12
-    xor rbx, rbx
+    xor ebx, ebx
     mov r12, MAX_COLS * MAX_ROWS
 .gc_loop:
     cmp rbx, r12
@@ -9369,7 +9367,7 @@ grid_clear:
     jmp .gc_loop
 .gc_done:
     ; Reset wrap flags for all rows
-    xor rbx, rbx
+    xor ebx, ebx
 .gc_wrap_reset:
     cmp rbx, MAX_ROWS
     jge .gc_wrap_done
@@ -9480,7 +9478,7 @@ grid_clear_left:
     mov edx, [cur_fg_pixel]
     or rax, rdx
     push rax
-    xor rbx, rbx
+    xor ebx, ebx
 .gcl2_loop:
     cmp rbx, [cursor_col]
     jg .gcl2_done
@@ -9513,7 +9511,7 @@ grid_clear_above:
     imul rbx, MAX_COLS
     add rbx, [cursor_col]
     inc rbx                           ; inclusive of cursor cell
-    xor r12, r12
+    xor r12d, r12d
 .gca_loop:
     cmp r12, rbx
     jge .gca_done
@@ -9533,7 +9531,7 @@ grid_clear_line:
     push rbx
     mov rcx, [cursor_row]
     imul rcx, MAX_COLS
-    xor rbx, rbx
+    xor ebx, ebx
 .gcl_loop:
     cmp rbx, [grid_cols]
     jge .gcl_done
@@ -9785,7 +9783,7 @@ grid_scroll_up:
     pop r13
 
     ; Move rows 1..N-1 to 0..N-2
-    xor rbx, rbx
+    xor ebx, ebx
     mov r12, [grid_rows]
     dec r12
     imul r12, MAX_COLS
@@ -9822,7 +9820,7 @@ grid_scroll_up:
     jmp .gsu_clear
 .gsu_clear_done:
     ; Shift wrap flags up: row_wrapped[i] = row_wrapped[i+1]
-    xor rbx, rbx
+    xor ebx, ebx
     mov r12, [grid_rows]
     dec r12
 .gsu_wrap_shift:
@@ -9860,7 +9858,7 @@ grid_scroll_region_down:
     test r13, r13
     jnz .gsrd_have_region
     ; No region: full-grid scroll
-    xor r12, r12
+    xor r12d, r12d
     mov r13, [grid_rows]
     dec r13
 .gsrd_have_region:
@@ -9898,7 +9896,7 @@ grid_scroll_region_down:
     mov rax, r12
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
-    xor rdx, rdx
+    xor edx, edx
 .gsrd_clear:
     cmp rdx, [grid_cols]
     jge .gsrd_done
@@ -9962,7 +9960,6 @@ scroll_view_down:
     mov rbx, 1
 .svd_ok:
     sub rax, rbx
-    test rax, rax
     jns .svd_set
     xor eax, eax
 .svd_set:
@@ -10534,10 +10531,10 @@ b64_decode:
     push r14
     push r15
     mov r15, rcx                  ; src_len (rcx is reused for shift counts)
-    xor r12, r12                  ; out position
-    xor rbx, rbx                  ; in position
+    xor r12d, r12d                  ; out position
+    xor ebx, ebx                  ; in position
 .b64d_loop:
-    xor r13, r13                  ; 24-bit accumulator
+    xor r13d, r13d                  ; 24-bit accumulator
     xor r14d, r14d                ; valid char count (0..4)
 .b64d_chunk:
     cmp r14, 4
@@ -11059,7 +11056,7 @@ render_screen:
     ; already force-paints).
     push rbx
     push r12
-    xor r12, r12
+    xor r12d, r12d
 .rs_dmap_zero:
     cmp r12, MAX_ROWS
     jge .rs_dmap_zero_done
@@ -11071,7 +11068,7 @@ render_screen:
     jne .rs_dmap_done                  ; full repaint → bitmap unused
     cmp qword [scroll_offset], 0
     jne .rs_dmap_done                  ; scrollback path doesn't use mirror
-    xor r12, r12
+    xor r12d, r12d
 .rs_dmap_row:
     cmp r12, [grid_rows]
     jge .rs_dmap_done
@@ -11392,7 +11389,6 @@ paint_margins:
     xor esi, esi                           ; y = 0
     mov rdx, [win_width]
     sub rdx, rdi                           ; w = win_w - grid_w
-    test rdx, rdx
     jle .pm_no_right_bbox
     mov rcx, [win_height]                  ; h = full window height
     call expand_bbox
@@ -11403,7 +11399,6 @@ paint_margins:
     xor edi, edi                           ; x = 0
     mov rcx, [win_height]
     sub rcx, rsi                           ; h = win_h - grid_h
-    test rcx, rcx
     jle .pm_no_bottom_bbox
     movzx eax, word [char_width]
     mov rdx, [grid_cols]
@@ -11419,7 +11414,7 @@ paint_margins:
 rs_row_loop:
     ; Draw each row with per-color-run rendering
     ; When scroll_offset > 0, top rows come from scrollback buffer
-    xor r12, r12             ; display row
+    xor r12d, r12d             ; display row
 .rs_row:
     cmp r12, [grid_rows]
     jge .rs_after_rows
@@ -11588,7 +11583,7 @@ rs_row_loop:
     lea rdi, [prev_paint_grid + rax]
     mov r10, -1
     mov r11, -1
-    xor rbx, rbx
+    xor ebx, ebx
 .rs_row_diff_loop:
     cmp rbx, [grid_cols]
     jge .rs_row_diff_done
@@ -12338,11 +12333,11 @@ rs_row_loop:
     ; Scan grid for cells whose link id is non-zero and draw an
     ; underline per contiguous span. Done as a separate pass so it
     ; doesn't perturb the per-color text-run logic.
-    xor r12, r12
+    xor r12d, r12d
 .rs_link_row:
     cmp r12, [grid_rows]
     jge .rs_link_done
-    xor r13, r13
+    xor r13d, r13d
 .rs_link_scan:
     cmp r13, [grid_cols]
     jge .rs_link_next_row
@@ -12536,11 +12531,11 @@ rs_row_loop:
     jmp .rs_fb_done
     cmp dword [fallback_font_id], 0
     je .rs_fb_done
-    xor r12, r12                           ; row
+    xor r12d, r12d                           ; row
 .rs_fb_row:
     cmp r12, [grid_rows]
     jge .rs_fb_done
-    xor r13, r13                           ; col
+    xor r13d, r13d                           ; col
 .rs_fb_col:
     cmp r13, [grid_cols]
     jge .rs_fb_row_done
@@ -12719,11 +12714,11 @@ rs_row_loop:
     jne .rs_emoji_done
     cmp dword [render_major], 0
     je .rs_emoji_done
-    xor r12, r12
+    xor r12d, r12d
 .rs_emoji_row:
     cmp r12, [grid_rows]
     jge .rs_emoji_done
-    xor r13, r13
+    xor r13d, r13d
 .rs_emoji_col:
     cmp r13, [grid_cols]
     jge .rs_emoji_next_row
@@ -12793,7 +12788,7 @@ rs_row_loop:
     ; XRender, scaled into its declared cell rectangle.
     cmp dword [render_major], 0
     je .rs_imgs_done
-    xor r12, r12
+    xor r12d, r12d
 .rs_imgs_loop:
     cmp r12, PLACE_SLOTS
     jge .rs_imgs_done
@@ -13216,7 +13211,7 @@ init_palette:
     push r12
 
     ; Colors 0-15: standard colors
-    xor rbx, rbx
+    xor ebx, ebx
 .ip_std:
     cmp rbx, 16
     jge .ip_cube
@@ -13230,15 +13225,15 @@ init_palette:
     ; index = 16 + 36*r + 6*g + b
     ; Component values: 0, 0x5F, 0x87, 0xAF, 0xD7, 0xFF
     mov rbx, 16
-    xor r12, r12             ; r
+    xor r12d, r12d             ; r
 .ip_r:
     cmp r12, 6
     jge .ip_gray
-    xor rcx, rcx             ; g
+    xor ecx, ecx             ; g
 .ip_g:
     cmp rcx, 6
     jge .ip_r_next
-    xor rdx, rdx             ; b
+    xor edx, edx             ; b
 .ip_b:
     cmp rdx, 6
     jge .ip_g_next
@@ -13682,7 +13677,6 @@ setup_pseudo_transparency:
 .spt_pi_send_loop:
     mov eax, [pseudo_total_bytes]
     sub eax, r13d
-    test eax, eax
     jle .spt_pi_send_done
     mov rdx, rax
     lea rsi, [x11_buf + 8]
@@ -14060,7 +14054,7 @@ load_config:
     lea r8, [cfg_font_path_set]
 .lc_fp_copy_value:
     call lc_skip_to_value
-    xor rcx, rcx
+    xor ecx, ecx
 .lc_fp_copy:
     movzx eax, byte [rsi]
     test al, al
@@ -14235,7 +14229,7 @@ load_config:
     jne .lc_try_bg_cycle
     add rsi, 13
     call lc_skip_to_value
-    xor r12, r12                    ; count
+    xor r12d, r12d                    ; count
 .lc_oc_one:
     movzx eax, byte [rsi]
     cmp al, '0'
@@ -14288,7 +14282,7 @@ load_config:
     jne .lc_try_font_weight
     add rsi, 8
     call lc_skip_to_value
-    xor r12, r12                    ; count of colors parsed
+    xor r12d, r12d                    ; count of colors parsed
 .lc_bgc_one:
     cmp byte [rsi], '#'
     jne .lc_bgc_done
@@ -14756,12 +14750,12 @@ scan_urls:
 
     mov qword [url_count], 0
     mov qword [url_str_pos], 0
-    xor r12, r12             ; current row
+    xor r12d, r12d             ; current row
 
 .su_row_loop:
     cmp r12, [grid_rows]
     jge .su_o8_init                    ; http walk done → continue to OSC 8 sweep
-    xor r13, r13             ; current col
+    xor r13d, r13d             ; current col
 
 .su_col_loop:
     cmp r13, [grid_cols]
@@ -14966,13 +14960,13 @@ scan_urls:
     ; http(s):// substrings — discoverable via hover-underline,
     ; click-to-open without Ctrl, mouse-over cursor change.
 .su_o8_init:
-    xor r12, r12                          ; row
+    xor r12d, r12d                          ; row
 .su_o8_row:
     cmp r12, [grid_rows]
     jge .su_done
-    xor r13, r13                          ; col
+    xor r13d, r13d                          ; col
     xor r14d, r14d                        ; current run's link id (0 = no run)
-    xor r15, r15                          ; current run's start col
+    xor r15d, r15d                          ; current run's start col
 .su_o8_col:
     cmp r13, [grid_cols]
     jl .su_o8_have_col
@@ -15082,7 +15076,7 @@ url_at_cell:
     push r13
     mov r12, rdi
     mov r13, rsi
-    xor rbx, rbx
+    xor ebx, ebx
 .uac_loop:
     cmp rbx, [url_count]
     jge .uac_none
@@ -15155,7 +15149,7 @@ url_open_at:
     syscall
 .uoa_no_osc8:
 
-    xor rbx, rbx             ; url index
+    xor ebx, ebx             ; url index
 .uoa_loop:
     cmp rbx, [url_count]
     jge .uoa_done
@@ -15821,8 +15815,8 @@ base64_decode:
     mov r13, rsi                     ; src len
     mov r14, rdx                     ; dst
     call b64_init_table
-    xor r15, r15                     ; src index
-    xor rbx, rbx                     ; dst written
+    xor r15d, r15d                     ; src index
+    xor ebx, ebx                     ; dst written
     xor edx, edx                     ; running 24-bit accumulator
     xor ecx, ecx                     ; bits accumulated
 .b64d_loop:
@@ -15953,7 +15947,7 @@ png_decode_to_rgba:
     mov rdx, MMAP_PROT_RW
     mov r10, MMAP_FLAGS_PRIV
     mov r8, -1
-    xor r9, r9
+    xor r9d, r9d
     syscall
     cmp rax, -4096
     ja .pdr_fail
@@ -16068,7 +16062,7 @@ png_decode_to_rgba:
     syscall
 
     ; Read RGBA from png_out_read into img_decode_buf.
-    xor r12, r12                     ; bytes received
+    xor r12d, r12d                     ; bytes received
 .pdr_read:
     cmp r12, r14
     jge .pdr_read_done
@@ -16094,7 +16088,7 @@ png_decode_to_rgba:
     mov rdi, r15
     mov rsi, rsp
     xor edx, edx
-    xor r10, r10
+    xor r10d, r10d
     syscall
     add rsp, 16
 
@@ -16326,7 +16320,7 @@ img_upload_rsi:
     ; us avoid that whole code path. Send strips of N rows at a time
     ; where N*width*4 ≤ 200000 bytes.
     call x11_flush
-    xor rcx, rcx                     ; current y
+    xor ecx, ecx                     ; current y
     mov rax, 200000
     xor edx, edx
     mov ebx, r13d
@@ -16556,7 +16550,7 @@ handle_kitty_apc:
     ; transmission (e.g. pointer killed mid-stream while glow was still
     ; chunking) MUST be reset, not fused into. r14 = 1 if action was
     ; explicit, 0 if inferred.
-    xor r14, r14
+    xor r14d, r14d
     movzx eax, byte [apc_kv_a]
     test al, al
     jz .hka_action_inferred
@@ -16799,7 +16793,7 @@ kitty_finalize_image:
     mov rdx, MMAP_PROT_RW
     mov r10, MMAP_FLAGS_PRIV
     mov r8, -1
-    xor r9, r9
+    xor r9d, r9d
     syscall
     cmp rax, -4096
     ja .kfi_done
@@ -16887,7 +16881,7 @@ kitty_finalize_image:
     mov rdx, MMAP_PROT_RW
     mov r10, MMAP_FLAGS_PRIV
     mov r8, -1
-    xor r9, r9
+    xor r9d, r9d
     syscall
     cmp rax, -4096
     ja .kfi_unmap_decoded
@@ -17653,7 +17647,7 @@ ttf_autodetect_emoji_path:
     push rdi
     lea rdi, [cfg_font_path_emoji]
     pop rsi
-    xor rcx, rcx
+    xor ecx, ecx
 .taep_copy:
     movzx eax, byte [rsi + rcx]
     mov [rdi + rcx], al
@@ -17956,7 +17950,7 @@ png_decode_to_emoji_buf:
     imul eax, r15d
     shl eax, 2
     mov rbp, rax                          ; expected
-    xor rbx, rbx                          ; received
+    xor ebx, ebx                          ; received
 .pde_read_loop:
     cmp rbx, rbp
     jge .pde_read_done
@@ -17982,7 +17976,7 @@ png_decode_to_emoji_buf:
     mov rdi, r15
     mov rsi, rsp
     xor edx, edx
-    xor r10, r10
+    xor r10d, r10d
     syscall
     add rsp, 8
     test rbx, rbx
@@ -17993,7 +17987,7 @@ png_decode_to_emoji_buf:
     ; /256 (shr 8) is one off from /255 at the very brightest values
     ; — invisible for emoji compositing.
     push rbx
-    xor rcx, rcx
+    xor ecx, ecx
 .pde_premul:
     cmp rcx, rbx
     jge .pde_premul_done
@@ -18119,7 +18113,7 @@ ttf_render_smp_to_raster:
     js .trsr_dx_zero
     jmp .trsr_dx_have
 .trsr_dx_zero:
-    xor rcx, rcx
+    xor ecx, ecx
 .trsr_dx_have:
     mov rax, rcx                          ; rax = dst_x
 
@@ -18128,7 +18122,7 @@ ttf_render_smp_to_raster:
     js .trsr_dy_zero
     jmp .trsr_dy_have
 .trsr_dy_zero:
-    xor rcx, rcx
+    xor ecx, ecx
 .trsr_dy_have:
     ; Stack layout for compose loop: [rsp]=dst_x [rsp+8]=dst_y
     push rax                              ; dst_x
@@ -18138,7 +18132,7 @@ ttf_render_smp_to_raster:
     ; an opaque white BGRA quad at (dst_x + sx, dst_y + sy). Output
     ; format must match `convert rgba:-` so .reg_have_raster's PutImage
     ; sees the same byte layout — RGBA: R,G,B,A in stream order.
-    xor r8, r8                            ; sy
+    xor r8d, r8d                            ; sy
 .trsr_row:
     cmp r8, r10
     jge .trsr_done
@@ -18146,7 +18140,7 @@ ttf_render_smp_to_raster:
     add rax, r8
     cmp rax, r14
     jge .trsr_done
-    xor r9, r9                            ; sx
+    xor r9d, r9d                            ; sx
 .trsr_col:
     cmp r9, r15
     jge .trsr_next_row
@@ -18217,8 +18211,8 @@ ttf_autodetect_style_paths:
     ; can splice "-Italic" before it. r12 = byte index of the '.', or
     ; total length if none.
     lea rsi, [cfg_font_path]
-    xor r12, r12
-    xor rcx, rcx
+    xor r12d, r12d
+    xor ecx, ecx
 .tasp_scan:
     movzx eax, byte [rsi + rcx]
     test al, al
@@ -18303,7 +18297,7 @@ ttf_autodetect_style_paths:
     mov r14, rdi                     ; destination
     mov r15, rsi                     ; suffix
     ; Copy cfg_font_path[0..r12) to dst[0..r12).
-    xor rcx, rcx
+    xor ecx, ecx
 .tasp_pre:
     cmp rcx, r12
     jge .tasp_pre_done
@@ -18313,7 +18307,7 @@ ttf_autodetect_style_paths:
     jmp .tasp_pre
 .tasp_pre_done:
     ; Append suffix.
-    xor rbx, rbx
+    xor ebx, ebx
 .tasp_suf:
     movzx eax, byte [r15 + rbx]
     test al, al
@@ -18770,10 +18764,10 @@ ttf_upload_glyph:
     je .blank_glyph
     jmp .not_space_pre
 .blank_glyph:
-    xor rcx, rcx                       ; W = 0
-    xor rdx, rdx                       ; H = 0
-    xor r8, r8                         ; bearing_x = 0
-    xor r9, r9                         ; bearing_y = 0
+    xor ecx, ecx                       ; W = 0
+    xor edx, edx                       ; H = 0
+    xor r8d, r8d                         ; bearing_x = 0
+    xor r9d, r9d                         ; bearing_y = 0
     movzx r10, word [char_width]       ; advance = char_width
     jmp .have_glyph
 .not_space_pre:
@@ -18867,7 +18861,6 @@ ttf_upload_glyph:
     mov ecx, r14d
     shr ecx, 1
     sub eax, ecx                       ; eax = dot top-left x
-    test eax, eax
     jns .ttf_brl_x_pos
     xor eax, eax
 .ttf_brl_x_pos:
@@ -18881,7 +18874,6 @@ ttf_upload_glyph:
     mov ecx, r14d
     shr ecx, 1
     sub eax, ecx                       ; eax = dot top-left y
-    test eax, eax
     jns .ttf_brl_y_pos
     xor eax, eax
 .ttf_brl_y_pos:
@@ -18918,7 +18910,7 @@ ttf_upload_glyph:
     ; Set up engine output regs for .have_glyph path.
     mov rcx, r12                       ; W
     mov rdx, r13                       ; H
-    xor r8, r8                         ; bearing_x = 0
+    xor r8d, r8d                         ; bearing_x = 0
     movzx r9, word [font_ascent]       ; bearing_y = ascent (top of cell)
     movzx r10, word [char_width]       ; advance
     pop r15
@@ -18970,8 +18962,8 @@ ttf_upload_glyph:
     ; this server build, so we use 1×1 alpha=0 explicitly.
     mov rcx, 1                         ; W = 1
     mov rdx, 1                         ; H = 1
-    xor r8, r8                         ; bearing_x = 0
-    xor r9, r9                         ; bearing_y = 0
+    xor r8d, r8d                         ; bearing_x = 0
+    xor r9d, r9d                         ; bearing_y = 0
     movzx r10, word [char_width]       ; advance = char_width
     mov byte [output_buf], 0           ; alpha = 0 (transparent)
 .have_glyph:
@@ -19001,7 +18993,7 @@ ttf_upload_glyph:
     mov [src_glyph_w], rcx
     mov r12, rcx                        ; W = char_width
     movzx r13d, word [char_height]      ; H = char_height
-    xor r14, r14                        ; bearing_x = 0
+    xor r14d, r14d                        ; bearing_x = 0
     movzx r15d, word [font_ascent]      ; bearing_y = +ascent (top of cell)
     movzx ebp, word [char_width]
     ; Zero the full output_buf area (W*H bytes)
@@ -19111,7 +19103,7 @@ ttf_upload_glyph:
     ; practice, often invisible).
     test r14, r14
     jns .no_left_clamp
-    xor r14, r14
+    xor r14d, r14d
 .no_left_clamp:
 
     ; W clipping intentionally disabled. The previous heuristic
@@ -19139,10 +19131,10 @@ ttf_upload_glyph:
     ; only, no mask) and CompositeGlyphs32 has nothing to paint.
     cmp rbx, 0x20
     jne .not_space
-    xor r12, r12                        ; W = 0
-    xor r13, r13                        ; H = 0
-    xor r14, r14                        ; bearing_x = 0
-    xor r15, r15                        ; bearing_y = 0
+    xor r12d, r12d                        ; W = 0
+    xor r13d, r13d                        ; H = 0
+    xor r14d, r14d                        ; bearing_x = 0
+    xor r15d, r15d                        ; bearing_y = 0
 .not_space:
 
     ; XRender AddGlyphs: A8 bitmap data has each scanline padded to 4
