@@ -7399,13 +7399,39 @@ vt_process:
     dec dword [utf8_remaining]
     cmp dword [utf8_remaining], 0
     jne .vtp_loop            ; more bytes coming
-    ; Complete: dispatch BMP to grid_put_char as before; route non-BMP
-    ; codepoints (the SMP emoji blocks) into the emoji cache so they
-    ; can be rendered via XRender Composite. Falls back to U+FFFD if
-    ; RENDER isn't available or the cache is full.
+    ; Complete: dispatch BMP non-emoji codepoints to grid_put_char as
+    ; before; route SMP codepoints AND specific BMP emoji blocks into
+    ; the emoji cache so they can be rendered via XRender Composite.
+    ; Falls back to U+FFFD if RENDER isn't available or the cache is
+    ; full.
+    ;
+    ; BMP emoji ranges routed through pango/CBDT (the Unicode blocks
+    ; that contain emoji-by-default codepoints per TR51):
+    ;   2300..23FF  Misc Technical (⌚⌛⏰⏳…)
+    ;   2600..26FF  Misc Symbols   (☀☁☂☔…)
+    ;   2700..27BF  Dingbats       (✅✊✋❌…) ← original bug case
+    ;   2B00..2BFF  Misc Symbols and Arrows (⬆⭐…)
+    ; Non-emoji glyphs in those ranges still render via pango (which
+    ; falls back through the system font stack), so we don't lose
+    ; coverage for things like ⌘ ⌥ that the X11 font might have.
     mov eax, [utf8_char]
     cmp eax, 0xFFFF
-    jle .vtp_put_char_bmp
+    jg .vtp_put_emoji
+    ; BMP — check the emoji ranges before falling through to text path.
+    cmp eax, 0x2300
+    jl .vtp_put_char_bmp
+    cmp eax, 0x23FF
+    jle .vtp_put_emoji
+    cmp eax, 0x2600
+    jl .vtp_put_char_bmp
+    cmp eax, 0x27BF
+    jle .vtp_put_emoji
+    cmp eax, 0x2B00
+    jl .vtp_put_char_bmp
+    cmp eax, 0x2BFF
+    jle .vtp_put_emoji
+    jmp .vtp_put_char_bmp
+.vtp_put_emoji:
     cmp dword [render_major], 0
     je .vtp_put_emoji_fallback
     push rax
