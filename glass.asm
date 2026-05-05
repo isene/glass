@@ -775,6 +775,21 @@ scroll_lines:       resq 1          ; number of lines stored
 scroll_write_pos:   resq 1          ; circular write position
 scroll_offset:      resq 1          ; current view offset (0 = live)
 
+; Synchronized output (DECSET 2026) — defer ConfigureNotify resize
+; application while a sync block is in flight. CC (and other modern
+; TUIs) wrap each frame in CSI ?2026h ... CSI ?2026l. If a window
+; resize lands mid-frame and we apply it immediately, CC's CUP
+; commands for OLD-size positions get clamped to the NEW (smaller)
+; bounds in vtp_csi_cup, corrupting the rendered cells. Then CC's
+; next frame diff (against CC's internal model, not the actual
+; screen) skips the corrupted cells and the user sees persistent
+; garbage. Deferring the resize until 2026l lets CC's frame complete
+; cleanly at OLD bounds before grid_rows/cols change.
+sync_active:         resb 1         ; 1 = inside DECSET 2026 sync block
+pending_resize_set:  resb 1         ; 1 = ConfigureNotify deferred
+pending_resize_w:    resw 1         ; new window width to apply
+pending_resize_h:    resw 1         ; new window height to apply
+
 ; Selection
 sel_active:         resq 1          ; 1 = selection in progress
 sel_start_row:      resq 1
@@ -5565,172 +5580,25 @@ handle_x11_events:
     push rbx
     push r12
     movzx eax, word [x11_buf + rbx + 20]
-    mov [win_width], rax
+    mov r12, rax                         ; width
     movzx eax, word [x11_buf + rbx + 22]
-    mov [win_height], rax
-    ; Recalculate grid size
-    mov rax, [win_width]
-    movzx ecx, word [char_width]
-    test ecx, ecx
-    jz .hxe_cfg_done
-    xor edx, edx
-    div rcx
-    cmp rax, MAX_COLS
-    jle .hxe_cfg_cols_ok
-    mov rax, MAX_COLS
-.hxe_cfg_cols_ok:
-    mov [grid_cols], rax
-    mov rax, [win_height]
-    movzx ecx, word [char_height]
-    test ecx, ecx
-    jz .hxe_cfg_done
-    xor edx, edx
-    div rcx
-    cmp rax, MAX_ROWS
-    jle .hxe_cfg_rows_ok
-    mov rax, MAX_ROWS
-.hxe_cfg_rows_ok:
-    mov [grid_rows], rax
-    ; Only resize PTY if dimensions actually changed
-    mov rax, [grid_cols]
-    cmp rax, [prev_grid_cols]
-    jne .hxe_cfg_resize
-    mov rax, [grid_rows]
-    cmp rax, [prev_grid_rows]
-    je .hxe_cfg_done
-.hxe_cfg_resize:
-    mov rax, [grid_cols]
-    mov [prev_grid_cols], rax
-    mov rax, [grid_rows]
-    mov [prev_grid_rows], rax
-    ; Clamp scroll region + cursor + saved cursor to the new grid bounds.
-    ; A shorter window (e.g. tile vertical-split) leaves scroll_bottom
-    ; pointing past grid_rows-1 if the child app set DECSTBM at the old
-    ; height (vim sends `\x1b[1;55r` in 55-row layouts; if we resize to
-    ; 25 rows the scroll region still claims rows 0..54). Subsequent
-    ; index/scroll operations then walk past the visible grid and
-    ; mash up the rendered output. Clamp on every resize so the next
-    ; SIGWINCH-driven full repaint from the child lands in valid bounds.
-    mov rax, [grid_rows]
-    test rax, rax
-    jz .hxe_cfg_clamp_done
-    dec rax                            ; rax = max-row index
-    cmp [scroll_bottom], rax
-    jbe .hxe_cfg_clamp_st
-    mov [scroll_bottom], rax
-.hxe_cfg_clamp_st:
-    cmp [scroll_top], rax
-    jbe .hxe_cfg_clamp_cur_row
-    mov [scroll_top], rax
-.hxe_cfg_clamp_cur_row:
-    cmp [cursor_row], rax
-    jbe .hxe_cfg_clamp_alt_row
-    mov [cursor_row], rax
-.hxe_cfg_clamp_alt_row:
-    cmp [alt_cursor_row], rax
-    jbe .hxe_cfg_clamp_saved_row
-    mov [alt_cursor_row], rax
-.hxe_cfg_clamp_saved_row:
-    cmp [cursor_saved_row], rax
-    jbe .hxe_cfg_clamp_alt_saved_row
-    mov [cursor_saved_row], rax
-.hxe_cfg_clamp_alt_saved_row:
-    cmp [alt_saved_cursor_row], rax
-    jbe .hxe_cfg_clamp_col
-    mov [alt_saved_cursor_row], rax
-.hxe_cfg_clamp_col:
-    mov rax, [grid_cols]
-    test rax, rax
-    jz .hxe_cfg_clamp_done
-    dec rax                            ; rax = max-col index
-    cmp [cursor_col], rax
-    jbe .hxe_cfg_clamp_alt_col
-    mov [cursor_col], rax
-.hxe_cfg_clamp_alt_col:
-    cmp [alt_cursor_col], rax
-    jbe .hxe_cfg_clamp_saved_col
-    mov [alt_cursor_col], rax
-.hxe_cfg_clamp_saved_col:
-    cmp [cursor_saved_col], rax
-    jbe .hxe_cfg_clamp_alt_saved_col
-    mov [cursor_saved_col], rax
-.hxe_cfg_clamp_alt_saved_col:
-    cmp [alt_saved_cursor_col], rax
-    jbe .hxe_cfg_clamp_done
-    mov [alt_saved_cursor_col], rax
-.hxe_cfg_clamp_done:
-    ; Resize PTY. Fill ws_xpixel/ws_ypixel so kitty-graphics clients
-    ; (pointer, etc.) can size images to the actual pane in pixels.
-    sub rsp, 8
-    movzx eax, word [grid_rows]
-    mov word [rsp], ax        ; ws_row
-    movzx eax, word [grid_cols]
-    mov word [rsp+2], ax      ; ws_col
-    movzx eax, word [grid_cols]
-    movzx ecx, word [char_width]
-    imul eax, ecx
-    mov word [rsp+4], ax      ; ws_xpixel
-    movzx eax, word [grid_rows]
-    movzx ecx, word [char_height]
-    imul eax, ecx
-    mov word [rsp+6], ax      ; ws_ypixel
-    mov rax, SYS_IOCTL
-    mov rdi, [pty_master]
-    mov rsi, TIOCSWINSZ
-    mov rdx, rsp
-    syscall
-    add rsp, 8
-    ; If child not yet forked, fork it now (with correct dimensions)
-    cmp qword [child_forked], 0
-    jne .hxe_cfg_send_winch
-    mov qword [child_forked], 1
-    push rbx
-    push r12
-    call pty_fork
-    pop r12
-    pop rbx
-    jmp .hxe_cfg_done
-.hxe_cfg_send_winch:
-    ; Send SIGWINCH to child process group
-    mov rax, SYS_KILL
-    mov rdi, [child_pid]
-    neg rdi                   ; negative pid = process group
-    mov rsi, SIGWINCH
-    syscall
-    ; Resize invalidates the dirty-tracking mirror: prev_paint_grid is
-    ; sized for the previous dimensions, the back-buffer pixmap was
-    ; reallocated, and rows past the new height/width have stale ink.
-    mov qword [all_dirty], 1
-.hxe_cfg_done:
-    ; Pseudo-transparency setup is a one-shot. We must NOT re-run
-    ; setup_pseudo_transparency from inside the CN handler at runtime:
-    ; it issues round-trips via x11_drain_until_reply, which reads
-    ; replies INTO x11_buf — the same buffer the chunk-dispatch loop is
-    ; walking. The MapNotify and Expose right after the workspace-
-    ; switch CN get clobbered, the Expose-driven request_render never
-    ; fires, and pseudo-transparent panes come up blank in non-tabbed
-    ; layouts. (Tabbed dodged it because that path doesn't go through
-    ; configure_window_rect.)
-    ;
-    ; Gate on pseudo_full — the truthful "pseudo is currently active"
-    ; flag — rather than pseudo_setup_done, which Alt+t / Mod1+t
-    ; (opacity_toggle_apply) explicitly resets to 0 every time it
-    ; flips pseudo on. With pseudo_full as the gate, we set up pseudo
-    ; exactly once per session: at the first CN if it was configured
-    ; via .glassrc, and on toggle-on (which calls setup_pseudo
-    ; directly, no CN-handler dependency). Layout cycles that move
-    ; the window will have a stale wallpaper crop; user can refresh
-    ; with Alt+t-twice.
-    cmp byte [cfg_opacity_set], 1
-    jne .hxe_cfg_no_pseudo
-    cmp byte [compositor_active], 1
-    je .hxe_cfg_no_pseudo
-    cmp byte [pseudo_full], 1
-    je .hxe_cfg_no_pseudo
-    mov byte [pseudo_setup_done], 1
-    call setup_pseudo_transparency
-    call request_render
-.hxe_cfg_no_pseudo:
+    ; If a CC synchronized-output block (DECSET 2026) is in flight,
+    ; defer this resize until 2026l arrives. Otherwise CC's OLD-size
+    ; CUP commands hit vtp_csi_cup with a smaller grid_rows/cols and
+    ; get clamped, corrupting the cells. The deferred handler below
+    ; (in .vtp_sync_off) calls apply_window_resize once the frame
+    ; finishes, so CC's frame writes complete at OLD bounds first.
+    cmp byte [sync_active], 0
+    je .hxe_cfg_apply_now
+    mov word [pending_resize_w], r12w
+    mov word [pending_resize_h], ax
+    mov byte [pending_resize_set], 1
+    jmp .hxe_cfg_done_skip_apply
+.hxe_cfg_apply_now:
+    mov rdi, r12
+    mov rsi, rax
+    call apply_window_resize
+.hxe_cfg_done_skip_apply:
     pop r12
     pop rbx
     add rbx, 32
@@ -6509,6 +6377,168 @@ handle_x11_events:
     syscall
 
 .hxe_done:
+    pop r12
+    pop rbx
+    ret
+
+; apply_window_resize — actually apply a configure-notify resize.
+;   rdi = new window width (pixels)
+;   rsi = new window height (pixels)
+; Updates win_*/grid_*, clamps cursor positions, sends TIOCSWINSZ +
+; SIGWINCH (or pty_forks if first time), and triggers pseudo-
+; transparency setup if applicable. Called from .hxe_configure for
+; immediate resizes, and from .vtp_sync_off when a deferred resize
+; (held off across a CC DECSET 2026 sync block) is unblocked at the
+; end of the frame. Lives outside handle_x11_events so the .hxe_*
+; local labels in that function aren't shadowed by labels here.
+apply_window_resize:
+    push rbx
+    push r12
+    mov [win_width], rdi
+    mov [win_height], rsi
+    ; Recalculate grid size
+    mov rax, [win_width]
+    movzx ecx, word [char_width]
+    test ecx, ecx
+    jz .awr_done
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_COLS
+    jle .awr_cols_ok
+    mov rax, MAX_COLS
+.awr_cols_ok:
+    mov [grid_cols], rax
+    mov rax, [win_height]
+    movzx ecx, word [char_height]
+    test ecx, ecx
+    jz .awr_done
+    xor edx, edx
+    div rcx
+    cmp rax, MAX_ROWS
+    jle .awr_rows_ok
+    mov rax, MAX_ROWS
+.awr_rows_ok:
+    mov [grid_rows], rax
+    ; Only resize PTY if dimensions actually changed
+    mov rax, [grid_cols]
+    cmp rax, [prev_grid_cols]
+    jne .awr_resize
+    mov rax, [grid_rows]
+    cmp rax, [prev_grid_rows]
+    je .awr_done
+.awr_resize:
+    mov rax, [grid_cols]
+    mov [prev_grid_cols], rax
+    mov rax, [grid_rows]
+    mov [prev_grid_rows], rax
+    ; Clamp scroll region + cursor + saved cursor to the new grid bounds.
+    ; A shorter window (e.g. tile vertical-split) leaves scroll_bottom
+    ; pointing past grid_rows-1 if the child app set DECSTBM at the old
+    ; height (vim sends `\x1b[1;55r` in 55-row layouts; if we resize to
+    ; 25 rows the scroll region still claims rows 0..54). Subsequent
+    ; index/scroll operations then walk past the visible grid and
+    ; mash up the rendered output. Clamp on every resize so the next
+    ; SIGWINCH-driven full repaint from the child lands in valid bounds.
+    mov rax, [grid_rows]
+    test rax, rax
+    jz .awr_clamp_done
+    dec rax                            ; rax = max-row index
+    cmp [scroll_bottom], rax
+    jbe .awr_clamp_st
+    mov [scroll_bottom], rax
+.awr_clamp_st:
+    cmp [scroll_top], rax
+    jbe .awr_clamp_cur_row
+    mov [scroll_top], rax
+.awr_clamp_cur_row:
+    cmp [cursor_row], rax
+    jbe .awr_clamp_alt_row
+    mov [cursor_row], rax
+.awr_clamp_alt_row:
+    cmp [alt_cursor_row], rax
+    jbe .awr_clamp_saved_row
+    mov [alt_cursor_row], rax
+.awr_clamp_saved_row:
+    cmp [cursor_saved_row], rax
+    jbe .awr_clamp_alt_saved_row
+    mov [cursor_saved_row], rax
+.awr_clamp_alt_saved_row:
+    cmp [alt_saved_cursor_row], rax
+    jbe .awr_clamp_col
+    mov [alt_saved_cursor_row], rax
+.awr_clamp_col:
+    mov rax, [grid_cols]
+    test rax, rax
+    jz .awr_clamp_done
+    dec rax                            ; rax = max-col index
+    cmp [cursor_col], rax
+    jbe .awr_clamp_alt_col
+    mov [cursor_col], rax
+.awr_clamp_alt_col:
+    cmp [alt_cursor_col], rax
+    jbe .awr_clamp_saved_col
+    mov [alt_cursor_col], rax
+.awr_clamp_saved_col:
+    cmp [cursor_saved_col], rax
+    jbe .awr_clamp_alt_saved_col
+    mov [cursor_saved_col], rax
+.awr_clamp_alt_saved_col:
+    cmp [alt_saved_cursor_col], rax
+    jbe .awr_clamp_done
+    mov [alt_saved_cursor_col], rax
+.awr_clamp_done:
+    ; Resize PTY. Fill ws_xpixel/ws_ypixel so kitty-graphics clients
+    ; (pointer, etc.) can size images to the actual pane in pixels.
+    sub rsp, 8
+    movzx eax, word [grid_rows]
+    mov word [rsp], ax        ; ws_row
+    movzx eax, word [grid_cols]
+    mov word [rsp+2], ax      ; ws_col
+    movzx eax, word [grid_cols]
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rsp+4], ax      ; ws_xpixel
+    movzx eax, word [grid_rows]
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rsp+6], ax      ; ws_ypixel
+    mov rax, SYS_IOCTL
+    mov rdi, [pty_master]
+    mov rsi, TIOCSWINSZ
+    mov rdx, rsp
+    syscall
+    add rsp, 8
+    ; If child not yet forked, fork it now (with correct dimensions)
+    cmp qword [child_forked], 0
+    jne .awr_send_winch
+    mov qword [child_forked], 1
+    call pty_fork
+    jmp .awr_done
+.awr_send_winch:
+    ; Send SIGWINCH to child process group
+    mov rax, SYS_KILL
+    mov rdi, [child_pid]
+    neg rdi                   ; negative pid = process group
+    mov rsi, SIGWINCH
+    syscall
+    ; Resize invalidates the dirty-tracking mirror: prev_paint_grid is
+    ; sized for the previous dimensions, the back-buffer pixmap was
+    ; reallocated, and rows past the new height/width have stale ink.
+    mov qword [all_dirty], 1
+.awr_done:
+    ; Pseudo-transparency setup is a one-shot. Gated on pseudo_full
+    ; (the truthful "pseudo is currently active" flag) so we set up
+    ; pseudo exactly once per session.
+    cmp byte [cfg_opacity_set], 1
+    jne .awr_no_pseudo
+    cmp byte [compositor_active], 1
+    je .awr_no_pseudo
+    cmp byte [pseudo_full], 1
+    je .awr_no_pseudo
+    mov byte [pseudo_setup_done], 1
+    call setup_pseudo_transparency
+    call request_render
+.awr_no_pseudo:
     pop r12
     pop rbx
     ret
@@ -8195,6 +8225,8 @@ vt_process:
     je .vtp_mouse_sgr_on
     cmp eax, 2004
     je .vtp_bracketed_paste_on
+    cmp eax, 2026
+    je .vtp_sync_on
     jmp .vtp_loop
 
 ; CSI ? N l - DECRST (reset mode)
@@ -8218,6 +8250,27 @@ vt_process:
     je .vtp_mouse_sgr_off
     cmp eax, 2004
     je .vtp_bracketed_paste_off
+    cmp eax, 2026
+    je .vtp_sync_off
+    jmp .vtp_loop
+
+; DECSET/DECRST 2026 — synchronized output mode. Used by modern TUIs
+; (Claude Code, etc.) to wrap each render frame so the terminal can
+; coalesce updates. We don't double-buffer rendering, but we DO use
+; the sync window to defer ConfigureNotify resize application until
+; the in-flight frame finishes. See sync_active comments at BSS for
+; the full rationale.
+.vtp_sync_on:
+    mov byte [sync_active], 1
+    jmp .vtp_loop
+.vtp_sync_off:
+    mov byte [sync_active], 0
+    cmp byte [pending_resize_set], 0
+    je .vtp_loop
+    mov byte [pending_resize_set], 0
+    movzx edi, word [pending_resize_w]
+    movzx esi, word [pending_resize_h]
+    call apply_window_resize
     jmp .vtp_loop
 
 ; DECSET/DECRST handlers
@@ -8728,12 +8781,20 @@ vt_process:
     jl .vtp_stbm_default_bot
     mov eax, [vt_params + 4]
     test eax, eax
-    jnz .vtp_stbm_bot
-.vtp_stbm_default_bot:
-    mov rax, [grid_rows]
-.vtp_stbm_bot:
-    dec eax                  ; 0-based
+    jz .vtp_stbm_default_bot
+    dec eax                  ; 0-based explicit bottom
     mov [scroll_bottom], rax
+    jmp .vtp_stbm_home
+.vtp_stbm_default_bot:
+    ; No explicit bottom → store 0 sentinel so the LF/scroll/clamp
+    ; paths track grid_rows-1 dynamically across resize. Storing
+    ; grid_rows-1 here (the prior behaviour) was the cause of the
+    ; "vertical layout sets the new size forever" bug: shrink would
+    ; clamp the explicit bottom, grow couldn't reverse it because
+    ; the clamp only goes downward, and CC has no reason to re-issue
+    ; CSI r between layout changes.
+    mov qword [scroll_bottom], 0
+.vtp_stbm_home:
     ; Move cursor to home
     mov qword [cursor_row], 0
     mov qword [cursor_col], 0
@@ -9701,6 +9762,125 @@ grid_scroll_region_up:
     pop rbx
     ret
 
+; shrink_scroll_up_one — scroll the FULL old-grid (rows 0..prev_grid_rows-1)
+; up by ONE row, pushing the topmost row into scrollback. Called only
+; from the ConfigureNotify shrink path, while prev_grid_rows still
+; holds the OLD (larger) value. Independent of scroll_top/scroll_bottom
+; (DECSTBM region) — we want the entire grid to slide, not just the
+; inner region. Preserves all caller registers.
+shrink_scroll_up_one:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r13
+
+    ; Save grid row 0 to scroll_buf at scroll_write_pos.
+    mov rax, [scroll_write_pos]
+    imul r13, rax, MAX_COLS * CELL_SIZE
+    xor ecx, ecx
+    mov rdx, [grid_cols]
+.shr_save_row:
+    cmp rcx, rdx
+    jge .shr_save_pad
+    mov rax, rcx
+    imul rax, CELL_SIZE
+    mov r8, [grid + rax]
+    mov [scroll_buf + r13 + rax], r8
+    mov r8, [grid + rax + 8]
+    mov [scroll_buf + r13 + rax + 8], r8
+    inc rcx
+    jmp .shr_save_row
+.shr_save_pad:
+    ; Pad to MAX_COLS with default cells so a later wider grid doesn't
+    ; show garbage when re-displaying this scrollback row.
+.shr_save_pad_loop:
+    cmp rcx, MAX_COLS
+    jge .shr_save_done
+    mov rax, rcx
+    imul rax, CELL_SIZE
+    mov qword [scroll_buf + r13 + rax], DEFAULT_CELL_LO
+    mov qword [scroll_buf + r13 + rax + 8], 0
+    inc rcx
+    jmp .shr_save_pad_loop
+.shr_save_done:
+
+    ; Advance scroll_write_pos with 1000-row wrap.
+    mov rax, [scroll_write_pos]
+    inc rax
+    cmp rax, 1000
+    jl .shr_no_wrap
+    xor eax, eax
+.shr_no_wrap:
+    mov [scroll_write_pos], rax
+
+    ; Increment scroll_lines (clamped at 1000).
+    mov rax, [scroll_lines]
+    cmp rax, 1000
+    jge .shr_lines_ok
+    inc rax
+    mov [scroll_lines], rax
+.shr_lines_ok:
+
+    ; If user is currently in scrollback view (scroll_offset > 0),
+    ; bump scroll_offset so their viewport tracks the same content.
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .shr_off_done
+    mov rcx, [scroll_lines]
+    inc rax
+    cmp rax, rcx
+    jle .shr_off_set
+    mov rax, rcx
+.shr_off_set:
+    mov [scroll_offset], rax
+.shr_off_done:
+
+    ; Shift grid rows 1..(prev_grid_rows-1) → 0..(prev_grid_rows-2).
+    ; Forward-copy with src > dst handles the overlap correctly.
+    mov rcx, [prev_grid_rows]
+    test rcx, rcx
+    jz .shr_clear_bottom
+    dec rcx
+    jz .shr_clear_bottom
+    imul rcx, MAX_COLS * CELL_SIZE
+    lea rdi, [grid]
+    lea rsi, [grid + MAX_COLS * CELL_SIZE]
+    cld
+    rep movsb
+
+.shr_clear_bottom:
+    ; Clear the new-bottom row (prev_grid_rows-1) with default cells
+    ; so the just-vacated row doesn't show stale ink.
+    mov rax, [prev_grid_rows]
+    test rax, rax
+    jz .shr_done
+    dec rax
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rdi, [grid + rax]
+    mov ecx, MAX_COLS
+.shr_clear_loop:
+    test ecx, ecx
+    jz .shr_done
+    mov qword [rdi], DEFAULT_CELL_LO
+    mov qword [rdi+8], 0
+    add rdi, CELL_SIZE
+    dec ecx
+    jmp .shr_clear_loop
+.shr_done:
+    pop r13
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 grid_scroll_up:
     push rbx
     push r12
@@ -9974,6 +10154,15 @@ scroll_view_down:
 ; sel_active. Used by the drag-beyond-edge select-scroll path. Half-a-
 ; screen jumps (the wheel/keyboard contract) are far too aggressive when
 ; the X server delivers a motion event per pixel of pointer travel.
+;
+; If a button-1 drag is in progress (sel_button_held=1), shift
+; sel_start_row in lockstep with the viewport so the user's anchor
+; cell follows the content as it scrolls. Without this, scrolling
+; up by N rows leaves sel_start_row pointing at a different cell
+; (the one that scrolled INTO that screen-row position), and the
+; visual selection appears to detach from its original anchor —
+; the symptom the user calls "Select+scroll doesn't keep selection
+; start". Clamp at the grid edges so the start can't fly off.
 selection_scroll_step_up:
     mov rax, [scroll_offset]
     mov rcx, [scroll_lines]
@@ -9981,7 +10170,26 @@ selection_scroll_step_up:
     jge .sssu_done
     inc rax
     mov [scroll_offset], rax
+    ; Shift selection start down by 1 (content shifted down on screen
+    ; because viewport scrolled up into older history). Do it only
+    ; during an active drag and only while the start is still inside
+    ; the visible grid — once it walks off the bottom, leave it
+    ; pinned there so the selection visually extends from the bottom
+    ; edge of the viewport.
+    cmp qword [sel_button_held], 0
+    je .sssu_done
+    mov rcx, [sel_start_row]
+    mov rdx, [grid_rows]
+    test rdx, rdx
+    jz .sssu_render
+    dec rdx
+    cmp rcx, rdx
+    jge .sssu_render
+    inc rcx
+    mov [sel_start_row], rcx
+.sssu_render:
     call request_render
+    ret
 .sssu_done:
     ret
 
@@ -9991,7 +10199,18 @@ selection_scroll_step_down:
     jz .sssd_done
     dec rax
     mov [scroll_offset], rax
+    ; Shift selection start up by 1 (content shifted up on screen
+    ; because viewport scrolled down toward live). Mirror of _up.
+    cmp qword [sel_button_held], 0
+    je .sssd_render
+    mov rcx, [sel_start_row]
+    test rcx, rcx
+    jz .sssd_render
+    dec rcx
+    mov [sel_start_row], rcx
+.sssd_render:
     call request_render
+    ret
 .sssd_done:
     ret
 
