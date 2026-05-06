@@ -13133,14 +13133,13 @@ rs_row_loop:
     ; onto the window via XRender. Lazy: any not-yet-rendered emoji
     ; gets forked-and-rasterized here on first sight.
     ;
-    ; Skip when scrolled into history. The grid still holds the live
-    ; cells, but the displayed content is scrollback (which doesn't
-    ; carry emoji indices); painting the live emojis at their grid
-    ; (row, col) puts them on top of the wrong content. The user
-    ; reported live emojis "moving along with the scrolling and
-    ; clobbering the text" — that's this pass running unconditionally.
-    cmp qword [scroll_offset], 0
-    jne .rs_emoji_done
+    ; Resolve each (view_row, view_col) through cell_ptr_at_view so the
+    ; pass works in scrollback too — scroll_buf cells carry the same
+    ; CELL_SIZE layout (incl. emoji_idx at +6/7), and the per-cell
+    ; lookup ensures we composite at the correct view position whether
+    ; the underlying cell is in `grid` (live) or `scroll_buf` (history).
+    ; The earlier "skip when scrolled" guard caused wide emoji to
+    ; vanish entirely when the user scrolled back through them.
     cmp dword [render_major], 0
     je .rs_emoji_done
     xor r12d, r12d
@@ -13151,13 +13150,14 @@ rs_row_loop:
 .rs_emoji_col:
     cmp r13, [grid_cols]
     jge .rs_emoji_next_row
-    mov rax, r12
-    imul rax, MAX_COLS
-    add rax, r13
-    imul rax, CELL_SIZE
-    test byte [grid + rax + 4], 8       ; ATTR_IS_EMOJI
+    mov rdi, r12
+    mov rsi, r13
+    call cell_ptr_at_view
+    test rax, rax
+    jz .rs_emoji_inc                    ; out of bounds (shouldn't happen)
+    test byte [rax + 4], 8              ; ATTR_IS_EMOJI
     jz .rs_emoji_inc
-    movzx r14d, word [grid + rax + 6]   ; emoji index
+    movzx r14d, word [rax + 6]          ; emoji index
     cmp r14d, MAX_EMOJI
     jae .rs_emoji_inc
     mov edi, r14d
