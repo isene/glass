@@ -7492,6 +7492,32 @@ vt_process:
     ; falls back through the system font stack), so we don't lose
     ; coverage for things like ⌘ ⌥ that the X11 font might have.
     mov eax, [utf8_char]
+    ; Zero-width codepoints (variation selectors, ZWJ, bidi controls,
+    ; word joiners, BOM): Unicode treats their advance as 0. Glass
+    ; would otherwise route them through the text path and consume
+    ; one cell each, drifting markdown column borders. Most-impactful
+    ; case: U+FE0F (VS16) following emoji like ⚠️ ℹ️ to force emoji
+    ; presentation — without this filter, ⚠️ took 3 cells (2 wide
+    ; emoji + 1 text VS16) when source spacing assumed 2.
+    cmp eax, 0x200B
+    jb .vtp_zw_done
+    cmp eax, 0x200F
+    jbe .vtp_loop                ; ZWSP/ZWNJ/ZWJ/LRM/RLM
+    cmp eax, 0x202A
+    jb .vtp_zw_done
+    cmp eax, 0x202E
+    jbe .vtp_loop                ; bidi format controls
+    cmp eax, 0x2060
+    jb .vtp_zw_done
+    cmp eax, 0x2064
+    jbe .vtp_loop                ; word joiner / function application
+    cmp eax, 0xFE00
+    jb .vtp_zw_done
+    cmp eax, 0xFE0F
+    jbe .vtp_loop                ; variation selectors 1..16
+    cmp eax, 0xFEFF
+    je .vtp_loop                 ; BOM / zero-width no-break space
+.vtp_zw_done:
     cmp eax, 0xFFFF
     jg .vtp_put_emoji
     ; BMP — check the emoji ranges before falling through to text path.
