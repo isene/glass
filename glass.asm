@@ -7190,31 +7190,23 @@ handle_keypress:
     cmp qword [sel_active], 0
     je .hkp_ctrl_l_no_sel
     mov qword [sel_active], 0
-    call selection_release_all
 .hkp_ctrl_l_no_sel:
     mov qword [all_dirty], 1
     call request_render
-    ; selection_release_all + request_render clobber rdx. The fall-
-    ; through to .hkp_send_seq_no_clear writes rdx bytes from
-    ; key_out_buf to the PTY — without this restore, that became
-    ; ~16 bytes of trash (0x0C plus whatever the previous keypress
-    ; left in key_out_buf — `[C` from a right-arrow, `[3~` from
-    ; delete, etc. — which bare echoed straight into its line
-    ; buffer, advancing the cursor).
+    ; request_render clobbers rdx. The fall-through to
+    ; .hkp_send_seq_no_clear writes rdx bytes from key_out_buf to the
+    ; PTY — without this restore, that became ~16 bytes of trash.
     mov rdx, 1
 .hkp_send_seq_no_clear:
-    ; Drop any active mouse selection: an input keystroke means the
-    ; user is done picking text. Without this, typing into a selected
-    ; region leaves the highlight band underneath the typed glyphs
-    ; (and the next paste / Shift+Insert pulls stale content). xterm,
-    ; kitty, and st all do this. selection_release_all clobbers rdx,
-    ; which is the byte count the SYS_WRITE below needs — save it.
+    ; Drop any active mouse selection's visual highlight: an input
+    ; keystroke means the user is done picking text. Keep PRIMARY
+    ; ownership intact — sel_buf still holds the extracted bytes, so
+    ; another app's Shift+Insert (which ConvertSelection's PRIMARY)
+    ; should still get the selected content even after the user
+    ; resumes typing in glass.
     cmp qword [sel_active], 0
     je .hkp_keep_no_sel_clear
-    push rdx
     mov qword [sel_active], 0
-    call selection_release_all
-    pop rdx
     mov qword [all_dirty], 1
 .hkp_keep_no_sel_clear:
     ; Any keystroke that produces input bytes snaps the view back
@@ -8402,10 +8394,11 @@ vt_process:
     je .vtp_loop                ; already on alt screen
     ; Switching to alt screen wipes the user's view; any selection on
     ; the main grid now points at content the user can no longer see.
+    ; Drop the visual highlight but keep PRIMARY ownership — sel_buf
+    ; still holds the extracted bytes, so cross-app paste keeps working.
     cmp qword [sel_active], 0
     je .vtp_alt_on_no_sel
     mov qword [sel_active], 0
-    call selection_release_all
 .vtp_alt_on_no_sel:
     ; Save cursor position
     mov rax, [cursor_row]
@@ -8469,11 +8462,11 @@ vt_process:
     cmp qword [alt_screen_active], 0
     je .vtp_loop                ; already on main screen
     ; Selection on the alt screen no longer matches anything we'll
-    ; show post-restore.
+    ; show post-restore. Drop the visual highlight but keep PRIMARY
+    ; ownership — sel_buf still holds the extracted bytes.
     cmp qword [sel_active], 0
     je .vtp_alt_off_no_sel
     mov qword [sel_active], 0
-    call selection_release_all
 .vtp_alt_off_no_sel:
     ; Drop any kitty-graphics placements from the alt screen so they
     ; don't bleed onto the restored main screen (e.g. pointer leaving
@@ -9754,10 +9747,11 @@ grid_scroll_region_up:
     ; restricted region (top-row banner / bottom-row status bar).
     ; Without this clear, the selection's pixel position stays put
     ; while the underlying text scrolls past — what the user reported.
+    ; Visual only — keep PRIMARY ownership so cross-app Shift+Insert
+    ; still receives sel_buf's already-extracted bytes.
     cmp qword [sel_active], 0
     je .gsru_no_sel_clear
     mov qword [sel_active], 0
-    call selection_release_all
 .gsru_no_sel_clear:
     mov r12, [scroll_top]
     mov r13, [scroll_bottom]
@@ -10012,15 +10006,16 @@ grid_scroll_up:
     push r12
     push r13
 .gsu_entry:
-    ; Any active mouse selection is now meaningless: rows are about to
-    ; shift, so sel_start_row/sel_end_row would still point at display
-    ; positions that no longer hold the user's selected content. Clear
-    ; PRIMARY ownership too so other apps re-poll instead of pasting
-    ; whatever the now-shifted selection extracts.
+    ; Any active mouse selection's HIGHLIGHT is now meaningless: rows
+    ; are about to shift, so sel_start_row/sel_end_row would still
+    ; point at display positions that no longer hold the user's
+    ; selected content. But sel_buf is a flat byte copy taken at
+    ; click-up time — it doesn't decay with the grid. So we keep
+    ; PRIMARY ownership; another app's Shift+Insert still receives
+    ; the bytes the user actually selected.
     cmp qword [sel_active], 0
     je .gsu_no_sel_clear
     mov qword [sel_active], 0
-    call selection_release_all
 .gsu_no_sel_clear:
 
     ; Save top row to scrollback circular buffer before scrolling
@@ -10153,11 +10148,12 @@ grid_scroll_region_down:
     push r12
     push r13
     ; Same rationale as grid_scroll_up: rows are about to shift, so any
-    ; active selection now points at content that's about to move.
+    ; active selection's highlight now points at content that's about
+    ; to move. Visual-only clear; sel_buf still holds the extracted
+    ; bytes, so PRIMARY ownership is preserved.
     cmp qword [sel_active], 0
     je .gsrd_no_sel_clear
     mov qword [sel_active], 0
-    call selection_release_all
 .gsrd_no_sel_clear:
     mov r12, [scroll_top]
     mov r13, [scroll_bottom]
