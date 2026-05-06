@@ -7551,10 +7551,19 @@ vt_process:
     ; matching Unicode EAW=W and Emoji_Presentation=Yes). Source apps
     ; pad columns according to EAW so the cursor must advance 2 cells
     ; for wide chars to keep markdown-table | dividers aligned.
+    ;
+    ; Non-BMP shortcut: every plane-1+ codepoint we route through
+    ; put_emoji (U+1F000+ Misc/Emoticons/Transport/Supplemental, plus
+    ; CJK Ext B-G) is EAW=W in practice. Skip the BMP table scan —
+    ; is_wide_bmp's `cmp ax, dx` would silently truncate the high
+    ; bits and miss anyway, leaving 🚀 🔥 etc. advancing 1 cell.
+    cmp eax, 0xFFFF
+    ja .vtp_put_emoji_wide_set
     push rax
     call is_wide_bmp                  ; CF=1 if codepoint is EAW-wide
     pop rax
     jnc .vtp_put_emoji_narrow
+.vtp_put_emoji_wide_set:
     or byte [cur_attrs], 32           ; ATTR_IS_WIDE
 .vtp_put_emoji_narrow:
     mov eax, 0x20                 ; cell glyph fallback (overlaid by emoji)
