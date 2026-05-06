@@ -3341,6 +3341,98 @@ x11_setup_render:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; is_wide_bmp: ax = BMP codepoint. Returns CF=1 if East Asian Width
+; equals Wide (or has emoji-presentation default), CF=0 otherwise.
+; Covers only the BMP "emoji" ranges glass routes through Pango/CBDT
+; — narrow chars in those ranges (⏺ ⌫ ⏵ etc.) advance the cursor 1
+; cell, wide ones (✅ ⚠ ❌ etc.) advance 2. Per Unicode 15
+; EastAsianWidth + Emoji_Presentation. Linear scan over a small
+; range table; ~30 entries, all hot in icache.
+; ══════════════════════════════════════════════════════════════════════
+is_wide_bmp:
+    push rsi
+    push rcx
+    lea rsi, [rel wide_bmp_ranges]
+    mov ecx, wide_bmp_ranges_count
+.iwb_loop:
+    test ecx, ecx
+    jz .iwb_no
+    movzx edx, word [rsi]            ; range start
+    cmp ax, dx
+    jb .iwb_next                      ; below this range
+    movzx edx, word [rsi + 2]        ; range end (inclusive)
+    cmp ax, dx
+    jbe .iwb_yes
+.iwb_next:
+    add rsi, 4
+    dec ecx
+    jmp .iwb_loop
+.iwb_yes:
+    pop rcx
+    pop rsi
+    stc
+    ret
+.iwb_no:
+    pop rcx
+    pop rsi
+    clc
+    ret
+
+; (start, end-inclusive) pairs of EAW=Wide BMP codepoints in glass's
+; pango-routed emoji ranges. Singletons use start==end. Sorted by
+; start for clarity (the lookup is linear so order doesn't matter
+; for correctness).
+align 2
+wide_bmp_ranges:
+    dw 0x231A, 0x231B                ; WATCH, HOURGLASS
+    dw 0x23E9, 0x23EC                ; FAST FORWARD..PAUSE
+    dw 0x23F0, 0x23F0                ; ALARM CLOCK
+    dw 0x23F3, 0x23F3                ; HOURGLASS WITH FLOWING SAND
+    dw 0x25FD, 0x25FE                ; medium small squares (white/black)
+    dw 0x2614, 0x2615                ; UMBRELLA, HOT BEVERAGE
+    dw 0x2648, 0x2653                ; zodiac signs
+    dw 0x267F, 0x267F                ; WHEELCHAIR
+    dw 0x2693, 0x2693                ; ANCHOR
+    dw 0x26A1, 0x26A1                ; HIGH VOLTAGE
+    dw 0x26AA, 0x26AB                ; medium circles
+    dw 0x26BD, 0x26BE                ; soccer ball, baseball
+    dw 0x26C4, 0x26C5                ; snowman, sun
+    dw 0x26CE, 0x26CE                ; OPHIUCHUS
+    dw 0x26D4, 0x26D4                ; NO ENTRY
+    dw 0x26EA, 0x26EA                ; CHURCH
+    dw 0x26F2, 0x26F3                ; FOUNTAIN, FLAG IN HOLE
+    dw 0x26F5, 0x26F5                ; SAILBOAT
+    dw 0x26FA, 0x26FA                ; TENT
+    dw 0x26FD, 0x26FD                ; FUEL PUMP
+    dw 0x2705, 0x2705                ; ✅ WHITE HEAVY CHECK MARK
+    dw 0x270A, 0x270B                ; ✊ ✋ raised fist / hand
+    dw 0x2728, 0x2728                ; ✨ SPARKLES
+    dw 0x274C, 0x274C                ; ❌ CROSS MARK
+    dw 0x274E, 0x274E                ; ❎ NEGATIVE SQUARED CROSS
+    dw 0x2753, 0x2755                ; question/exclamation marks
+    dw 0x2757, 0x2757                ; ❗ HEAVY EXCLAMATION
+    dw 0x2795, 0x2797                ; heavy plus / minus / division
+    dw 0x27B0, 0x27B0                ; CURLY LOOP
+    dw 0x27BF, 0x27BF                ; DOUBLE CURLY LOOP
+    dw 0x2B1B, 0x2B1C                ; large squares (black/white)
+    dw 0x2B50, 0x2B50                ; ⭐ WHITE MEDIUM STAR
+    dw 0x2B55, 0x2B55                ; ⭕ HEAVY LARGE CIRCLE
+    ; Variation-selector-16-modified chars commonly appearing in
+    ; markdown / chat: the base codepoint is EAW=N or EAW=A, but
+    ; with VS16 (U+FE0F) following, presentation is emoji (wide).
+    ; We don't read VS16 here, so include the base codepoints used
+    ; in practice as a heuristic.
+    dw 0x26A0, 0x26A0                ; ⚠ WARNING SIGN (often ⚠️ with VS16)
+    dw 0x2139, 0x2139                ; ℹ INFORMATION SOURCE
+    dw 0x2122, 0x2122                ; ™ TRADE MARK
+    dw 0x21A9, 0x21AA                ; LEFT/RIGHT-WARDS ARROW WITH HOOK
+    dw 0x2934, 0x2935                ; arrow up/down right
+    dw 0x2B05, 0x2B07                ; arrows left/up/down
+    dw 0x2B06, 0x2B06                ; UPWARDS BLACK ARROW
+wide_bmp_ranges_end:
+wide_bmp_ranges_count equ (wide_bmp_ranges_end - wide_bmp_ranges) / 4
+
+; ══════════════════════════════════════════════════════════════════════
 ; find_or_alloc_emoji: edi = 32-bit codepoint. Returns rax = emoji
 ; index (>= 0), or -1 if the cache is full. Linear search — N is
 ; small (max 1024) and emoji are sticky (same set on each refresh).
@@ -7435,9 +7527,21 @@ vt_process:
     mov [cur_emoji_index], ax
     or byte [cur_attrs], 8       ; ATTR_IS_EMOJI
     pop rax
+    ; Per-codepoint East Asian Width = Wide check. Pango renders most
+    ; chars in our routed BMP "emoji" ranges as 1-cell glyphs (⏺ ⌫ ⏵
+    ; etc.); a smaller subset is rendered 2 cells wide (✅ ⚠ ❌ etc.,
+    ; matching Unicode EAW=W and Emoji_Presentation=Yes). Source apps
+    ; pad columns according to EAW so the cursor must advance 2 cells
+    ; for wide chars to keep markdown-table | dividers aligned.
+    push rax
+    call is_wide_bmp                  ; CF=1 if codepoint is EAW-wide
+    pop rax
+    jnc .vtp_put_emoji_narrow
+    or byte [cur_attrs], 32           ; ATTR_IS_WIDE
+.vtp_put_emoji_narrow:
     mov eax, 0x20                 ; cell glyph fallback (overlaid by emoji)
     call grid_put_char
-    and byte [cur_attrs], ~8
+    and byte [cur_attrs], ~(8 | 32)   ; clear ATTR_IS_EMOJI + ATTR_IS_WIDE
     jmp .vtp_loop
 .vtp_put_emoji_fallback_pop:
     pop rax
@@ -9389,22 +9493,22 @@ grid_put_char:
     mov ecx, [cur_bg_pixel]
     mov [grid + rbx + 12], ecx       ; [12-15] bg pixel
 
-    ; (v0.3.25's emoji EAW=W pad-cell write reverted in v0.3.30; the
-    ; 2026-05-06 advance-2-for-ATTR_IS_EMOJI variant also reverted —
-    ; the BMP "emoji" ranges 0x2300-0x23FF / 0x2600-0x26FF / 0x2700-
-    ; 0x27BF / 0x2B00-0x2BFF contain narrow-width symbols (⏺ U+23FA,
-    ; ⌫ U+232B, ⏵ U+23F5, etc.) whose Pango bitmap is 1 cell wide. An
-    ; unconditional 2-cell advance pushed every following char one
-    ; column right and trashed dense TUI layouts, eventually wedging a
-    ; full session. Cursor advances 1 cell for ALL chars, and color-
-    ; emoji bitmaps that are 2 cells wide just visually overflow into
-    ; the right-half cell — same as kitty's graphics-style overflow.
-    ; Markdown table alignment in rows containing wide emoji breaks
-    ; cosmetically; the cure was worse than the disease.)
+    ; Cursor advance: 1 cell for normal chars, 2 cells for chars marked
+    ; ATTR_IS_WIDE (set in .vtp_put_emoji when the codepoint is in the
+    ; wide_bmp_ranges table — Unicode EAW=W or Emoji_Presentation). The
+    ; 2025-05 pad-cell variant and the 2026-05-06 advance-2-for-
+    ; ATTR_IS_EMOJI variant both broke dense TUIs because they applied
+    ; advance-2 too broadly: many "emoji" codepoints (⏺ ⌫ ⏵ etc.) are
+    ; rendered 1 cell wide by Pango. Only ATTR_IS_WIDE chars actually
+    ; warrant the 2-cell step; everything else gets 1.
     ;
     ; Advance cursor
     mov rax, [cursor_col]
     inc rax
+    test byte [cur_attrs], 32                ; ATTR_IS_WIDE
+    jz .gpc_adv_check
+    inc rax                                  ; wide: advance by 2 total
+.gpc_adv_check:
     cmp rax, [grid_cols]
     jl .gpc_ok
     ; Reached past the last column.
