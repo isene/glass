@@ -829,6 +829,15 @@ url_str_pos:        resq 1
 hover_url_idx:      resq 1          ; signed; -1 = no hover
 hover_url_pressed:  resb 1          ; 1 between press-on-url and release
 
+; OSC 8 hyperlink hover state. Maintained alongside hover_url_idx so
+; cells in the scrollback buffer (where url_list entries don't reach)
+; still get the blue-underline cue. Computed by motion handler via
+; cell_ptr_at_view + a one-row run-find.
+hover_osc8_id:        resb 1        ; non-zero ⇒ hovering an OSC 8 cell
+hover_osc8_row:       resd 1        ; view row of the hover (0..grid_rows-1)
+hover_osc8_col_start: resd 1
+hover_osc8_col_end:   resd 1        ; inclusive
+
 ; Logging — see log_open_glass / log_write_buf in .text. fd=0 means
 ; "log file unavailable" (kernel never returns 0 from open with
 ; stdin still open).
@@ -5650,45 +5659,23 @@ handle_x11_events:
     cmp qword [mouse_tracking], 0
     jne .hxe_bp_mouse_report
 
-    ; Normal click: start selection (button 1 only)
+    ; Normal click: start selection (button 1 only).
     cmp r13d, 1
     jne .hxe_bp_done2
-    ; If the pointer is currently hovering a URL, plain button-1 press
-    ; opens it (no Ctrl required) and short-circuits the selection
-    ; start. Hover state was set by the motion handler. Drag-from-URL
-    ; isn't supported — copy URL text via Ctrl+drag if needed.
-    ; Save row (rax) and col (r12) on the stack so the selection
-    ; fall-through still has them — the hover_url_idx load below
-    ; clobbers rax, and a -1 idx (no hover) used to leak that into
-    ; sel_start_row, breaking every selection until next click.
+    ; First try URL-open-at-cell. url_open_at handles BOTH the OSC 8
+    ; hyperlink id (cell[5]) AND url_list heuristic URLs, and uses
+    ; cell_ptr_at_view internally so OSC 8 cells in the scrollback
+    ; buffer are clickable too. Returns 1 if it opened a URL,
+    ; 0 if no URL was at (row, col). Save row/col across the call
+    ; since the selection fall-through needs them.
     push rax
     push r12
-    mov rax, [hover_url_idx]
+    mov rdi, rax                                ; view_row
+    mov rsi, r12                                ; view_col
+    call url_open_at
     test rax, rax
-    js .hxe_bp_no_hover_url
-    mov rdi, rax
-    imul rdi, 24
-    mov r14d, [url_list + rdi + 8]             ; str_offset
-    add rsp, 16                                 ; drop saved row/col
-    mov rax, SYS_FORK
-    syscall
-    test rax, rax
-    jnz .hxe_bp_url_done                       ; parent
-    sub rsp, 32
-    lea rax, [xdg_open]
-    mov [rsp], rax
-    lea rax, [url_strings + r14]
-    mov [rsp + 8], rax
-    mov qword [rsp + 16], 0
-    mov rax, SYS_EXECVE
-    lea rdi, [xdg_open]
-    mov rsi, rsp
-    mov rdx, [envp]
-    syscall
-    mov rdi, 1
-    mov rax, SYS_EXIT
-    syscall
-.hxe_bp_url_done:
+    jz .hxe_bp_no_hover_url                     ; not a URL → fall to selection
+    add rsp, 16                                  ; drop saved row/col
     jmp .hxe_bp_done2
 .hxe_bp_no_hover_url:
     pop r12
@@ -5937,24 +5924,30 @@ handle_x11_events:
     ; eax = row
 
     ; Hover detection. Skip while button is held — that's a drag,
-    ; not a hover. Hovering a URL cell sets hover_url_idx so the
+    ; not a hover. Hovering a URL cell sets hover_url_idx (or
+    ; hover_osc8_id, for cells in the scrollback buffer) so the
     ; render pass draws an underline at the URL's columns; entering
     ; / leaving forces a repaint.
     cmp qword [sel_button_held], 1
     je .hxe_mn_drag_path
     push rax
     push r12
+    ; --- url_list-based hover (live grid only) ---
     mov rdi, rax
     mov rsi, r12
     call url_at_cell                          ; eax = idx or -1
     movsxd rcx, eax                           ; sign-extend (eax may be -1)
     mov rdx, [hover_url_idx]
     cmp rcx, rdx
-    je .hxe_mn_hover_same
+    je .hxe_mn_hover_url_same
     mov [hover_url_idx], rcx
     mov qword [all_dirty], 1
     call request_render
-.hxe_mn_hover_same:
+.hxe_mn_hover_url_same:
+    ; --- OSC 8 hover (works in scrollback too, via cell_ptr_at_view) ---
+    mov rdi, [rsp + 8]                        ; saved row
+    mov rsi, [rsp]                            ; saved col
+    call osc8_hover_check                     ; updates hover_osc8_*
     pop r12
     pop rax
     jmp .hxe_mn_done
@@ -9396,16 +9389,19 @@ grid_put_char:
     mov ecx, [cur_bg_pixel]
     mov [grid + rbx + 12], ecx       ; [12-15] bg pixel
 
-    ; (v0.3.25's emoji EAW=W pad-cell write reverted in v0.3.30 — it
-    ; created more bugs than it solved: cursor stepped into the middle
-    ; of every emoji, selection_extract emitted spurious spaces from
-    ; the pad cells, scroll-pause work needed extra dance to dodge it,
-    ; and the wrap-mangling symptom it was meant to fix was never
-    ; reproducible. Emoji bitmaps render 2 cells wide visually but the
-    ; cursor advances 1 cell per emoji — same as kitty-graphics-style
-    ; visual overflow. The emoji-overlay pass runs LAST so the bitmap
-    ; covers any text in the right-half cell.)
-
+    ; (v0.3.25's emoji EAW=W pad-cell write reverted in v0.3.30; the
+    ; 2026-05-06 advance-2-for-ATTR_IS_EMOJI variant also reverted —
+    ; the BMP "emoji" ranges 0x2300-0x23FF / 0x2600-0x26FF / 0x2700-
+    ; 0x27BF / 0x2B00-0x2BFF contain narrow-width symbols (⏺ U+23FA,
+    ; ⌫ U+232B, ⏵ U+23F5, etc.) whose Pango bitmap is 1 cell wide. An
+    ; unconditional 2-cell advance pushed every following char one
+    ; column right and trashed dense TUI layouts, eventually wedging a
+    ; full session. Cursor advances 1 cell for ALL chars, and color-
+    ; emoji bitmaps that are 2 cells wide just visually overflow into
+    ; the right-half cell — same as kitty's graphics-style overflow.
+    ; Markdown table alignment in rows containing wide emoji breaks
+    ; cosmetically; the cure was worse than the disease.)
+    ;
     ; Advance cursor
     mov rax, [cursor_col]
     inc rax
@@ -10133,6 +10129,8 @@ scroll_view_up:
     ; a SelectionClear event back to glass that falls through the
     ; unhandled-event dispatch and produces user-visible side effects.
     mov qword [sel_active], 0
+    mov qword [hover_url_idx], -1
+    mov byte  [hover_osc8_id], 0
     mov rax, [scroll_offset]
     mov rbx, [grid_rows]
     shr rbx, 1                       ; scroll by half a screen
@@ -10156,6 +10154,8 @@ scroll_view_up:
 scroll_view_down:
     push rbx
     mov qword [sel_active], 0
+    mov qword [hover_url_idx], -1
+    mov byte  [hover_osc8_id], 0
     mov rax, [scroll_offset]
     test rax, rax
     jz .svd_done                     ; already at live view
@@ -12768,6 +12768,86 @@ rs_row_loop:
     pop rbx
 .rs_hover_url_done:
 
+    ; ─── OSC 8 hover underline (works in scrollback) ──────────────────
+    cmp byte [hover_osc8_id], 0
+    je .rs_hover_osc8_done
+    push rbx
+    push r13
+    push r14
+    push r15
+    mov r13d, [hover_osc8_row]
+    mov r14d, [hover_osc8_col_start]
+    mov ecx, [hover_osc8_col_end]
+    sub ecx, r14d
+    inc ecx
+    mov r15d, ecx                             ; span cells
+    test r15d, r15d
+    jle .rs_hover_osc8_unwind
+    cmp byte [cfg_url_set], 1
+    jne .rs_h8_default_fg
+    mov eax, [cfg_url_pixel]
+    jmp .rs_h8_have_fg
+.rs_h8_default_fg:
+    mov eax, 0x005599FF
+.rs_h8_have_fg:
+    cmp dword [x11_argb_colormap], 0
+    je .rs_h8_no_alpha
+    or eax, 0xFF000000
+.rs_h8_no_alpha:
+    mov ebx, eax
+    cmp byte [gc_fg_valid], 1
+    jne .rs_h8_gc_send
+    cmp ebx, [gc_current_fg]
+    je .rs_h8_gc_skip
+.rs_h8_gc_send:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 4
+    mov eax, [gc_id]
+    mov [rdi + 4], eax
+    mov dword [rdi + 8], GC_FOREGROUND
+    mov [rdi + 12], ebx
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov [gc_current_fg], ebx
+    mov byte [gc_fg_valid], 1
+.rs_h8_gc_skip:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 5
+    mov eax, [draw_drawable]
+    mov [rdi + 4], eax
+    mov eax, [gc_id]
+    mov [rdi + 8], eax
+    movzx ecx, word [char_width]
+    mov eax, r14d
+    imul eax, ecx
+    mov word [rdi + 12], ax
+    movzx eax, word [char_height]
+    imul eax, r13d
+    movzx ecx, word [font_ascent]
+    add eax, ecx
+    inc eax
+    mov word [rdi + 14], ax
+    movzx eax, word [char_width]
+    imul eax, r15d
+    mov word [rdi + 16], ax
+    mov word [rdi + 18], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_hover_osc8_unwind:
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+.rs_hover_osc8_done:
+
     ; ─── Fallback-glyph pass (DISABLED) ───────────────────────────────
     ; First-cut fallback had two cell-byte-order bugs that mis-marked
     ; codepoints in glyph_present and sent wrong CHAR2B to ImageText16.
@@ -15354,8 +15434,159 @@ url_at_cell:
     pop rbx
     ret
 
+; rdi = view_row, rsi = view_col. Updates hover_osc8_* state. If the
+; cell at that view position has a non-zero OSC 8 link id, scans
+; left+right on the same row for the contiguous run of cells with the
+; matching id (so the hover underline spans the whole link, not just
+; one cell). Triggers a repaint when the hover state changes.
+osc8_hover_check:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                              ; view_row
+    mov r13, rsi                              ; view_col
+    mov rdi, r12
+    mov rsi, r13
+    call cell_ptr_at_view
+    test rax, rax
+    jz .ohc_clear
+    movzx eax, byte [rax + 5]                 ; osc8 link id
+    test eax, eax
+    jz .ohc_clear
+    mov r14d, eax                             ; r14 = osc8 id
+    ; Walk left from r13 while same row's cells have matching id.
+    mov rbx, r13
+.ohc_left:
+    test rbx, rbx
+    jz .ohc_left_done
+    dec rbx
+    mov rdi, r12
+    mov rsi, rbx
+    call cell_ptr_at_view
+    test rax, rax
+    jz .ohc_left_undo
+    movzx eax, byte [rax + 5]
+    cmp eax, r14d
+    je .ohc_left
+.ohc_left_undo:
+    inc rbx
+.ohc_left_done:
+    ; rbx = first column with matching id. Now walk right.
+    mov rcx, r13
+.ohc_right:
+    inc rcx
+    cmp rcx, [grid_cols]
+    jge .ohc_right_undo
+    mov rdi, r12
+    mov rsi, rcx
+    push rbx
+    push rcx
+    call cell_ptr_at_view
+    pop rcx
+    pop rbx
+    test rax, rax
+    jz .ohc_right_undo
+    movzx eax, byte [rax + 5]
+    cmp eax, r14d
+    je .ohc_right
+.ohc_right_undo:
+    dec rcx                                   ; rcx = last col (inclusive)
+    ; Compare new state with stored state; redraw on change.
+    movzx eax, byte [hover_osc8_id]
+    cmp eax, r14d
+    jne .ohc_changed
+    cmp [hover_osc8_row], r12d
+    jne .ohc_changed
+    cmp [hover_osc8_col_start], ebx
+    jne .ohc_changed
+    cmp [hover_osc8_col_end], ecx
+    je .ohc_done
+.ohc_changed:
+    mov [hover_osc8_id], r14b
+    mov [hover_osc8_row], r12d
+    mov [hover_osc8_col_start], ebx
+    mov [hover_osc8_col_end], ecx
+    mov qword [all_dirty], 1
+    call request_render
+    jmp .ohc_done
+
+.ohc_clear:
+    cmp byte [hover_osc8_id], 0
+    je .ohc_done
+    mov byte [hover_osc8_id], 0
+    mov qword [all_dirty], 1
+    call request_render
+.ohc_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; Open URL at grid position (row, col) if one exists
 ; rdi = row, rsi = col
+; rdi = view_row (0..grid_rows-1), rsi = view_col (0..grid_cols-1).
+; Returns rax = pointer to the CELL_SIZE-byte cell at that view position,
+; reading from scroll_buf when scroll_offset > 0 puts the row in the
+; scrollback area, or from grid otherwise. Returns 0 on out-of-range.
+cell_ptr_at_view:
+    push rbx
+    push r12
+    cmp rdi, [grid_rows]
+    jae .cpv_oob
+    cmp rsi, [grid_cols]
+    jae .cpv_oob
+    mov r12, rdi                        ; view_row
+    mov rbx, rsi                        ; view_col
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .cpv_live
+    cmp r12, rax
+    jge .cpv_grid_shifted
+    ; Scrollback row: index into circular scroll_buf.
+    mov rax, [scroll_write_pos]
+    sub rax, [scroll_offset]
+    add rax, r12
+    test rax, rax
+    jns .cpv_sb_pos
+    add rax, 1000
+.cpv_sb_pos:
+    cmp rax, 1000
+    jl .cpv_sb_ok
+    sub rax, 1000
+.cpv_sb_ok:
+    imul rax, MAX_COLS
+    add rax, rbx
+    imul rax, CELL_SIZE
+    lea rax, [scroll_buf + rax]
+    pop r12
+    pop rbx
+    ret
+.cpv_grid_shifted:
+    sub r12, [scroll_offset]
+.cpv_live:
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, rbx
+    imul rax, CELL_SIZE
+    lea rax, [grid + rax]
+    pop r12
+    pop rbx
+    ret
+.cpv_oob:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; rdi = view_row, rsi = view_col. If the cell has an OSC 8 hyperlink
+; id OR matches a url_list entry, fork+exec xdg-open with the URI and
+; return rax = 1. Returns rax = 0 if no URL found at that cell.
+;
+; Both lookups now route the cell read through cell_ptr_at_view so
+; OSC 8 hyperlinks remain clickable even after the source row has
+; scrolled into the scrollback buffer.
 url_open_at:
     push rbx
     push r12
@@ -15364,11 +15595,12 @@ url_open_at:
     mov r13, rsi             ; col
 
     ; First, check if this cell has an OSC 8 hyperlink id.
-    mov rax, r12
-    imul rax, MAX_COLS
-    add rax, r13
-    imul rax, CELL_SIZE
-    movzx eax, byte [grid + rax + 5]
+    mov rdi, r12
+    mov rsi, r13
+    call cell_ptr_at_view
+    test rax, rax
+    jz .uoa_no_osc8
+    movzx eax, byte [rax + 5]
     test eax, eax
     jz .uoa_no_osc8
     ; Look up URI offset (must survive the upcoming syscall, so park it
@@ -15377,7 +15609,7 @@ url_open_at:
     mov rax, SYS_FORK
     syscall
     test rax, rax
-    jnz .uoa_done            ; parent done
+    jnz .uoa_opened          ; parent: success path
     sub rsp, 32
     lea rax, [xdg_open]
     mov [rsp], rax
@@ -15422,7 +15654,7 @@ url_open_at:
     mov rax, SYS_FORK
     syscall
     test rax, rax
-    jnz .uoa_done            ; parent: done
+    jnz .uoa_opened          ; parent: success
     ; Child process
     ; Build argv: ["/usr/bin/xdg-open", url_string, NULL]
     sub rsp, 32
@@ -15445,7 +15677,14 @@ url_open_at:
     inc rbx
     jmp .uoa_loop
 
+.uoa_opened:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
 .uoa_done:
+    xor eax, eax
     pop r13
     pop r12
     pop rbx
