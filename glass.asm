@@ -15,6 +15,7 @@
 %define SYS_MUNMAP      11
 %define SYS_IOCTL       16
 %define SYS_DUP2        33
+%define SYS_GETPID      39
 %define SYS_SOCKET      41
 %define SYS_CONNECT     42
 %define SYS_FORK        57
@@ -210,6 +211,8 @@ wm_delete_str:  db "WM_DELETE_WINDOW", 0
 wm_delete_len   equ 16
 tile_shell_pid_str: db "_TILE_SHELL_PID", 0
 tile_shell_pid_len  equ 15
+net_wm_pid_str: db "_NET_WM_PID", 0
+net_wm_pid_len  equ 11
 
 ; XRender extension name (used by QueryExtension)
 render_ext_str:   db "RENDER", 0
@@ -757,6 +760,7 @@ emoji_cache_dirs_made:  resb 1           ; 1 after we've created the dirs
 render_gc_ready:        resb 1           ; 1 once render_temp_gc is created
 wm_delete_atom:     resd 1
 tile_shell_pid_atom: resd 1
+net_wm_pid_atom:    resd 1          ; _NET_WM_PID — EWMH-standard pid attribution
 
 ; Font metrics
 font_ascent:        resw 1
@@ -4459,6 +4463,69 @@ x11_set_wm_hints:
     syscall
     mov eax, [x11_buf + 8]
     mov [tile_shell_pid_atom], eax
+
+    ; InternAtom _NET_WM_PID — EWMH-standard pid attribution. Tools
+    ; like drain rely on it to map an X window back to the process
+    ; that owns it (and from there to the workspace via tile's
+    ; _NET_WM_DESKTOP).
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (net_wm_pid_len + 3) / 4
+    mov word [rdi+4], net_wm_pid_len
+    mov word [rdi+6], 0
+    lea rsi, [net_wm_pid_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.xwm_cp_nwp:
+    cmp ecx, net_wm_pid_len
+    jge .xwm_pad_nwp
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .xwm_cp_nwp
+.xwm_pad_nwp:
+    mov eax, net_wm_pid_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_buf + 8]
+    mov [net_wm_pid_atom], eax
+
+    ; ChangeProperty: _NET_WM_PID = getpid() on the window. Format =
+    ; 32-bit CARDINAL (atom 6), single value.
+    mov rax, SYS_GETPID
+    syscall
+    mov r11d, eax                          ; preserve pid across builder
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7                    ; 6 base + 1 value word
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [net_wm_pid_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 6                  ; type = CARDINAL
+    mov byte [rdi+16], 32                  ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 1                  ; value-length (1 dword)
+    mov [rdi+24], r11d                     ; the pid
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
 
     ; ChangeProperty: WM_PROTOCOLS = [WM_DELETE_WINDOW]
     lea rdi, [tmp_buf]
