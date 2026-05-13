@@ -7587,19 +7587,45 @@ vt_process:
 .vtp_zw_done:
     cmp eax, 0xFFFF
     jg .vtp_put_emoji
-    ; BMP — check the emoji ranges before falling through to text path.
+    ; BMP — check the emoji ranges. Routing into put_emoji means
+    ; pango/CBDT renders the glyph, which is wide (2 cells) and
+    ; bitmap-colored. For codepoints that are NOT emoji-presentation
+    ; by Unicode default (TR-51 Emoji_Presentation=No), apps like
+    ; tock send the bare codepoint (or +VS-15) expecting a 1-cell
+    ; text glyph from the X11 font. Routing those to put_emoji
+    ; renders a colored 2-cell icon that overwrites the next cell
+    ; — e.g. ☀ U+2600 erasing the ↑ that follows for tock's sunrise
+    ; line. Gate the emoji-path branch on is_wide_bmp so only the
+    ; ~30 codepoints whose default presentation IS emoji actually
+    ; hit pango; the rest take the text path.
     cmp eax, 0x2300
     jl .vtp_put_char_bmp
     cmp eax, 0x23FF
-    jle .vtp_put_emoji
+    jg .vtp_check_2600
+    push rax
+    call is_wide_bmp
+    pop rax
+    jc .vtp_put_emoji
+    jmp .vtp_put_char_bmp
+.vtp_check_2600:
     cmp eax, 0x2600
     jl .vtp_put_char_bmp
     cmp eax, 0x27BF
-    jle .vtp_put_emoji
+    jg .vtp_check_2B00
+    push rax
+    call is_wide_bmp
+    pop rax
+    jc .vtp_put_emoji
+    jmp .vtp_put_char_bmp
+.vtp_check_2B00:
     cmp eax, 0x2B00
     jl .vtp_put_char_bmp
     cmp eax, 0x2BFF
-    jle .vtp_put_emoji
+    jg .vtp_put_char_bmp
+    push rax
+    call is_wide_bmp
+    pop rax
+    jc .vtp_put_emoji
     jmp .vtp_put_char_bmp
 .vtp_put_emoji:
     cmp dword [render_major], 0
