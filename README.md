@@ -30,7 +30,13 @@ bottom-right panes, bare is the shell.
 
 ### From source (requires nasm and ld)
 
+The build expects [glyph](https://github.com/isene/glyph) checked
+out as a sibling directory (`../glyph` relative to this repo) — it
+provides the TTF rasterizer that glass includes at assembly time.
+
 ```bash
+mkdir glass-build && cd glass-build
+git clone https://github.com/isene/glyph.git
 git clone https://github.com/isene/glass.git
 cd glass
 make
