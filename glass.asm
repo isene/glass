@@ -584,6 +584,11 @@ theme_monokai:
     dd 0x0075715E, 0x00F92672, 0x00A6E22E, 0x00F4BF75
     dd 0x0066D9EF, 0x00AE81FF, 0x00A1EFE4, 0x00F9F8F5
 
+; xterm CSI numbers for F5..F12. F1..F4 use the SS3 family (ESC O P/Q/R/S)
+; and don't need a table. The gaps at 16 and 22 are historical (vt100
+; assigned those to other keys) and every modern TUI follows xterm.
+fkey_csi_nums: db 15, 17, 18, 19, 20, 21, 23, 24
+
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS section
 ; ══════════════════════════════════════════════════════════════════════
@@ -7022,6 +7027,14 @@ handle_keypress:
     ; XK_Delete = 0xFFFF
     cmp eax, 0xFFFF
     je .hkp_delete
+    ; F1..F12 = XK_F1..XK_F12 = 0xFFBE..0xFFC9 (consecutive keysyms).
+    cmp eax, 0xFFBE
+    jb .hkp_not_fkey
+    cmp eax, 0xFFC9
+    ja .hkp_not_fkey
+    sub eax, 0xFFBE                       ; 0..11 (F1..F12)
+    jmp .hkp_fkey
+.hkp_not_fkey:
     ; Modifier keys (Shift, Ctrl, etc) - ignore
     jmp .hkp_done
 
@@ -7235,6 +7248,42 @@ handle_keypress:
     mov byte [key_out_buf+2], '3'
     mov byte [key_out_buf+3], '~'
     mov rdx, 4
+    jmp .hkp_send_seq
+
+; F-key emit. eax = F-key index (0=F1 .. 11=F12).
+; Sequences match xterm's default (so vim, htop, mc, less, etc. all
+; recognise them out of the box):
+;   F1..F4 : ESC O P / Q / R / S        (SS3, 3 bytes)
+;   F5..F12: ESC [ <num> ~              (CSI, 5 bytes; num from table)
+; Modifier-combined F-keys (Shift+F5 etc.) currently fall through as
+; bare F-keys; xterm's "ESC[<num>;<mod>~" form can be added later if
+; any TUI needs it.
+.hkp_fkey:
+    cmp eax, 4
+    jb .hkp_fkey_ss3
+    ; F5..F12 → CSI <num> ~
+    sub eax, 4                            ; 0..7
+    lea rdi, [rel fkey_csi_nums]
+    movzx eax, byte [rdi + rax]           ; xterm number 15..24
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], '['
+    mov ecx, 10
+    xor edx, edx
+    div ecx                               ; eax = tens, edx = units
+    add al, '0'
+    mov byte [key_out_buf+2], al
+    add dl, '0'
+    mov byte [key_out_buf+3], dl
+    mov byte [key_out_buf+4], '~'
+    mov rdx, 5
+    jmp .hkp_send_seq
+.hkp_fkey_ss3:
+    ; F1..F4 → ESC O <letter>
+    add eax, 'P'                          ; 0->P, 1->Q, 2->R, 3->S
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf+1], 'O'
+    mov byte [key_out_buf+2], al
+    mov rdx, 3
     jmp .hkp_send_seq
 
 .hkp_send_seq:
