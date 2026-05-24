@@ -686,6 +686,45 @@ apc_pending_h:      resd 1
 apc_pending_q:      resb 1          ; quiet level
 apc_pending_active: resb 1          ; 1 = mid-transmission (m=1 seen)
 apc_pending_place:  resb 1          ; 1 = a=T, place after decoding
+
+; Deferred a=p — when a place command arrives for an image whose
+; chunked transmission isn't done yet, store the place parameters and
+; replay them after the matching m=0 chunk finalises the image.
+; Without this, the place command silently no-ops (img_find returns
+; null) and the user sees a blank pane until they force a re-render
+; (e.g. by pressing Enter). Single-slot is enough for glow's pattern
+; (one image being transmitted at a time); upgrade to a small array if
+; multiple concurrent transmissions ever become a thing.
+apc_deferred_place_id:   resd 1     ; 0 = no defer; else target image id
+apc_deferred_place_row:  resq 1     ; cursor row captured at a=p time
+apc_deferred_place_col:  resq 1     ; cursor col captured at a=p time
+apc_deferred_place_cw:   resw 1     ; c= from the place command (0 = auto)
+apc_deferred_place_ch:   resw 1     ; r= from the place command (0 = auto)
+
+; APC instrumentation. Gated on the GLASS_APC_LOG env var pointing at
+; a writable path; otherwise apc_log_fd stays 0 and every emit is a
+; single test+branch (zero cost on the hot path when not debugging).
+; Format emitted (one line per APC sequence):
+;   [apc] kind=<t|m|p> id=<N> bytes=<B> total=<T> flag=<X> ts=<US>\n
+; Where flag is the m= value for transmit chunks, 'y'/'n' for place
+; deferred status, '.' otherwise.
+apc_log_fd:          resq 1
+apc_log_ts_buf:      resq 2          ; scratch for clock_gettime
+apc_log_chunk_bytes: resq 1          ; saved chunk size for the log emit (post-append)
+apc_log_line_buf:    resb 256
+
+; ESC carry flag for the APC / STRING (DCS/SOS/PM) tokenizers. Set
+; when an ESC byte was consumed at the very end of a PTY read while in
+; VT_APC or VT_STRING state, before glass got a chance to peek at the
+; following byte (which would tell it whether this ESC is the start of
+; ST `\x1b\\` or a stray). Cleared and acted on the next time we land
+; in that state with another byte in hand. Without this, the ESC was
+; silently dropped, glass kept accumulating, and the next APC's
+; `\x1b_G...` opener got smeared into the current APC's body — a
+; deterministic +8-byte corruption at the boundary, observed as
+; ~1-in-500 image-place failures under sustained chunked-transmit
+; firehose (test 4 of /tmp/test_kitty_tf).
+vt_pending_esc:      resb 1
 img_table:          resb IMG_SLOTS * IMG_SLOT_SIZE
 place_table:        resb PLACE_SLOTS * PLACE_SLOT_SIZE
 place_count:        resq 1
@@ -1301,6 +1340,12 @@ _start:
     ; Done AFTER argv parsing — log_open_glass clobbers rdi/rsi via
     ; its syscall args, and the argv loop above relied on them.
     call log_open_glass
+
+    ; If $GLASS_APC_LOG is set, open that path for the APC instrumentation
+    ; channel. Used to debug intermittent kitty-graphics chunked-transmit
+    ; races; see apc_log_emit comments for the line format. Cheap when
+    ; unset (single test+branch per APC sequence).
+    call apc_log_open
 
     ; No dead key pending at startup.
     mov byte [pending_dead], 0xFF
@@ -2186,6 +2231,204 @@ log_write_buf:
     ret
 
 log_path_glass: db "/tmp/glass.log", 0
+
+apc_log_env_name: db "GLASS_APC_LOG="
+apc_log_env_len  equ $ - apc_log_env_name
+
+; If $GLASS_APC_LOG is set, open that path O_WRONLY|O_CREAT|O_APPEND
+; for the lifetime of the process. Called once at startup. Failure is
+; silent — apc_log_fd stays 0 and every later emit short-circuits.
+apc_log_open:
+    push rbx
+    push r12
+    mov rbx, [envp]
+.alo_loop:
+    mov rax, [rbx]
+    test rax, rax
+    jz .alo_done
+    ; Compare the first apc_log_env_len bytes to "GLASS_APC_LOG=".
+    mov r12, rax
+    lea rdi, [apc_log_env_name]
+    mov ecx, apc_log_env_len
+.alo_cmp:
+    test ecx, ecx
+    jz .alo_match
+    mov al, [r12]
+    cmp al, [rdi]
+    jne .alo_next
+    inc r12
+    inc rdi
+    dec ecx
+    jmp .alo_cmp
+.alo_next:
+    add rbx, 8
+    jmp .alo_loop
+.alo_match:
+    ; r12 points at the value (after the '='). Empty value = treat as
+    ; unset to give the user a fast way to override an inherited setting.
+    cmp byte [r12], 0
+    je .alo_done
+    mov rax, SYS_OPEN
+    mov rdi, r12
+    mov esi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js .alo_done
+    mov [apc_log_fd], rax
+.alo_done:
+    pop r12
+    pop rbx
+    ret
+
+; Append an unsigned 64-bit value (rax) in decimal to [rdi]. Returns
+; rdi advanced past the digits. Clobbers rax/rcx/rdx/r8/r9.
+apc_log_u64:
+    push rsi
+    push rbx
+    mov rbx, rdi                           ; start of digits
+    mov r9, 10
+    test rax, rax
+    jnz .alu_div
+    mov byte [rdi], '0'
+    inc rdi
+    jmp .alu_done
+.alu_div:
+    xor edx, edx
+    div r9
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    test rax, rax
+    jnz .alu_div
+    ; Reverse in place between rbx and rdi-1.
+    mov rsi, rdi
+    dec rsi
+.alu_rev:
+    cmp rbx, rsi
+    jge .alu_done
+    mov al, [rbx]
+    mov dl, [rsi]
+    mov [rbx], dl
+    mov [rsi], al
+    inc rbx
+    dec rsi
+    jmp .alu_rev
+.alu_done:
+    pop rbx
+    pop rsi
+    ret
+
+; apc_log_emit: write one log line.
+;   Stack layout on entry expected by caller — none. Args via regs:
+;     dil  = kind char ('t', 'm', 'p')
+;     esi  = image id
+;     rdx  = bytes for this event   (0 for 'p')
+;     rcx  = total bytes for this id (0 for 'p')
+;     r8b  = flag char ('0'/'1' for m=, 'y'/'n' for deferred, '.' otherwise)
+; No-op if apc_log_fd is 0. Saves and restores every register the
+; caller cared about so it can be called from anywhere in handle_kitty_apc.
+apc_log_emit:
+    cmp qword [apc_log_fd], 0
+    jle .ale_done
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+
+    ; Move all the args into callee-saved regs so apc_log_u64
+    ; (which clobbers rax/rcx/rdx/r8/r9 plus rdi as the cursor) can't
+    ; eat them. r14b holds kind+flag packed: high byte = kind, low = flag.
+    movzx r12d, dil                        ; kind char
+    mov   r13d, esi                        ; id
+    mov   rbp, rdx                         ; bytes
+    mov   r14, rcx                         ; total
+    movzx ebx, r8b                         ; flag char (saved here)
+
+    ; Timestamp in microseconds (CLOCK_MONOTONIC).
+    mov rax, SYS_CLOCK_GETTIME
+    mov edi, 1
+    lea rsi, [apc_log_ts_buf]
+    syscall
+    mov rax, [apc_log_ts_buf]              ; sec
+    mov rcx, 1000000
+    mul rcx                                ; rax = sec * 1e6
+    mov r10, rax
+    mov rax, [apc_log_ts_buf + 8]          ; nsec
+    mov rcx, 1000
+    xor edx, edx
+    div rcx                                ; rax = nsec / 1000
+    add r10, rax                           ; r10 = ts_us
+
+    ; Build line into apc_log_line_buf.
+    lea rdi, [apc_log_line_buf]
+    mov dword [rdi], '[apc'
+    mov word  [rdi+4], '] '
+    mov dword [rdi+6], 'kind'
+    mov byte  [rdi+10], '='
+    mov       [rdi+11], r12b
+    mov byte  [rdi+12], ' '
+    mov word  [rdi+13], 'id'
+    mov byte  [rdi+15], '='
+    add rdi, 16
+    mov rax, r13
+    call apc_log_u64
+    mov word  [rdi], ' b'
+    mov dword [rdi+2], 'ytes'
+    mov byte  [rdi+6], '='
+    add rdi, 7
+    mov rax, rbp
+    call apc_log_u64
+    mov word  [rdi], ' t'
+    mov dword [rdi+2], 'otal'
+    mov byte  [rdi+6], '='
+    add rdi, 7
+    mov rax, r14
+    call apc_log_u64
+    mov word  [rdi], ' f'
+    mov dword [rdi+2], 'lag='
+    mov       [rdi+6], bl
+    mov byte  [rdi+7], ' '
+    mov word  [rdi+8], 'ts'
+    mov byte  [rdi+10], '='
+    add rdi, 11
+    mov rax, r10
+    call apc_log_u64
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [apc_log_line_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, [apc_log_fd]
+    syscall
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+.ale_done:
+    ret
 
 ; ══════════════════════════════════════════════════════════════════════
 ; X11 requests
@@ -7882,6 +8125,19 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_string_discard:
+    ; Same ESC-carry handling as VT_APC. Without it, an ESC at the tail
+    ; of a PTY read silently terminated this state's discard one
+    ; byte too late; rare in practice but the symmetric fix keeps the
+    ; bug class closed for any future DCS/PM/SOS consumer that actually
+    ; depends on body content.
+    cmp byte [vt_pending_esc], 0
+    je .vtp_str_no_carry
+    mov byte [vt_pending_esc], 0
+    cmp al, '\'
+    je .vtp_string_end
+    ; Stray carried ESC; the current byte may itself be ESC (start of a
+    ; fresh ST candidate). Fall through to the normal handling below.
+.vtp_str_no_carry:
     ; BEL terminates (xterm-style)
     cmp al, 7
     je .vtp_string_end
@@ -7889,13 +8145,16 @@ vt_process:
     cmp al, 27
     jne .vtp_loop
     cmp r14, r13
-    jge .vtp_loop
+    jge .vtp_str_carry_esc
     mov al, [r12 + r14]
     inc r14
     cmp al, '\'
     jne .vtp_string_discard      ; nested ESC? keep discarding
 .vtp_string_end:
     mov qword [vt_state], VT_NORMAL
+    jmp .vtp_loop
+.vtp_str_carry_esc:
+    mov byte [vt_pending_esc], 1
     jmp .vtp_loop
 
 .vtp_start_apc:
@@ -7904,6 +8163,20 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_apc_capture:
+    ; If a previous PTY read ended on an ESC inside APC body, this byte
+    ; is the one we couldn't peek then. If it's `\`, complete the ST.
+    ; Otherwise re-inject the carried ESC into the body and fall through
+    ; to the normal capture path for this byte.
+    cmp byte [vt_pending_esc], 0
+    je .vtp_apc_no_carry
+    mov byte [vt_pending_esc], 0
+    cmp al, '\'
+    je .vtp_apc_dispatch
+    push rax
+    mov al, 27
+    call .vtp_apc_store_helper
+    pop rax
+.vtp_apc_no_carry:
     ; BEL terminates and dispatches.
     cmp al, 7
     je .vtp_apc_dispatch
@@ -7911,7 +8184,7 @@ vt_process:
     cmp al, 27
     jne .vtp_apc_store
     cmp r14, r13
-    jge .vtp_loop                    ; out of bytes; resume next read
+    jge .vtp_apc_carry_esc           ; out of bytes — remember ESC for next read
     mov al, [r12 + r14]
     inc r14
     cmp al, '\'
@@ -7924,6 +8197,9 @@ vt_process:
     pop rax
 .vtp_apc_store:
     call .vtp_apc_store_helper
+    jmp .vtp_loop
+.vtp_apc_carry_esc:
+    mov byte [vt_pending_esc], 1
     jmp .vtp_loop
 
 .vtp_apc_store_helper:
@@ -8233,6 +8509,7 @@ vt_process:
 
 .vtp_full_reset:
     call grid_clear
+    mov byte [vt_pending_esc], 0        ; clear any half-finished ST/APC carry
     mov qword [cursor_row], 0
     mov qword [cursor_col], 0
     mov byte [cur_fg_default], 1
@@ -17347,6 +17624,16 @@ handle_kitty_apc:
     ; wipe the place flag set by the original a=T.
     test r14, r14
     jz .hka_append                   ; inferred: pure continuation, append
+    ; New explicit transmit. If a deferred place is parked for a
+    ; different image id (the previous transmission was interrupted
+    ; before finalise), drop it — its target image will never decode.
+    mov eax, [apc_deferred_place_id]
+    test eax, eax
+    jz .hka_xmit_no_def_clear
+    cmp eax, [apc_kv_i]
+    je .hka_xmit_no_def_clear        ; same id: keep, the new finalise will drain it
+    mov dword [apc_deferred_place_id], 0
+.hka_xmit_no_def_clear:
     mov [apc_pending_place], al
     mov eax, [apc_kv_i]
     mov [apc_pending_id], eax
@@ -17365,6 +17652,9 @@ handle_kitty_apc:
     mov rsi, [apc_payload_off]
     mov rcx, [apc_body_len]
     sub rcx, rsi
+    ; Save chunk size for the post-append log emit. apc_payload_len is
+    ; what changes during append, so we need the size we computed here.
+    mov [apc_log_chunk_bytes], rcx
     jbe .hka_after_append
     mov rdx, [apc_payload_len]
     add rdx, rcx
@@ -17386,6 +17676,24 @@ handle_kitty_apc:
     sub rdx, [apc_payload_off]
     mov [apc_payload_len], rdx
 .hka_after_append:
+    ; APC instrumentation. Logs every chunk's receipt with id + this-
+    ; chunk bytes + cumulative total + m= flag, so failing tests can be
+    ; correlated to which chunk(s) glass actually parsed. No-op when
+    ; GLASS_APC_LOG isn't set (apc_log_fd stays 0).
+    cmp qword [apc_log_fd], 0
+    jle .hka_after_append_log_done
+    mov edi, 'm'                          ; kind char (continuation)
+    test r14, r14
+    jz .hka_log_kind_set
+    mov edi, 't'                          ; explicit a=t / a=T start
+.hka_log_kind_set:
+    mov esi, [apc_pending_id]
+    mov rdx, [apc_log_chunk_bytes]
+    mov rcx, [apc_payload_len]
+    movzx r8d, byte [apc_kv_m]
+    add r8d, '0'                          ; '0' (last) or '1' (more)
+    call apc_log_emit
+.hka_after_append_log_done:
 
     ; If more chunks coming, wait for them.
     cmp byte [apc_kv_m], 1
@@ -17394,6 +17702,74 @@ handle_kitty_apc:
     ; Last chunk — decode the accumulated payload and store the image.
     call kitty_finalize_image
     mov byte [apc_pending_active], 0
+
+    ; Drain a deferred place command (if any) for the id we just
+    ; finalised. Without this, an a=p that arrived during the chunked
+    ; transmission stays parked in apc_deferred_place_* forever.
+    mov eax, [apc_deferred_place_id]
+    test eax, eax
+    jz .hka_done
+    cmp eax, [apc_pending_id]
+    jne .hka_done                    ; deferred for a different id (shouldn't happen)
+    mov dword [apc_deferred_place_id], 0
+    mov edi, eax
+    call img_find
+    test rsi, rsi
+    jnz .hka_drain_have_image
+    ; Log: deferred drain attempted but finalise produced no image.
+    mov edi, 'p'
+    mov esi, [apc_pending_id]
+    xor edx, edx
+    xor ecx, ecx
+    mov r8b, 'f'                          ; failed drain (no image after finalise)
+    call apc_log_emit
+    jmp .hka_done
+.hka_drain_have_image:
+    ; Log: deferred drain placing now.
+    push rsi
+    mov edi, 'p'
+    mov esi, [apc_pending_id]
+    xor edx, edx
+    xor ecx, ecx
+    mov r8b, 'd'                          ; drained: pulled off the deferred slot
+    call apc_log_emit
+    pop rsi
+    ; Repeat .hka_place's cell_w/cell_h derivation using the saved c=/r=
+    ; and the now-registered image's pixel dimensions.
+    movzx ecx, word [apc_deferred_place_cw]
+    test ecx, ecx
+    jnz .hka_drain_have_cw
+    mov eax, [rsi + 4]
+    movzx edx, word [char_width]
+    test edx, edx
+    jz .hka_done
+    add eax, edx
+    dec eax
+    xor edx, edx
+    movzx r8d, word [char_width]
+    div r8d
+    mov ecx, eax
+.hka_drain_have_cw:
+    movzx r8d, word [apc_deferred_place_ch]
+    test r8d, r8d
+    jnz .hka_drain_have_ch
+    mov eax, [rsi + 8]
+    movzx edx, word [char_height]
+    test edx, edx
+    jz .hka_done
+    add eax, edx
+    dec eax
+    xor edx, edx
+    movzx r9d, word [char_height]
+    div r9d
+    mov r8d, eax
+.hka_drain_have_ch:
+    ; place_add(edi=id, rsi=row, rdx=col, ecx=cw, r8d=ch)
+    mov rsi, [apc_deferred_place_row]
+    mov rdx, [apc_deferred_place_col]
+    mov edi, [apc_pending_id]
+    call place_add
+    call request_render
     jmp .hka_done
 
 .hka_place:
@@ -17403,7 +17779,52 @@ handle_kitty_apc:
     jz .hka_done
     call img_find
     test rsi, rsi
-    jz .hka_done
+    jnz .hka_place_have_image
+    ; Image not registered yet. If an assembly is in flight for this
+    ; same id, the place command raced the finaliser — buffer it for
+    ; replay after .hka_after_append calls kitty_finalize_image. If no
+    ; matching assembly is active, drop quietly (matches prior behaviour
+    ; for stale ids; nothing useful we can do without image data).
+    cmp byte [apc_pending_active], 1
+    jne .hka_place_drop
+    cmp edi, [apc_pending_id]
+    jne .hka_place_drop
+    mov [apc_deferred_place_id], edi
+    mov rax, [cursor_row]
+    mov [apc_deferred_place_row], rax
+    mov rax, [cursor_col]
+    mov [apc_deferred_place_col], rax
+    movzx eax, word [apc_kv_c]
+    mov [apc_deferred_place_cw], ax
+    movzx eax, word [apc_kv_r]
+    mov [apc_deferred_place_ch], ax
+    ; Log: place deferred.
+    mov edi, 'p'
+    mov esi, [apc_kv_i]
+    xor edx, edx
+    xor ecx, ecx
+    mov r8b, 'y'
+    call apc_log_emit
+    jmp .hka_done
+.hka_place_drop:
+    ; Place for an id that's neither registered nor in flight: drop.
+    mov edi, 'p'
+    mov esi, [apc_kv_i]
+    xor edx, edx
+    xor ecx, ecx
+    mov r8b, 'x'                          ; dropped: no image, no pending
+    call apc_log_emit
+    jmp .hka_done
+.hka_place_have_image:
+    ; Log: place applied (image already registered).
+    push rsi                              ; img_find result needed below
+    mov edi, 'p'
+    mov esi, [apc_kv_i]
+    xor edx, edx
+    xor ecx, ecx
+    mov r8b, 'n'
+    call apc_log_emit
+    pop rsi
     ; Compute cell_w / cell_h: explicit c=/r=, else native pixels / cell.
     movzx ecx, word [apc_kv_c]       ; cell_w request
     test ecx, ecx
