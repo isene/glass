@@ -247,6 +247,12 @@ convert_arg_rgba: db "RGBA:-", 0
 ; PNG → RGBA conversion for kitty graphics: `convert png:- rgba:-`
 convert_arg_png_in: db "png:-", 0
 convert_arg_rgba_lower: db "rgba:-", 0
+; PNG → BGRA conversion for the CBDT emoji raster path. On
+; little-endian x86, X11 ARGB32 expects bytes in [B,G,R,A] order, so
+; asking ImageMagick for bgra:- directly lets us PutImage straight
+; through with no in-asm swap pass. Image-upload (kitty graphics)
+; still uses rgba:- + the post-decode swap in image_upload_raster.
+convert_arg_bgra_lower: db "bgra:-", 0
 
 ; Advertised TERM for the child shell. Set to xterm-kitty so apps
 ; (glow, ueberzug, etc.) detect that glass supports kitty graphics.
@@ -18964,11 +18970,13 @@ cbdt_render_emoji_to_raster:
     ret
 
 ; ---------------------------------------------------------------------
-; png_decode_to_emoji_buf — fork convert with `png:- -resize WxH! -depth 8 rgba:-`,
-; pipe the PNG bytes in, read RGBA bytes into emoji_raster_buf.
+; png_decode_to_emoji_buf — fork convert with `png:- -resize WxH! -depth 8 bgra:-`,
+; pipe the PNG bytes in, read BGRA bytes into emoji_raster_buf. BGRA
+; matches X11 ARGB32 byte order on little-endian x86, so .reg_have_raster's
+; PutImage can upload the bytes directly with no swap pass.
 ;   in : rdi = PNG ptr, rsi = PNG length,
 ;        edx = target W, ecx = target H
-;   out: rax = total RGBA bytes received (= W*H*4) on success, -1 on fail
+;   out: rax = total BGRA bytes received (= W*H*4) on success, -1 on fail
 png_decode_to_emoji_buf:
     push rbx
     push r12
@@ -19035,7 +19043,7 @@ png_decode_to_emoji_buf:
     mov [png_argv + 8*8], rax
     lea rax, [convert_arg_8]
     mov [png_argv + 9*8], rax
-    lea rax, [convert_arg_rgba_lower]
+    lea rax, [convert_arg_bgra_lower]
     mov [png_argv + 10*8], rax
     mov qword [png_argv + 11*8], 0
 
