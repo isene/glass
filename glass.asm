@@ -798,6 +798,11 @@ emoji_pictures:         resd MAX_EMOJI   ; XID of XRender Picture (0 = not yet r
 emoji_pixmaps:          resd MAX_EMOJI   ; XID of backing Pixmap
 emoji_count:            resq 1
 cur_emoji_index:        resw 1     ; set by UTF-8 decoder before grid_put_char
+; VS16/VS15 presentation selector lookahead result for the base codepoint
+; currently being routed. 0 = no selector follows, 1 = U+FE0F (force emoji
+; / color presentation), 2 = U+FE0E (force text presentation). Set by the
+; lookahead at .vtp_zw_done, consumed by the routing gate + width logic.
+emoji_vs_flag:          resb 1
 ; Buffers for fork+exec convert (rebuilt per emoji)
 emoji_size_arg:         resb 16          ; "WxH\0"
 emoji_pango_arg:        resb 256         ; "pango:<span ...>UTF8</span>\0"
@@ -808,6 +813,23 @@ emoji_sys_cache_path:   resb 256         ; full path to system bundled cache
 emoji_cache_dir:        resb 256         ; full path to cache directory
 emoji_cache_dirs_made:  resb 1           ; 1 after we've created the dirs
 render_gc_ready:        resb 1           ; 1 once render_temp_gc is created
+
+; ── ZWJ emoji sequences ───────────────────────────────────────────────
+; Multi-codepoint emoji (polar bear 🐻‍❄️, families, professions, flags)
+; are keyed by their raw UTF-8 byte sequence, NOT a scalar codepoint, so
+; they get a parallel store. Pango/HarfBuzz does the GSUB ligature
+; shaping when we hand it the whole UTF-8 run, so glass needs no GSUB
+; parser. Single-codepoint emoji keep using emoji_codepoints/_pictures/
+; _pixmaps unchanged. A grid cell flags a sequence emoji by setting bit
+; 15 of its emoji-index word (single-cp indices are 0..1023 < 0x8000).
+%define MAX_EMOJI_SEQ   256
+%define EMOJI_SEQ_MAX   48               ; UTF-8 bytes incl NUL; longest std ZWJ run fits
+%define EMOJI_SEQ_FLAG  0x8000           ; cell emoji-index bit 15 = sequence slot
+emoji_seq_bytes:        resb MAX_EMOJI_SEQ * EMOJI_SEQ_MAX  ; NUL-terminated UTF-8 per slot
+emoji_seq_pictures:     resd MAX_EMOJI_SEQ
+emoji_seq_pixmaps:      resd MAX_EMOJI_SEQ
+emoji_seq_count:        resq 1
+emoji_seq_scan_buf:     resb 64          ; router scratch: assembled run UTF-8
 wm_delete_atom:     resd 1
 tile_shell_pid_atom: resd 1
 net_wm_pid_atom:    resd 1          ; _NET_WM_PID — EWMH-standard pid attribution
@@ -3731,6 +3753,86 @@ find_or_alloc_emoji:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; find_or_alloc_emoji_seq: rsi = UTF-8 byte sequence, edx = length
+; (must be < EMOJI_SEQ_MAX). Returns rax = sequence slot index (>= 0),
+; or -1 if the sequence is too long or the cache is full. Linear scan
+; like find_or_alloc_emoji — ZWJ sequences are very few per session.
+; ══════════════════════════════════════════════════════════════════════
+find_or_alloc_emoji_seq:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r13, rsi             ; key ptr
+    mov r14d, edx            ; key len
+    cmp r14d, EMOJI_SEQ_MAX
+    jae .foes_full           ; too long to store (incl NUL)
+    mov r12, [emoji_seq_count]
+    xor ebx, ebx
+.foes_search:
+    cmp rbx, r12
+    jge .foes_alloc
+    ; Compare r14 bytes of [emoji_seq_bytes + rbx*EMOJI_SEQ_MAX] vs key,
+    ; then require a NUL at [+r14] so "ab" doesn't match "abc".
+    mov rax, rbx
+    imul rax, EMOJI_SEQ_MAX
+    lea r15, [emoji_seq_bytes + rax]
+    xor ecx, ecx
+.foes_cmp:
+    cmp ecx, r14d
+    jge .foes_cmp_tail
+    mov al, [r13 + rcx]
+    cmp al, [r15 + rcx]
+    jne .foes_next
+    inc ecx
+    jmp .foes_cmp
+.foes_cmp_tail:
+    cmp byte [r15 + r14], 0
+    jne .foes_next
+    mov rax, rbx             ; match
+    jmp .foes_ret
+.foes_next:
+    inc rbx
+    jmp .foes_search
+.foes_alloc:
+    cmp r12, MAX_EMOJI_SEQ
+    jge .foes_full
+    mov rax, r12
+    imul rax, EMOJI_SEQ_MAX
+    lea r15, [emoji_seq_bytes + rax]
+    xor ecx, ecx
+.foes_copy:
+    cmp ecx, r14d
+    jge .foes_copy_done
+    mov al, [r13 + rcx]
+    mov [r15 + rcx], al
+    inc ecx
+    jmp .foes_copy
+.foes_copy_done:
+    mov byte [r15 + r14], 0
+    mov dword [emoji_seq_pictures + r12*4], 0
+    mov dword [emoji_seq_pixmaps + r12*4], 0
+    mov rax, r12
+    inc r12
+    mov [emoji_seq_count], r12
+.foes_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.foes_full:
+    mov rax, -1
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
 ; itoa_decimal: rdi = unsigned value, rsi = output buffer.
 ; Writes decimal digits (no terminator). Returns rax = number of bytes
 ; written. Used for assembling the convert size argument.
@@ -4511,6 +4613,312 @@ render_emoji_glyph:
 .regs_done:
     pop rax
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; render_emoji_seq_glyph: rdi = sequence slot index. Rasterizes a ZWJ
+; emoji sequence (already stored as UTF-8 in emoji_seq_bytes) by handing
+; the whole run to pango via `convert` — pango/HarfBuzz performs the GSUB
+; ligature shaping. Stores the resulting XRender Picture / Pixmap in
+; emoji_seq_pictures[idx] / emoji_seq_pixmaps[idx]. No-op if already
+; cached for this session. No disk cache / CBDT / TTF fast paths — ZWJ
+; sequences are rare, so a single pango fork per unique sequence per
+; session is acceptable.
+;
+; r12 = idx, r13 = pixmap width, r14 = pixmap height throughout.
+; ══════════════════════════════════════════════════════════════════════
+render_emoji_seq_glyph:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    cmp dword [render_major], 0
+    je .resg_done                        ; XRender absent — can't composite
+    mov eax, [emoji_seq_pictures + r12*4]
+    test eax, eax
+    jnz .resg_done
+
+    ; Pixmap: 2 cells wide, 1 cell tall.
+    movzx r13d, word [char_width]
+    add r13d, r13d
+    movzx r14d, word [char_height]
+
+    ; Build "WxH\0" into emoji_size_arg.
+    mov edi, r13d
+    lea rsi, [emoji_size_arg]
+    call itoa_decimal
+    mov ebx, eax
+    mov byte [emoji_size_arg + rbx], 'x'
+    inc ebx
+    mov edi, r14d
+    lea rsi, [emoji_size_arg + rbx]
+    call itoa_decimal
+    add ebx, eax
+    mov byte [emoji_size_arg + rbx], 0
+
+    ; Build the pango: argument. Share the prefix/mid/suffix strings with
+    ; render_emoji_glyph.
+    lea rdi, [emoji_pango_arg]
+    lea rsi, [render_emoji_glyph.reg_pango_prefix]
+    call render_emoji_glyph.reg_strcpy_advance
+    mov eax, r14d
+    imul eax, 700
+    mov r15, rdi
+    mov rsi, rdi
+    mov edi, eax
+    call itoa_decimal
+    mov rdi, r15
+    add rdi, rax
+    lea rsi, [render_emoji_glyph.reg_pango_mid]
+    call render_emoji_glyph.reg_strcpy_advance
+    ; Copy the stored UTF-8 sequence bytes (NUL-terminated).
+    mov rax, r12
+    imul rax, EMOJI_SEQ_MAX
+    lea rsi, [emoji_seq_bytes + rax]
+    call render_emoji_glyph.reg_strcpy_advance
+    lea rsi, [render_emoji_glyph.reg_pango_suffix]
+    call render_emoji_glyph.reg_strcpy_advance
+    mov byte [rdi], 0
+
+    ; argv for convert (same shape as render_emoji_glyph).
+    lea rax, [convert_path]
+    mov [emoji_argv + 0*8], rax
+    lea rax, [convert_arg_size]
+    mov [emoji_argv + 1*8], rax
+    lea rax, [emoji_size_arg]
+    mov [emoji_argv + 2*8], rax
+    lea rax, [convert_arg_bg]
+    mov [emoji_argv + 3*8], rax
+    lea rax, [convert_arg_none]
+    mov [emoji_argv + 4*8], rax
+    lea rax, [emoji_pango_arg]
+    mov [emoji_argv + 5*8], rax
+    lea rax, [convert_arg_depth]
+    mov [emoji_argv + 6*8], rax
+    lea rax, [convert_arg_8]
+    mov [emoji_argv + 7*8], rax
+    lea rax, [convert_arg_rgba]
+    mov [emoji_argv + 8*8], rax
+    mov qword [emoji_argv + 9*8], 0
+
+    ; pipe
+    sub rsp, 16
+    mov rax, SYS_PIPE
+    mov rdi, rsp
+    syscall
+    test rax, rax
+    js .resg_pipe_fail
+    mov ebx, [rsp]                       ; read fd
+    mov r15d, [rsp + 4]                  ; write fd
+    add rsp, 16
+
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .resg_fork_fail
+    jnz .resg_parent
+    ; child
+    mov rax, SYS_DUP2
+    mov edi, r15d
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [convert_path]
+    lea rsi, [emoji_argv]
+    mov rdx, [envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov rdi, 127
+    syscall
+
+.resg_parent:
+    push rax
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    pop r15                              ; child pid
+
+    movzx eax, word [char_width]
+    add eax, eax
+    movzx edx, word [char_height]
+    imul eax, edx
+    shl eax, 2
+    mov r13, rax                         ; expected bytes
+    xor r14d, r14d
+.resg_read_loop:
+    cmp r14, r13
+    jge .resg_read_done
+    cmp r14, EMOJI_RASTER_MAX
+    jge .resg_read_done
+    mov rax, SYS_READ
+    mov edi, ebx
+    lea rsi, [emoji_raster_buf + r14]
+    mov rdx, r13
+    sub rdx, r14
+    syscall
+    test rax, rax
+    jle .resg_read_done
+    add r14, rax
+    jmp .resg_read_loop
+.resg_read_done:
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    push r14
+    sub rsp, 8
+    mov rax, SYS_WAIT4
+    mov rdi, r15
+    mov rsi, rsp
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 8
+    pop r14
+    test r14, r14
+    jz .resg_done
+
+    ; Recompute pixmap dims (clobbered by read loop).
+    movzx r13d, word [char_width]
+    add r13d, r13d
+    movzx r14d, word [char_height]
+
+    ; CreatePixmap depth=32.
+    call alloc_xid
+    mov [emoji_seq_pixmaps + r12*4], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov byte [rdi+1], 32
+    mov word [rdi+2], 4
+    mov [rdi+4], eax
+    mov eax, [win_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], r13w
+    mov word [rdi+14], r14w
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; render_temp_gc (shared with render_emoji_glyph) — create if needed.
+    cmp byte [render_gc_ready], 1
+    je .resg_gc_done
+    call alloc_xid
+    mov [render_temp_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [render_temp_gc]
+    mov [rdi+4], eax
+    mov eax, [emoji_seq_pixmaps + r12*4]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    mov byte [render_gc_ready], 1
+.resg_gc_done:
+
+    ; PutImage RGBA.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2
+    mov eax, r14d
+    mov ecx, r13d
+    imul ecx, eax
+    shl ecx, 2
+    add ecx, 24 + 3
+    shr ecx, 2
+    mov word [rdi+2], cx
+    mov eax, [emoji_seq_pixmaps + r12*4]
+    mov [rdi+4], eax
+    mov eax, [render_temp_gc]
+    mov [rdi+8], eax
+    mov word [rdi+12], r13w
+    mov word [rdi+14], r14w
+    mov word [rdi+16], 0
+    mov word [rdi+18], 0
+    mov byte [rdi+20], 0
+    mov byte [rdi+21], 32
+    mov word [rdi+22], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [emoji_raster_buf]
+    mov edx, r13d
+    imul edx, r14d
+    shl edx, 2
+    syscall
+    mov ecx, r13d
+    imul ecx, r14d
+    shl ecx, 2
+    test ecx, 3
+    jz .resg_no_pad
+    mov edx, 4
+    sub edx, ecx
+    and edx, 3
+    sub rsp, 8
+    mov qword [rsp], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    mov rsi, rsp
+    syscall
+    add rsp, 8
+.resg_no_pad:
+    inc dword [x11_seq]
+
+    ; CreatePicture wrapping the pixmap.
+    call alloc_xid
+    mov [emoji_seq_pictures + r12*4], eax
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5
+    mov eax, [emoji_seq_pictures + r12*4]
+    mov [rdi+4], eax
+    mov eax, [emoji_seq_pixmaps + r12*4]
+    mov [rdi+8], eax
+    mov eax, [render_format_argb32]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+
+.resg_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.resg_pipe_fail:
+    add rsp, 16
+    jmp .resg_done
+.resg_fork_fail:
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r15d
+    syscall
+    jmp .resg_done
 
 ; Map window
 x11_map_window:
@@ -7883,6 +8291,171 @@ vt_process:
     cmp eax, 0xFEFF
     je .vtp_loop                 ; BOM / zero-width no-break space
 .vtp_zw_done:
+    ; ── ZWJ emoji sequence detection ───────────────────────────────
+    ; eax = base codepoint. A ZWJ emoji (polar bear 🐻‍❄️, families,
+    ; professions, flags) is `BASE [VS16] (ZWJ BASE [VS16])+`. If a ZWJ
+    ; (U+200D = E2 80 8D) follows the base — optionally past one VS16 —
+    ; assemble the whole run's UTF-8 and route it to the sequence emoji
+    ; store, which hands the run to pango (HarfBuzz shapes the GSUB
+    ; ligature; glass needs no GSUB parser). Otherwise fall through to
+    ; the VS16/normal single-codepoint logic at .vtp_zw_no_seq.
+    ; Tentative peek: skip an optional VS16, then look for ZWJ.
+    mov r8, r14
+    lea r9, [r8 + 3]
+    cmp r9, r13
+    jg .vtp_zw_chk_zwj
+    cmp byte [r12 + r8], 0xEF
+    jne .vtp_zw_chk_zwj
+    cmp byte [r12 + r8 + 1], 0xB8
+    jne .vtp_zw_chk_zwj
+    cmp byte [r12 + r8 + 2], 0x8F
+    jne .vtp_zw_chk_zwj
+    add r8, 3
+.vtp_zw_chk_zwj:
+    lea r9, [r8 + 3]
+    cmp r9, r13
+    jg .vtp_zw_no_seq
+    cmp byte [r12 + r8], 0xE2
+    jne .vtp_zw_no_seq
+    cmp byte [r12 + r8 + 1], 0x80
+    jne .vtp_zw_no_seq
+    cmp byte [r12 + r8 + 2], 0x8D
+    jne .vtp_zw_no_seq
+    ; Confirmed ZWJ sequence. Assemble UTF-8 into emoji_seq_scan_buf,
+    ; advancing r14 over the consumed run.
+    lea r15, [emoji_seq_scan_buf]
+    push rax
+    mov edi, eax
+    mov rsi, r15
+    call encode_utf8
+    add r15, rax
+    pop rax
+.vtp_zw_asm_loop:
+    ; optional VS16 (EF B8 8F) at r14
+    lea r9, [r14 + 3]
+    cmp r9, r13
+    jg .vtp_zw_asm_chk_zwj
+    cmp byte [r12 + r14], 0xEF
+    jne .vtp_zw_asm_chk_zwj
+    cmp byte [r12 + r14 + 1], 0xB8
+    jne .vtp_zw_asm_chk_zwj
+    cmp byte [r12 + r14 + 2], 0x8F
+    jne .vtp_zw_asm_chk_zwj
+    mov byte [r15], 0xEF
+    mov byte [r15+1], 0xB8
+    mov byte [r15+2], 0x8F
+    add r15, 3
+    add r14, 3
+.vtp_zw_asm_chk_zwj:
+    ; ZWJ (E2 80 8D) at r14?
+    lea r9, [r14 + 3]
+    cmp r9, r13
+    jg .vtp_zw_asm_done
+    cmp byte [r12 + r14], 0xE2
+    jne .vtp_zw_asm_done
+    cmp byte [r12 + r14 + 1], 0x80
+    jne .vtp_zw_asm_done
+    cmp byte [r12 + r14 + 2], 0x8D
+    jne .vtp_zw_asm_done
+    mov byte [r15], 0xE2
+    mov byte [r15+1], 0x80
+    mov byte [r15+2], 0x8D
+    add r15, 3
+    add r14, 3
+    ; copy the next base codepoint (1-4 UTF-8 bytes by lead byte)
+    cmp r14, r13
+    jge .vtp_zw_asm_done
+    movzx eax, byte [r12 + r14]
+    mov ecx, 1
+    cmp al, 0x80
+    jb .vtp_zw_cp_len_have
+    cmp al, 0xE0
+    jb .vtp_zw_cp_len2
+    cmp al, 0xF0
+    jb .vtp_zw_cp_len3
+    mov ecx, 4
+    jmp .vtp_zw_cp_len_have
+.vtp_zw_cp_len2:
+    mov ecx, 2
+    jmp .vtp_zw_cp_len_have
+.vtp_zw_cp_len3:
+    mov ecx, 3
+.vtp_zw_cp_len_have:
+    lea r9, [r14 + rcx]
+    cmp r9, r13
+    jg .vtp_zw_asm_done                   ; truncated multibyte at buffer end
+    lea r9, [emoji_seq_scan_buf + 56]
+    cmp r15, r9
+    jae .vtp_zw_asm_done                  ; run too long for the scratch buffer
+.vtp_zw_cp_copy:
+    mov dl, [r12 + r14]
+    mov [r15], dl
+    inc r14
+    inc r15
+    dec ecx
+    jnz .vtp_zw_cp_copy
+    jmp .vtp_zw_asm_loop
+.vtp_zw_asm_done:
+    mov byte [r15], 0
+    lea rsi, [emoji_seq_scan_buf]
+    mov rdx, r15
+    sub rdx, rsi
+    call find_or_alloc_emoji_seq
+    test rax, rax
+    js .vtp_zw_seq_fallback
+    cmp dword [render_major], 0
+    je .vtp_zw_seq_fallback               ; no XRender — can't show emoji
+    or eax, EMOJI_SEQ_FLAG
+    mov [cur_emoji_index], ax
+    or byte [cur_attrs], 8 | 32           ; ATTR_IS_EMOJI | ATTR_IS_WIDE
+    mov eax, 0x20                         ; cell fallback glyph (overlaid)
+    call grid_put_char
+    and byte [cur_attrs], ~(8 | 32)
+    jmp .vtp_loop
+.vtp_zw_seq_fallback:
+    ; Sequence store full or no XRender: render the first base alone
+    ; (reads better than the old bear+snowflake decay). eax was
+    ; clobbered by find_or_alloc_emoji_seq — reload the base codepoint.
+    mov eax, [utf8_char]
+.vtp_zw_no_seq:
+    ; VS16 / VS15 presentation lookahead. eax holds a real (non-zero-
+    ; width) base codepoint. If the very next codepoint in the input
+    ; buffer is U+FE0F (VS16, emoji presentation) or U+FE0E (VS15, text
+    ; presentation), record it and consume those 3 UTF-8 bytes so the
+    ; selector doesn't fall through to the zero-width drop and get lost.
+    ; FE0F = EF B8 8F, FE0E = EF B8 8E. This is the fix for ‼️ ➡️ ⚠️ ℹ️
+    ; and the long tail of `BASE + FE0F` that previously dropped the
+    ; selector and rendered the base as a monochrome text glyph.
+    ;
+    ; Streaming caveat: if the base ends a PTY read and the selector
+    ; arrives in the next read, the peek finds nothing (flag=0) and the
+    ; base renders as text — same as the old behaviour. Apps emit
+    ; base+selector in one write() in practice, so this is rare.
+    mov byte [emoji_vs_flag], 0
+    lea r8, [r14 + 3]
+    cmp r8, r13
+    jg .vtp_vs_none                   ; fewer than 3 bytes left to peek
+    cmp byte [r12 + r14], 0xEF
+    jne .vtp_vs_none
+    cmp byte [r12 + r14 + 1], 0xB8
+    jne .vtp_vs_none
+    movzx r9d, byte [r12 + r14 + 2]
+    cmp r9d, 0x8F
+    je .vtp_vs_emoji
+    cmp r9d, 0x8E
+    je .vtp_vs_text
+    jmp .vtp_vs_none
+.vtp_vs_emoji:
+    mov byte [emoji_vs_flag], 1
+    add r14, 3                        ; consume the FE0F
+    jmp .vtp_put_emoji
+.vtp_vs_text:
+    mov byte [emoji_vs_flag], 2
+    add r14, 3                        ; consume the FE0E
+    cmp eax, 0xFFFF
+    jg .vtp_put_char                  ; non-BMP forced to text
+    jmp .vtp_put_char_bmp
+.vtp_vs_none:
     cmp eax, 0xFFFF
     jg .vtp_put_emoji
     ; BMP — check the emoji ranges. Routing into put_emoji means
@@ -7950,6 +8523,12 @@ vt_process:
     ; bits and miss anyway, leaving 🚀 🔥 etc. advancing 1 cell.
     cmp eax, 0xFFFF
     ja .vtp_put_emoji_wide_set
+    ; An explicit VS16 selector means emoji presentation, which is
+    ; EAW-wide by Unicode default even for bases the is_wide_bmp table
+    ; doesn't list (‼ ➡ ⚠ ℹ are EAW=N as bare text but wide as emoji).
+    ; Force 2 cells so the app's column padding stays aligned.
+    cmp byte [emoji_vs_flag], 1
+    je .vtp_put_emoji_wide_set
     push rax
     call is_wide_bmp                  ; CF=1 if codepoint is EAW-wide
     pop rax
@@ -13613,7 +14192,9 @@ rs_row_loop:
     jz .rs_emoji_inc                    ; out of bounds (shouldn't happen)
     test byte [rax + 4], 8              ; ATTR_IS_EMOJI
     jz .rs_emoji_inc
-    movzx r14d, word [rax + 6]          ; emoji index
+    movzx r14d, word [rax + 6]          ; emoji index (+ bit 15 seq flag)
+    test r14d, EMOJI_SEQ_FLAG
+    jnz .rs_emoji_seq
     cmp r14d, MAX_EMOJI
     jae .rs_emoji_inc
     mov edi, r14d
@@ -13621,6 +14202,17 @@ rs_row_loop:
     mov eax, [emoji_pictures + r14*4]
     test eax, eax
     jz .rs_emoji_inc
+    jmp .rs_emoji_have_pic
+.rs_emoji_seq:
+    and r14d, ~EMOJI_SEQ_FLAG           ; strip flag → sequence slot index
+    cmp r14d, MAX_EMOJI_SEQ
+    jae .rs_emoji_inc
+    mov edi, r14d
+    call render_emoji_seq_glyph
+    mov eax, [emoji_seq_pictures + r14*4]
+    test eax, eax
+    jz .rs_emoji_inc
+.rs_emoji_have_pic:
     ; Composite: src=picture, mask=0, dst=window_picture, op=Over
     push rax
     lea rdi, [tmp_buf]
