@@ -18985,8 +18985,17 @@ font_change_step:
     mov rax, [font_size_presets + rcx*8]
 
 .fcs_have_size:
+    ; Reset path (r12d == 0) always falls through to the full rebuild,
+    ; even when current == target. Otherwise a user pressing Alt+Shift+-
+    ; on a glass that's already at the configured size sees nothing
+    ; happen and concludes the binding is broken. The inc/dec paths
+    ; keep the equality bail because identical target = harmless no-op
+    ; (already at preset edge).
+    test r12d, r12d
+    jz .fcs_apply
     cmp rax, [cfg_font_size]
     je .fcs_done                     ; nothing to do
+.fcs_apply:
     mov [cfg_font_size], rax
 
     ; Rebuild XLFDs and re-open. (We deliberately leak the previous
