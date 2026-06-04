@@ -7423,6 +7423,16 @@ handle_keypress:
     ; mods=0 means the binding is disabled. Only Shift|Ctrl|Alt bits
     ; (0|2|3 = mask 0x0D) participate in the comparison so AltGr/Lock
     ; don't accidentally suppress matches.
+    ;
+    ; Implicit-Shift rule: when the keypress used Shift to PRODUCE the
+    ; keysym (r13d=1 — e.g. Shift+- → underscore, Shift+/ → question)
+    ; AND the binding doesn't explicitly include Shift in its mod byte,
+    ; the Shift bit in state is the price of typing the character, not
+    ; an extra modifier the user must hold. Strip it before comparing,
+    ; so `key.font_reset = alt+underscore` matches a physical Alt+Shift+-.
+    ; If the binding DOES include Shift in mod, the user explicitly
+    ; wants Shift counted (e.g. Ctrl+Shift+UppercaseA) — leave state
+    ; alone and require an exact match.
     xor ecx, ecx
 .hkp_kbd_loop:
     cmp ecx, KB_COUNT
@@ -7432,6 +7442,12 @@ handle_keypress:
     jz .hkp_kbd_next
     mov esi, ebx
     and esi, 0x0D
+    test r13d, r13d
+    jz .hkp_kbd_compare
+    test edx, 1
+    jnz .hkp_kbd_compare
+    and esi, ~1                   ; implicit-Shift strip
+.hkp_kbd_compare:
     cmp esi, edx
     jne .hkp_kbd_next
     cmp eax, [keybind_keysyms + rcx*4]
@@ -18754,12 +18770,11 @@ init_keybindings:
     ; font_dec: Alt + minus
     mov byte [keybind_mods + KB_FONT_DEC], 8
     mov dword [keybind_keysyms + KB_FONT_DEC*4], 0x2D
-    ; font_reset: Alt+Shift+- (produces underscore on most layouts).
-    ; The dispatch (.hkp_kbd_loop) does an EXACT match on state & 0x0D,
-    ; so the binding's mod byte must include the Shift bit that's
-    ; physically held to produce '_'. Was 8 (Alt only) — never matched
-    ; because the KeyPress event arrives with state=9 (Alt|Shift).
-    mov byte [keybind_mods + KB_FONT_RESET], 9
+    ; font_reset: alt+underscore. The dispatch's implicit-Shift rule
+    ; (.hkp_kbd_loop) understands that producing '_' requires Shift, so
+    ; mod=8 here matches the physical Alt+Shift+- — state's Shift bit is
+    ; stripped because the binding doesn't explicitly require Shift.
+    mov byte [keybind_mods + KB_FONT_RESET], 8
     mov dword [keybind_keysyms + KB_FONT_RESET*4], 0x5F
     ; bg_cycle: Alt + b
     mov byte [keybind_mods + KB_BG_CYCLE], 8
