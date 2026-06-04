@@ -11336,20 +11336,28 @@ selection_scroll_step_up:
     inc rax
     mov [scroll_offset], rax
     ; Shift selection start down by 1 (content shifted down on screen
-    ; because viewport scrolled up into older history). Do it only
-    ; during an active drag and only while the start is still inside
-    ; the visible grid — once it walks off the bottom, leave it
-    ; pinned there so the selection visually extends from the bottom
-    ; edge of the viewport.
+    ; because viewport scrolled up into older history). Only during an
+    ; active drag — for plain Shift+PgUp the existing selection range
+    ; should stay pinned to the viewport rows, not chase the content.
+    ;
+    ; Earlier code clamped sel_start_row at grid_rows-1 (last visible)
+    ; "so the selection visually extends from the bottom edge of the
+    ; viewport." That looked right but broke selection_extract: with
+    ; the click anchor pinned at the last visible row, iteration
+    ; stopped at the viewport bottom even after the user dragged
+    ; further up, so the off-screen-below portion of the selection
+    ; never made it into the paste buffer.
+    ;
+    ; Let sel_start_row grow past grid_rows-1; selection_extract's
+    ; .se_row_grid_shifted path maps r12 → live[r12 - scroll_offset]
+    ; which stays in bounds because we increment scroll_offset and
+    ; sel_start_row in lockstep (their difference is the original
+    ; live-grid row at click time, always in [0, grid_rows-1]).
+    ; The visual still looks correct because is_cell_selected only
+    ; queries viewport-visible rows, so they all light up.
     cmp qword [sel_button_held], 0
-    je .sssu_done
+    je .sssu_render
     mov rcx, [sel_start_row]
-    mov rdx, [grid_rows]
-    test rdx, rdx
-    jz .sssu_render
-    dec rdx
-    cmp rcx, rdx
-    jge .sssu_render
     inc rcx
     mov [sel_start_row], rcx
 .sssu_render:
@@ -18746,8 +18754,12 @@ init_keybindings:
     ; font_dec: Alt + minus
     mov byte [keybind_mods + KB_FONT_DEC], 8
     mov dword [keybind_keysyms + KB_FONT_DEC*4], 0x2D
-    ; font_reset: Alt + underscore (Alt+Shift+- on most layouts)
-    mov byte [keybind_mods + KB_FONT_RESET], 8
+    ; font_reset: Alt+Shift+- (produces underscore on most layouts).
+    ; The dispatch (.hkp_kbd_loop) does an EXACT match on state & 0x0D,
+    ; so the binding's mod byte must include the Shift bit that's
+    ; physically held to produce '_'. Was 8 (Alt only) — never matched
+    ; because the KeyPress event arrives with state=9 (Alt|Shift).
+    mov byte [keybind_mods + KB_FONT_RESET], 9
     mov dword [keybind_keysyms + KB_FONT_RESET*4], 0x5F
     ; bg_cycle: Alt + b
     mov byte [keybind_mods + KB_BG_CYCLE], 8
