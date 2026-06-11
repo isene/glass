@@ -10541,6 +10541,42 @@ grid_put_char:
     mov ecx, [cur_bg_pixel]
     mov [grid + rbx + 12], ecx       ; [12-15] bg pixel
 
+    ; Wide colour-emoji: also write the continuation cell (N+1) as a blank
+    ; that carries the SAME background + colours. The emoji is composited
+    ; two cells wide in a LATER pass, over whatever the bg pass painted for
+    ; each cell; cell N+1 is never otherwise written here (the cursor just
+    ; advances by 2), so it keeps the previous frame's bg — typically black
+    ; — and shows through behind the emoji's right half on a coloured pane.
+    ; A real terminal paints both cells of a wide glyph with the active bg.
+    ; Scoped to the emoji path (ATTR_IS_EMOJI|ATTR_IS_WIDE): the emoji
+    ; overdraws the blank, so it is safe. Wide *text* glyphs are left alone
+    ; — their glyph is drawn in the text pass and a spacer would erase its
+    ; right half.
+    mov cl, [cur_attrs]
+    and cl, 8 | 32                           ; ATTR_IS_EMOJI | ATTR_IS_WIDE
+    cmp cl, 8 | 32
+    jne .gpc_no_widecont
+    mov rax, [cursor_col]
+    inc rax
+    cmp rax, [grid_cols]
+    jge .gpc_no_widecont                     ; continuation would be off-row
+    mov word [grid + rbx + CELL_SIZE], 0x20  ; [0-1] blank glyph
+    movzx ecx, byte [cur_fg_default]
+    mov [grid + rbx + CELL_SIZE + 2], cl     ; [2] fg default flag
+    movzx ecx, byte [cur_bg_default]
+    mov [grid + rbx + CELL_SIZE + 3], cl     ; [3] bg default flag
+    movzx ecx, byte [cur_attrs]
+    and cl, ~(8 | 32)                        ; spacer: not emoji, not wide
+    mov [grid + rbx + CELL_SIZE + 4], cl     ; [4] attrs
+    movzx ecx, byte [cur_osc8_id]
+    mov [grid + rbx + CELL_SIZE + 5], cl     ; [5] OSC 8 link id
+    mov word [grid + rbx + CELL_SIZE + 6], 0 ; [6-7] no emoji index
+    mov ecx, [cur_fg_pixel]
+    mov [grid + rbx + CELL_SIZE + 8], ecx    ; [8-11] fg pixel
+    mov ecx, [cur_bg_pixel]
+    mov [grid + rbx + CELL_SIZE + 12], ecx   ; [12-15] bg pixel
+.gpc_no_widecont:
+
     ; Cursor advance: 1 cell for normal chars, 2 cells for chars marked
     ; ATTR_IS_WIDE (set in .vtp_put_emoji when the codepoint is in the
     ; wide_bmp_ranges table — Unicode EAW=W or Emoji_Presentation). The
