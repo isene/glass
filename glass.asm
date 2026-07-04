@@ -1905,7 +1905,13 @@ x11_connect:
     dec edx
     jnz .xc_pad_name
 .xc_auth_data:
-    ; Auth data (16 bytes, already 4-aligned)
+    ; Auth data (16 bytes, already 4-aligned). Only when we HAVE a cookie:
+    ; the block declares auth-data-len = xauth_len, and writing the zeroed
+    ; cookie area anyway put 16 undeclared bytes on the wire — the server
+    ; parsed them as garbage requests (desynced connection, the all-zero
+    ; "x11 err" floods). Same fix as tile/strip; spot always had the guard.
+    cmp qword [xauth_len], 0
+    je  .xc_setup_send
     lea rsi, [xauth_data]
     mov ecx, 16
 .xc_cp_auth_data:
@@ -1915,6 +1921,7 @@ x11_connect:
     inc rdi
     dec ecx
     jnz .xc_cp_auth_data
+.xc_setup_send:
 
     ; Calculate total length
     mov rdx, rdi
