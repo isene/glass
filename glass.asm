@@ -918,6 +918,7 @@ hover_osc8_col_end:   resd 1        ; inclusive
 ; "log file unavailable" (kernel never returns 0 from open with
 ; stdin still open).
 log_fd_glass:       resq 1
+dbg_trace_b:        resb 2               ; TEMP paste-race trace bytes
 
 ; Config (.glassrc)
 cfg_bg_pixel:       resd 1
@@ -967,7 +968,8 @@ KB_FONT_DEC      equ 1
 KB_FONT_RESET    equ 2
 KB_BG_CYCLE      equ 3
 KB_OPACITY       equ 4
-KB_COUNT         equ 5
+KB_PASTE         equ 5
+KB_COUNT         equ 6
 keybind_mods:    resb KB_COUNT
 keybind_keysyms: resd KB_COUNT
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
@@ -2540,7 +2542,14 @@ x11_drain_until_reply_at:
     test al, al
     jz .xdra_fail                   ; X11 error
     cmp al, 1
-    jne .xdra_read_hdr              ; event, drop and reuse slot
+    je .xdra_is_reply
+    mov byte [dbg_trace_b], 0xF3     ; TEMP trace: drain_at ate an event
+    mov [dbg_trace_b + 1], al
+    lea rsi, [dbg_trace_b]
+    mov edx, 2
+    call log_write_buf
+    jmp .xdra_read_hdr              ; event, drop and reuse slot
+.xdra_is_reply:
     mov eax, [x11_buf + r14 + 4]
     shl eax, 2
     test eax, eax
@@ -2599,7 +2608,14 @@ x11_drain_until_reply:
     test al, al
     jz .xdr_fail                  ; X11 error
     cmp al, 1
-    jne .xdr_read_hdr             ; event, drop and retry
+    je .xdr_is_reply
+    mov byte [dbg_trace_b], 0xF5     ; TEMP trace: drain ate an event
+    mov [dbg_trace_b + 1], al
+    lea rsi, [dbg_trace_b]
+    mov edx, 2
+    call log_write_buf
+    jmp .xdr_read_hdr             ; event, drop and retry
+.xdr_is_reply:
     ; Reply: drain any extra bytes (reply length in 4-byte units at +4)
     mov eax, [x11_buf + 4]
     shl eax, 2
@@ -6102,6 +6118,14 @@ handle_x11_events:
 
     ; Event type (first byte, strip send_event flag)
     movzx eax, byte [x11_buf + rbx]
+    mov [dbg_trace_b], al            ; TEMP trace
+    push rsi
+    push rdx
+    lea rsi, [dbg_trace_b]
+    mov edx, 1
+    call log_write_buf
+    pop rdx
+    pop rsi
     and eax, 0x7F
 
     cmp al, 0                ; error
@@ -7105,6 +7129,10 @@ handle_x11_events:
     ; property at offset 20 (CARD32)
     push rbx
     push r12
+    mov byte [dbg_trace_b], 0xF1     ; TEMP trace: sel_notify entered
+    lea rsi, [dbg_trace_b]
+    mov edx, 1
+    call log_write_buf
     mov eax, [x11_buf + rbx + 20]
     test eax, eax
     jz .hxe_sn_done                  ; property = None, paste failed
@@ -7470,6 +7498,8 @@ handle_keypress:
     je .hkp_bg_cycle
     cmp ecx, KB_OPACITY
     je .hkp_opacity_toggle
+    cmp ecx, KB_PASTE
+    je .hkp_paste_primary
 .hkp_kbd_next:
     inc ecx
     jmp .hkp_kbd_loop
@@ -16145,7 +16175,7 @@ load_config:
     ret
 
 .lc_try_keybind:
-    ; Match "key.NAME = ..." for the five Alt-action bindings.
+    ; Match "key.NAME = ..." for the six Alt-action bindings.
     cmp dword [rsi], 'key.'
     jne .lc_skip_line
     add rsi, 4
@@ -16188,13 +16218,21 @@ load_config:
     jmp .lc_kb_call
 .lc_kb_try_opacity:
     cmp dword [rsi], 'opac'
-    jne .lc_skip_line
+    jne .lc_kb_try_paste
     cmp word [rsi+4], 'it'
-    jne .lc_skip_line
+    jne .lc_kb_try_paste
     cmp byte [rsi+6], 'y'
-    jne .lc_skip_line
+    jne .lc_kb_try_paste
     add rsi, 7
     mov edi, KB_OPACITY
+    jmp .lc_kb_call
+.lc_kb_try_paste:
+    cmp dword [rsi], 'past'
+    jne .lc_skip_line
+    cmp byte [rsi+4], 'e'
+    jne .lc_skip_line
+    add rsi, 5
+    mov edi, KB_PASTE
 .lc_kb_call:
     call lc_skip_to_value
     call parse_keybinding
@@ -18825,6 +18863,10 @@ init_keybindings:
     ; opacity_toggle: Alt + t
     mov byte [keybind_mods + KB_OPACITY], 8
     mov dword [keybind_keysyms + KB_OPACITY*4], 0x74
+    ; paste: Alt + v — pastes PRIMARY, same as Shift+Insert (replaces
+    ; the old tile-level "universal paste" grab; Alt is glass's realm)
+    mov byte [keybind_mods + KB_PASTE], 8
+    mov dword [keybind_keysyms + KB_PASTE*4], 0x76
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
