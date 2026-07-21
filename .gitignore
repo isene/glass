@@ -1,3 +1,5 @@
 glass
 *.o
 CLAUDE.md
+*.deb
+pkgroot/

@@ -300,6 +300,23 @@ empty value disables the binding.
 
 All three: pure x86_64 assembly, no libc, no dependencies, direct syscalls.
 
+## Packages
+
+**Debian/Ubuntu**: every release ships a dependency-free static amd64
+`.deb` — grab it from the
+[latest release](https://github.com/isene/glass/releases/latest) and:
+
+```bash
+sudo apt install ./glass_*_amd64.deb
+```
+
+**Arch**: a `PKGBUILD` is included in the repo root:
+
+```bash
+git clone https://github.com/isene/glass.git && cd glass && makepkg -si
+```
+
+
 ## License
 
 [Unlicense](https://unlicense.org/) (public domain)
