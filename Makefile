@@ -37,4 +37,17 @@ uninstall:
 clean:
 	rm -f glass glass.o
 
-.PHONY: install install-emoji emoji-cache uninstall clean
+.PHONY: install install-emoji emoji-cache uninstall clean deb
+
+# ── Debian package ─────────────────────────────────────────────────────
+# Version comes from the README badge (the repo's single version marker).
+VERSION := $(shell grep -oP 'version-\K[0-9.]+(?=-blue)' README.md)
+
+deb: glass
+	rm -rf pkgroot
+	$(MAKE) install DESTDIR=$(CURDIR)/pkgroot PREFIX=/usr
+	install -Dm644 LICENSE pkgroot/usr/share/doc/glass/copyright
+	install -d pkgroot/DEBIAN
+	printf 'Package: glass\nVersion: $(VERSION)\nArchitecture: amd64\nMaintainer: Geir Isene <g@isene.com>\nSection: x11\nPriority: optional\nHomepage: https://github.com/isene/glass\nDescription: Terminal emulator in x86_64 assembly\n Speaks the X11 wire protocol directly, no libc, no toolkit. Embedded\n TrueType rasterizer, kitty graphics, color emoji, pseudo-transparency.\n Single static binary.\n' > pkgroot/DEBIAN/control
+	dpkg-deb --build --root-owner-group pkgroot glass_$(VERSION)_amd64.deb
+	rm -rf pkgroot
