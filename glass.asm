@@ -26,6 +26,7 @@
 %define SYS_SETSID      112
 %define SYS_CLOCK_GETTIME 228
 %define SYS_PIPE         22
+%define SYS_ACCESS       21
 %define SYS_MKDIR        83
 %define SYS_CREAT        85
 
@@ -238,6 +239,11 @@ emoji_sys_cache_dir:     db "/usr/local/share/glass/emoji", 0
 ; and pango_arg are filled in BSS before fork). Output is raw RGBA
 ; bytes on stdout (depth 8, 4 bytes per pixel).
 convert_path:     db "/usr/bin/convert", 0
+; Stock DejaVuSansMono locations probed when .glassrc has no font_path —
+; a bare install then still gets TTF text on servers without core fonts
+; (frame). Debian/Ubuntu/Mint path first, then Arch.
+fb_font_deb:      db "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0
+fb_font_arch:     db "/usr/share/fonts/TTF/DejaVuSansMono.ttf", 0
 convert_arg_size: db "-size", 0
 convert_arg_bg:   db "-background", 0
 convert_arg_none: db "none", 0
@@ -1428,6 +1434,41 @@ _start:
     ; return to it later regardless of how often the user hit Alt+plus.
     mov rax, [cfg_font_size]
     mov [original_font_size], rax
+
+    ; No font_path in .glassrc → probe stock DejaVuSansMono locations
+    ; (fb_font_deb/arch). Two access() calls max, startup-only. Without
+    ; this a config-less glass falls back to X core fonts, which frame
+    ; does not serve — blank terminal (Mint tester, 2026-07-23).
+    cmp qword [cfg_font_path_set], 0
+    jne .fbf_done
+    push rbx
+    lea rbx, [fb_font_deb]
+    mov rdi, rbx
+    xor esi, esi                     ; F_OK
+    mov eax, SYS_ACCESS
+    syscall
+    test rax, rax
+    jz .fbf_use
+    lea rbx, [fb_font_arch]
+    mov rdi, rbx
+    xor esi, esi
+    mov eax, SYS_ACCESS
+    syscall
+    test rax, rax
+    jnz .fbf_pop
+.fbf_use:
+    lea rdi, [cfg_font_path]
+.fbf_copy:
+    mov al, [rbx]
+    mov [rdi], al
+    inc rbx
+    inc rdi
+    test al, al
+    jnz .fbf_copy
+    mov qword [cfg_font_path_set], 1
+.fbf_pop:
+    pop rbx
+.fbf_done:
 
     ; If font_path is configured, load up to four TTFs (regular,
     ; italic, bold, bold-italic) into separate per-font snapshots
