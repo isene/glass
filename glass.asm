@@ -738,6 +738,7 @@ apc_log_line_buf:    resb 256
 ; firehose (test 4 of /tmp/test_kitty_tf).
 vt_pending_esc:      resb 1
 img_table:          resb IMG_SLOTS * IMG_SLOT_SIZE
+img_evict_next:     resd 1          ; round-robin eviction cursor
 place_table:        resb PLACE_SLOTS * PLACE_SLOT_SIZE
 place_count:        resq 1
 img_decode_buf:     resq 1          ; mmap'd RGBA scratch (decoded PNG)
@@ -17965,9 +17966,27 @@ img_alloc:
     inc ecx
     jmp .ia_scan
 .ia_evict:
-    ; All used — evict slot 0 (simple FIFO; could be smarter)
-    lea rsi, [img_table]
-    call img_release_picture_in_rsi
+    ; All used — evict round-robin. A fixed victim (old: always slot 0)
+    ; let dead images from quit apps squat in every other slot while the
+    ; running app's uploads fought over one; fe2o3 launcher logos went
+    ; missing after enough run/quit cycles (2026-07-27). The cursor
+    ; strictly advances, so a burst of ≤IMG_SLOTS uploads never evicts
+    ; its own images.
+    mov eax, [img_evict_next]
+    inc dword [img_evict_next]
+    cmp dword [img_evict_next], IMG_SLOTS
+    jl .ia_ev_wrapped
+    mov dword [img_evict_next], 0
+.ia_ev_wrapped:
+    imul eax, IMG_SLOT_SIZE
+    lea rsi, [img_table + rax]
+    push rdi                         ; rdi = new image id; the release
+    call img_release_picture_in_rsi  ; helper clobbers rdi (tmp_buf
+    pop rdi                          ; cursor) — .ia_take would then
+                                     ; store a garbage id (pre-existing
+                                     ; bug in the old evict-slot-0 path:
+                                     ; every post-full image became
+                                     ; unfindable)
 .ia_take:
     mov [rsi], edi
     mov dword [rsi + 4], 0

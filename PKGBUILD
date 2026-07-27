@@ -1,6 +1,6 @@
 # Maintainer: Geir Isene <g@isene.com>
 pkgname=glass
-pkgver=0.3.46
+pkgver=0.3.47
 pkgrel=1
 pkgdesc="Terminal emulator in x86_64 assembly. X11 wire protocol, no libc. Embedded TTF rasterizer, kitty graphics, color emoji."
 arch=('x86_64')
