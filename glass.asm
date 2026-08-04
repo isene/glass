@@ -628,6 +628,7 @@ class_arg:           resq 1
 ; codepoint, on a miss we emit the dead key's spacing equivalent and
 ; then process the new key normally.
 pending_dead:        resb 1
+dead_pending_key:    resd 1          ; keysym following a dead key (compose)
 
 ; X11 connection
 x11_fd:             resq 1
@@ -7580,27 +7581,30 @@ handle_keypress:
     jmp .hkp_emit_ucs
 
 .hkp_compose_lookup:
-    ; Walk compose_table for (cl, al-low-byte). edx scratches over entries.
-    push rax                              ; preserve current keysym
+    ; Walk compose_table for (pending dead in cl, this keysym). Entries are
+    ; dead | base<<8 | composed<<16.
+    ;
+    ; Two bugs lived here until 2026-08-03, which together meant dead keys
+    ; NEVER composed. First, `mov dh, al` overwrote the entry's base char
+    ; before the shift, so the compare ended up testing the typed key
+    ; against the low byte of the COMPOSED codepoint ('e' vs 0xE9 for é) —
+    ; a miss every time. Second, ebx doubles as the table index here, but
+    ; ebx carries the modifier state for the rest of handle_key_press, so
+    ; the fall-through delivered a stray Ctrl (dead + e came out as 0x05).
+    mov [dead_pending_key], eax           ; the key that follows the dead one
+    push rbx                              ; modifier state, restored on both exits
     xor ebx, ebx
 .hkp_cl_loop:
     mov edx, [compose_table + rbx*4]
     test edx, edx
     jz .hkp_cl_miss
-    cmp dl, cl
+    cmp dl, cl                            ; same dead key?
     jne .hkp_cl_next
-    pop rax                               ; restore key (also into al)
-    push rax
-    mov dh, al                            ; key low byte
-    shr edx, 8
-    cmp dl, dh
+    cmp dh, [dead_pending_key]            ; same base character?
     jne .hkp_cl_next
-    ; Match — composed UCS-2 sits in the high 16 bits of the original
-    ; entry. Re-load it cleanly.
-    mov edx, [compose_table + rbx*4]
-    shr edx, 16
+    shr edx, 16                           ; composed codepoint
     movzx eax, dx
-    add rsp, 8                            ; drop saved keysym (consumed)
+    pop rbx
     jmp .hkp_emit_ucs
 .hkp_cl_next:
     inc ebx
@@ -7614,7 +7618,8 @@ handle_keypress:
     jz .hkp_cl_miss_no_dead_char
     call emit_ucs_inline
 .hkp_cl_miss_no_dead_char:
-    pop rax                               ; restore the new key
+    pop rbx                               ; after the call: it may clobber rbx
+    mov eax, [dead_pending_key]
     jmp .hkp_no_dead
 
 .hkp_emit_ucs:
