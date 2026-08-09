@@ -11658,12 +11658,16 @@ selection_extract:
 .se_row_grid_shifted:
     mov rax, r12
     sub rax, [scroll_offset]
+    cmp rax, MAX_ROWS           ; guard: shifted row must be in [0, MAX_ROWS)
+    jge .se_done
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
     lea rbx, [grid + rax]
     jmp .se_row_base_done
 .se_row_live:
     mov rax, r12
+    cmp rax, MAX_ROWS           ; guard: row must be in [0, MAX_ROWS)
+    jge .se_done
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
     lea rbx, [grid + rax]
