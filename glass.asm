@@ -3473,6 +3473,13 @@ x11_create_gc:
 .xgcbg_def:
     mov eax, [x11_black_pixel]
 .xgcbg_set:
+    cmp dword [x11_argb_colormap], 0
+    je .xgcbg_no_alpha
+    and eax, 0x00FFFFFF
+    movzx ecx, byte [cfg_opacity]
+    shl ecx, 24
+    or eax, ecx
+.xgcbg_no_alpha:
     mov [rdi+16], eax
 
     lea rsi, [tmp_buf]
