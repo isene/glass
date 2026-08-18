@@ -12594,8 +12594,6 @@ render_screen:
 .rs_dmap_zero_done:
     cmp qword [all_dirty], 0
     jne .rs_dmap_done                  ; full repaint → bitmap unused
-    cmp qword [scroll_offset], 0
-    jne .rs_dmap_done                  ; scrollback path doesn't use mirror
     xor r12d, r12d
 .rs_dmap_row:
     cmp r12, [grid_rows]
@@ -12603,11 +12601,18 @@ render_screen:
     push rdi
     push rsi
     push rcx
+    ; Compare what this display row SHOWS (scrollback / shifted /
+    ; live, via row_src_ptr) against what was last painted. The
+    ; scrolled view used to skip this pre-pass and force-paint every
+    ; row instead; the mirror is display-content now, so the compare
+    ; holds in scrollback too.
+    mov rdi, r12
+    call row_src_ptr
+    mov rsi, rax
     mov rax, r12
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
-    lea rdi, [grid + rax]
-    lea rsi, [prev_paint_grid + rax]
+    lea rdi, [prev_paint_grid + rax]
     mov rcx, [grid_cols]
     imul rcx, CELL_SIZE
     shr rcx, 3
@@ -12628,13 +12633,12 @@ render_screen:
     ; visual highlight is applied per-cell via is_cell_selected during
     ; paint, not stored in grid bytes — so a selection-only change
     ; never trips the grid-vs-prev pre-pass and these rows must be
-    ; force-painted explicitly. Skipped under all_dirty / scrollback
-    ; (both already paint every row).
+    ; force-painted explicitly. Skipped under all_dirty (already
+    ; paints every row). Selection rows are display rows, so the
+    ; band applies unchanged in the scrolled view.
     cmp byte [sel_dirty_flag], 0
     je .rs_sel_dmap_done
     cmp qword [all_dirty], 0
-    jne .rs_sel_dmap_done
-    cmp qword [scroll_offset], 0
     jne .rs_sel_dmap_done
     push rcx
     mov rcx, [sel_dirty_min]
@@ -12939,6 +12943,49 @@ paint_margins:
     pop rdi
     ret
 
+; ----------------------------------------------------------------------------
+; row_src_ptr — rdi = display row. Returns rax = pointer to that row's cell
+; bytes: the scrollback ring while the row is history, the shifted grid row
+; while the view is scrolled, the live grid row otherwise. The ONE mapping,
+; shared by the dirty pre-pass and the paint loop, so they cannot disagree.
+; Clobbers rax only.
+; ----------------------------------------------------------------------------
+row_src_ptr:
+    mov rax, [scroll_offset]
+    test rax, rax
+    jz .rsp_live
+    cmp rdi, rax
+    jge .rsp_shifted
+    ; History row: circular-buffer position =
+    ; (scroll_write_pos - scroll_offset + display_row) mod 1000
+    mov rax, [scroll_write_pos]
+    sub rax, [scroll_offset]
+    add rax, rdi
+    test rax, rax
+    jns .rsp_pos
+    add rax, 1000
+.rsp_pos:
+    cmp rax, 1000
+    jl .rsp_ok
+    sub rax, 1000
+.rsp_ok:
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rax, [scroll_buf + rax]
+    ret
+.rsp_shifted:
+    mov rax, rdi
+    sub rax, [scroll_offset]
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rax, [grid + rax]
+    ret
+.rsp_live:
+    mov rax, rdi
+    imul rax, MAX_COLS
+    imul rax, CELL_SIZE
+    lea rax, [grid + rax]
+    ret
+
 rs_row_loop:
     ; Draw each row with per-color-run rendering
     ; When scroll_offset > 0, top rows come from scrollback buffer
@@ -12947,57 +12994,17 @@ rs_row_loop:
     cmp r12, [grid_rows]
     jge .rs_after_rows
 
-    ; Compute row base pointer accounting for scrollback
-    mov rax, [scroll_offset]
-    test rax, rax
-    jz .rs_row_live
-
-    ; Scrolled back: which source row?
-    ; scroll_offset = N means show N lines of history above
-    ; display_row < grid_rows is mapped to:
-    ;   if display_row < scroll_offset: read from scrollback
-    ;   else: read from grid row (display_row - scroll_offset)
-    mov rax, [scroll_offset]
-    cmp r12, rax
-    jge .rs_row_grid_shifted
-
-    ; This row comes from scrollback
-    ; scrollback line index = scroll_lines - scroll_offset + display_row
-    ; position in circular buffer = (write_pos - scroll_offset + display_row) mod 1000
-    mov rax, [scroll_write_pos]
-    sub rax, [scroll_offset]
-    add rax, r12
-    ; Make positive (mod 1000)
-    test rax, rax
-    jns .rs_sb_pos
-    add rax, 1000
-.rs_sb_pos:
-    ; rax might still be >= 1000 if write_pos wrapped around
-    cmp rax, 1000
-    jl .rs_sb_ok
-    sub rax, 1000
-.rs_sb_ok:
-    imul rax, MAX_COLS * CELL_SIZE
-    lea rax, [scroll_buf + rax]
-    mov [rs_row_base], rax
-    jmp .rs_row_ready
-
-.rs_row_grid_shifted:
-    ; This row comes from grid, shifted
-    mov rax, r12
-    sub rax, [scroll_offset]
-    imul rax, MAX_COLS
-    imul rax, CELL_SIZE
-    lea rax, [grid + rax]
-    mov [rs_row_base], rax
-    jmp .rs_row_ready
-
-.rs_row_live:
-    ; Normal (live view): row directly from grid
-    mov rax, r12
-    imul rax, MAX_COLS
-    imul rax, CELL_SIZE
-    lea rax, [grid + rax]
+    ; Row source via row_src_ptr — scrollback ring / shifted grid /
+    ; live grid. The scrolled view used to bypass the dirty machinery
+    ; entirely ("scrollback always paints"), which made every render
+    ; while scrolled a full-window repaint. A selection drag delivers
+    ; motion events per pixel of travel, so dragging in scrollback
+    ; painted every cell dozens of times a second where the live view
+    ; paints only the selection's row band. Now scrolled rows get the
+    ; same mirror compare: the pre-pass diffs display content against
+    ; prev_paint_grid, so a drag repaints only the rows that changed.
+    mov rdi, r12
+    call row_src_ptr
     mov [rs_row_base], rax
 
     ; Default paint range: full row. Force-render branches below leave
@@ -13011,12 +13018,9 @@ rs_row_loop:
     ; this row if its own bit is set OR if a neighbour bit is set
     ; (±1 row smear) — glyph bleed from a changed row needs the
     ; neighbour to repaint so the bleed-into-neighbour pixels get
-    ; cleaned. Force-render conditions (all_dirty=1, scrollback)
-    ; bypass the bitmap entirely.
+    ; cleaned. all_dirty=1 bypasses the bitmap entirely.
     cmp qword [all_dirty], 0
     jne .rs_row_ready
-    cmp qword [scroll_offset], 0
-    jne .rs_row_ready                   ; scrollback always paints
     movzx eax, byte [row_dirty_map + r12]
     test eax, eax
     jnz .rs_row_dirty
@@ -13107,7 +13111,7 @@ rs_row_loop:
     mov rax, r12
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
-    lea rsi, [grid + rax]
+    mov rsi, [rs_row_base]             ; display content (== grid row when live)
     lea rdi, [prev_paint_grid + rax]
     mov r10, -1
     mov r11, -1
@@ -13818,13 +13822,12 @@ rs_row_loop:
     pop rdx
     pop rsi
     pop rdi
-    ; Mirror the grid row we just painted into prev_paint_grid so the
-    ; next render's dirty-skip check has something to compare against.
-    ; Skip this when scroll_offset != 0 (rows came from scrollback /
-    ; shifted, not the live grid) — leaving the live mirror untouched
-    ; means the first frame after exiting scrollback re-paints fully.
-    cmp qword [scroll_offset], 0
-    jne .rs_row_skip_copy
+    ; Mirror the row we just painted into prev_paint_grid so the next
+    ; render's dirty-skip has something to compare against. The mirror
+    ; holds DISPLAY content (rs_row_base), so it is valid in the
+    ; scrolled view too; entering, leaving or moving the scrollback
+    ; changes scroll_offset, which force-fulls the next render and
+    ; rebuilds the mirror for the new view.
     push rdi
     push rsi
     push rcx
@@ -13832,7 +13835,7 @@ rs_row_loop:
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
     lea rdi, [prev_paint_grid + rax]
-    lea rsi, [grid + rax]
+    mov rsi, [rs_row_base]
     mov rcx, [grid_cols]
     imul rcx, CELL_SIZE
     shr rcx, 3
@@ -13840,7 +13843,6 @@ rs_row_loop:
     pop rcx
     pop rsi
     pop rdi
-.rs_row_skip_copy:
 .rs_row_skip:
     inc r12
     jmp .rs_row
