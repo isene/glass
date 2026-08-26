@@ -1432,6 +1432,8 @@ _start:
 
     ; Load config from ~/.glassrc (before X11 connect)
     call load_config
+    ; GLASS_BG env overrides the file background (per-session colour).
+    call apply_bg_env
     ; Snapshot the configured font_size so Alt+_ (font reset) can
     ; return to it later regardless of how often the user hit Alt+plus.
     mov rax, [cfg_font_size]
@@ -2315,6 +2317,9 @@ log_path_glass: db "/tmp/glass.log", 0
 apc_log_env_name: db "GLASS_APC_LOG="
 apc_log_env_len  equ $ - apc_log_env_name
 
+glass_bg_env_name: db "GLASS_BG="
+glass_bg_env_len  equ $ - glass_bg_env_name
+
 ; If $GLASS_APC_LOG is set, open that path O_WRONLY|O_CREAT|O_APPEND
 ; for the lifetime of the process. Called once at startup. Failure is
 ; silent — apc_log_fd stays 0 and every later emit short-circuits.
@@ -2357,6 +2362,53 @@ apc_log_open:
     js .alo_done
     mov [apc_log_fd], rax
 .alo_done:
+    pop r12
+    pop rbx
+    ret
+
+; GLASS_BG=#RRGGBB (or GLASS_BG=RRGGBB) in the environment overrides the
+; .glassrc background, so a launcher (fleet) can give each glass its own
+; colour with no config file. Empty value = no change. Run once, after
+; load_config, so it wins over the file. hex_to_pixel reads exactly six
+; hex digits and treats any non-hex as 0, so a malformed value can only
+; yield an odd colour, never a crash.
+apply_bg_env:
+    push rbx
+    push r12
+    mov rbx, [envp]
+.abe_loop:
+    mov rax, [rbx]
+    test rax, rax
+    jz .abe_done
+    mov r12, rax
+    lea rdi, [glass_bg_env_name]
+    mov ecx, glass_bg_env_len
+.abe_cmp:
+    test ecx, ecx
+    jz .abe_match
+    mov al, [r12]
+    cmp al, [rdi]
+    jne .abe_next
+    inc r12
+    inc rdi
+    dec ecx
+    jmp .abe_cmp
+.abe_next:
+    add rbx, 8
+    jmp .abe_loop
+.abe_match:
+    cmp byte [r12], 0
+    je .abe_done
+    cmp byte [r12], '#'
+    jne .abe_parse
+    inc r12
+.abe_parse:
+    mov rsi, r12
+    call hex_to_pixel
+    mov [cfg_bg_pixel], eax
+    mov byte [cfg_bg_set], 1
+    mov [palette], eax
+.abe_done:
     pop r12
     pop rbx
     ret
