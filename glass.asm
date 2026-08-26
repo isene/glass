@@ -8443,6 +8443,30 @@ vt_process:
     cmp eax, 0xFEFF
     je .vtp_loop                 ; BOM / zero-width no-break space
 .vtp_zw_done:
+    ; Unicode SPACES the font has no glyph for. U+2000..U+200A (en/em
+    ; quads, thin/hair/six-per-em spaces), U+1680, U+205F and U+3000 are
+    ; blanks, but a font missing them sends the cell through the glyph
+    ; path and paints scrambled bits that smear into the row BELOW.
+    ; Seen 2026-08-26 in a bank mail masking a card as `• • • •` with
+    ; U+2006 between the bullets. Every cell is one column wide in a
+    ; terminal, so an em quad and a hair space can only ever be one
+    ; blank: fold them all to ASCII space, which always has a glyph.
+    ; U+00A0 and U+202F are left alone — fonts carry those, and folding
+    ; them would lose the no-break meaning on copy.
+    cmp eax, 0x1680
+    je .vtp_space_fold
+    cmp eax, 0x2000
+    jb .vtp_sp_done
+    cmp eax, 0x200A
+    jbe .vtp_space_fold
+    cmp eax, 0x205F
+    je .vtp_space_fold
+    cmp eax, 0x3000
+    jne .vtp_sp_done
+.vtp_space_fold:
+    mov eax, 0x20
+    mov [utf8_char], eax
+.vtp_sp_done:
     ; ── ZWJ emoji sequence detection ───────────────────────────────
     ; eax = base codepoint. A ZWJ emoji (polar bear 🐻‍❄️, families,
     ; professions, flags) is `BASE [VS16] (ZWJ BASE [VS16])+`. If a ZWJ
