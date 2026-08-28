@@ -19918,8 +19918,50 @@ ttf_render_with_fallback:
     call glyph_restore_pf_state
     pop rsi
     mov qword [ttf_font_active_slot], TTF_FONT_SLOT_FALLBACK
+    mov [twf_size], rsi
     mov rdi, r13
     call glyph_render_to_alpha
+    test eax, eax
+    jnz .trwf_no_rescale
+    ; A wide codepoint owns two cells. Fonts draw full-width glyphs on
+    ; their own em, so asking for the Latin size gives a glyph narrower
+    ; than the pair: DroidSansFallback at em 13 reports advance 18 where
+    ; two cells are 22, which is the airy CJK look. Scale the em by the
+    ; ratio the font itself just reported and render once more. Once per
+    ; distinct codepoint, since the upload is cached.
+    mov eax, r13d
+    cmp eax, 0xFFFF
+    ja .trwf_no_rescale
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    call is_wide_bmp
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    jnc .trwf_no_rescale
+    test r10, r10
+    jz .trwf_no_rescale
+    movzx eax, word [char_width]
+    add eax, eax                       ; want = two cells
+    cmp r10, rax
+    jae .trwf_no_rescale               ; already fills them
+    push rax
+    mov rax, [twf_size]
+    mul qword [rsp]                    ; size * want
+    xor edx, edx
+    div r10                            ; / advance
+    add rsp, 8
+    test rax, rax
+    jz .trwf_no_rescale
+    mov rsi, rax
+    mov rdi, r13
+    call glyph_render_to_alpha
+.trwf_no_rescale:
     ; Hold the engine's outputs across the slot restore, which walks
     ; the same registers.
     push rax
@@ -21256,7 +21298,6 @@ ttf_upload_glyph:
     movzx r10, word [char_width]       ; advance = char_width
     mov byte [output_buf], 0           ; alpha = 0 (transparent)
 .have_glyph:
-
     ; rcx=W rdx=H r8=bearing_x r9=bearing_y r10=advance
     mov r12, rcx                        ; W (will be clipped below)
     mov [src_glyph_w], rcx              ; save UNCLIPPED W as output_buf row stride
@@ -21639,3 +21680,9 @@ ensure_render_gc:
 ; no PGM emit, no argv/CLI helpers. See ../glyph/README.md for the API.
 %define GLYPH_LIB
 %include "../glyph/glyph.asm"
+
+
+section .bss
+twf_size: resq 1
+
+section .text
