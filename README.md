@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.51-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.52-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -77,7 +77,14 @@ opacity_cycle = 100,75,50,25,0
 font_weight = bold
 palette = tokyonight
 color1 = #e06c75
+font_path = /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+font_path_fallback = /usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf
 ```
+
+`font_path_fallback` names a second face to try for any glyph the main
+font has no outline for, which is how CJK, Cyrillic or box-drawing text
+renders when the main font stops at Latin. Leave it out and nothing
+changes.
 
 The default 16-color palette matches kitty's defaults so most modern
 TUIs (claude-code, lazygit, lazydocker, helix, etc.) render the way
@@ -146,6 +153,13 @@ for v0.4.)
   (e.g. CC's tree-prefix `⎿` → `└`, tool-call `⏵` → `▶`); blank-class
   codepoints (SPACE, NBSP, U+2007..U+200B etc.) upload as zero-area
   glyphs to avoid the X server's default-glyph placeholder
+- **Fallback font** via `font_path_fallback`: a second face for the
+  glyphs the main one has no outline for. DejaVu Sans Mono carries no
+  Japanese at all, so a CJK mail subject drew as nothing; point the key
+  at a wide-coverage face and it draws. Coverage decides, not a range
+  table, so Korean, Cyrillic, Greek and box drawing come along for
+  free. Opened on the first glyph that needs it and not before, so a
+  session that never meets one never touches the file
 - UTF-8 decoding state machine (2/3/4-byte sequences)
 - Per-color-run rendering (each color segment drawn separately)
 - 256-color palette with truecolor (24-bit) SGR mapping
