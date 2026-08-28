@@ -21305,6 +21305,31 @@ ttf_upload_glyph:
     mov r14, r8                         ; bearing_x (signed)
     mov r15, r9                         ; bearing_y
     mov rbp, r10                        ; advance
+    ; A wide codepoint owns two cells, and the cell after it emits its
+    ; own blank carrying char_width. So this glyph must contribute ONE
+    ; cell of advance, not the font's full-width figure, or the pair
+    ; steps three cells: 22 for the glyph plus 11 for the blank. The ink
+    ; is wider than the cell and spills into the second one, which is
+    ; exactly what should happen.
+    push rax
+    mov eax, ebx
+    cmp eax, 0xFFFF
+    ja .hg_adv_done
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    call is_wide_bmp
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    jnc .hg_adv_done
+    movzx ebp, word [char_width]
+.hg_adv_done:
+    pop rax
 
     ; Underscore (`_`, U+005F) workaround: DejaVu Sans Mono / many TTFs
     ; rasterise `_` as H=1 with bearing_y a few pixels below the
