@@ -13134,33 +13134,70 @@ paint_margins:
     call x11_buffer
     inc dword [x11_seq]
 .pm_no_bottom_paint:
-    ; Expand bbox to cover both margin strips (right + bottom).
+    ; Expand the BLT bbox over the margin strips — but only across the
+    ; band this frame actually painted, and only when that band reaches
+    ; the grid edge the strip protects.
+    ;
+    ; The old code expanded to the full window every time. The right
+    ; strip spans y=0..win_h and the bottom strip spans x=0..grid_w, so
+    ; their union is the whole window. That made every single-character
+    ; update a whole-window CopyArea, which frame then damaged and
+    ; composited as a full-screen repaint: one dot printed per 100 ms
+    ; cost 2,073,600 blitted pixels per frame.
+    ;
+    ; Nothing can bleed into a margin from a row we did not paint, so
+    ; the band is the correct bound. The strips are still FILLED in
+    ; full above; only what we copy to the window is narrowed.
     push rdi
     push rsi
     push rdx
     push rcx
+    cmp byte [blt_dirty], 1
+    jne .pm_bbox_done                      ; nothing painted → nothing bled
+    sub rsp, 32
+    mov rax, [blt_x0]
+    mov [rsp + 0], rax
+    mov rax, [blt_y0]
+    mov [rsp + 8], rax
+    mov rax, [blt_x1]
+    mov [rsp + 16], rax
+    mov rax, [blt_y1]
+    mov [rsp + 24], rax
+
+    ; Right strip: only if the painted band reached the last column.
     movzx eax, word [char_width]
     mov rdi, [grid_cols]
     imul rdi, rax                          ; right strip x = grid_w
-    xor esi, esi                           ; y = 0
+    mov rax, [rsp + 16]                    ; band x1
+    cmp rax, rdi
+    jl .pm_no_right_bbox
     mov rdx, [win_width]
     sub rdx, rdi                           ; w = win_w - grid_w
     jle .pm_no_right_bbox
-    mov rcx, [win_height]                  ; h = full window height
+    mov rsi, [rsp + 8]                     ; y = band y0
+    mov rcx, [rsp + 24]
+    sub rcx, rsi                           ; h = band height
+    jle .pm_no_right_bbox
     call expand_bbox
 .pm_no_right_bbox:
+    ; Bottom strip: only if the painted band reached the last row.
     movzx eax, word [char_height]
     mov rsi, [grid_rows]
     imul rsi, rax                          ; bottom strip y = grid_h
-    xor edi, edi                           ; x = 0
+    mov rax, [rsp + 24]                    ; band y1
+    cmp rax, rsi
+    jl .pm_no_bottom_bbox
     mov rcx, [win_height]
     sub rcx, rsi                           ; h = win_h - grid_h
     jle .pm_no_bottom_bbox
-    movzx eax, word [char_width]
-    mov rdx, [grid_cols]
-    imul rdx, rax                          ; w = grid_w
+    mov rdi, [rsp + 0]                     ; x = band x0
+    mov rdx, [rsp + 16]
+    sub rdx, rdi                           ; w = band width
+    jle .pm_no_bottom_bbox
     call expand_bbox
 .pm_no_bottom_bbox:
+    add rsp, 32
+.pm_bbox_done:
     pop rcx
     pop rdx
     pop rsi
