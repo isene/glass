@@ -137,6 +137,8 @@
 %define EV_SELECTION_CLEAR   29
 %define EV_SELECTION_REQUEST 30
 %define EV_SELECTION_NOTIFY  31
+%define EV_UNMAP_NOTIFY     18
+%define EV_MAP_NOTIFY       19
 
 ; X11 masks
 %define KEY_PRESS_MASK      0x00000001
@@ -193,6 +195,14 @@
 ; Data section
 ; ══════════════════════════════════════════════════════════════════════
 section .data
+
+; Is our window on screen? tile unmaps every window on the workspaces it
+; is not showing, so a terminal on a hidden workspace can keep receiving
+; PTY output for hours. Painting it costs the X server real work for
+; pixels nobody can see: an animating spinner on a hidden workspace still
+; burned ~32% of a core in frame. Default 1 so a session that never sees
+; a MapNotify still draws.
+win_mapped:     db 1
 
 ; X11 auth
 auth_name:      db "MIT-MAGIC-COOKIE-1"
@@ -6201,6 +6211,8 @@ event_loop:
     cmp byte [render_pending], 0
     je .ev_loop
     mov byte [render_pending], 0
+    cmp byte [win_mapped], 0                  ; hidden workspace: the grid is
+    je .ev_loop                               ; current, the pixels can wait
     call render_screen
     ; Skip scan_urls when render didn't actually paint anything (the
     ; grid bytes are unchanged from last scan, so the URL index can't
@@ -6284,6 +6296,10 @@ handle_x11_events:
     je .hxe_focus_in
     cmp al, EV_FOCUS_OUT
     je .hxe_focus_out
+    cmp al, EV_UNMAP_NOTIFY
+    je .hxe_unmap
+    cmp al, EV_MAP_NOTIFY
+    je .hxe_map
     ; Event type 13 (GraphicsExpose) and 14 (NoExposure) are informational
     ; events the X server generates for every CopyArea — the former when
     ; the source had pixels unavailable (parent obscured, etc.), the latter
@@ -6477,6 +6493,32 @@ handle_x11_events:
     call handle_keypress
     pop r12
     pop rbx
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_unmap:
+    ; Off-screen now (workspace switch, or the WM hid us). Stop painting:
+    ; the grid keeps updating from the PTY, the pixels just stop being
+    ; drawn until we come back. MapNotify below repaints everything.
+    mov eax, [x11_buf + rbx + 8]               ; event window
+    cmp eax, [win_id]
+    jne .hxe_unmap_done
+    mov byte [win_mapped], 0
+.hxe_unmap_done:
+    add rbx, 32
+    jmp .hxe_loop
+
+.hxe_map:
+    ; Back on screen. prev_paint_grid still mirrors whatever we last
+    ; painted, which can be many screens of scrollback out of date, so
+    ; force a full repaint rather than a dirty-row diff.
+    mov eax, [x11_buf + rbx + 8]               ; event window
+    cmp eax, [win_id]
+    jne .hxe_map_done
+    mov byte [win_mapped], 1
+    mov qword [all_dirty], 1
+    call request_render
+.hxe_map_done:
     add rbx, 32
     jmp .hxe_loop
 
