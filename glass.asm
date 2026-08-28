@@ -3786,6 +3786,36 @@ is_wide_bmp:
 ; for correctness).
 align 2
 wide_bmp_ranges:
+    ; --- East Asian Wide / Fullwidth text (Unicode EAW=W and F) -------
+    ; These are the ones that made a CJK subject drift: the cursor moved
+    ; one cell while the glyph was drawn two, so the app's column count
+    ; and glass's disagreed and the spill was never erased.
+    dw 0x1100, 0x115F                ; Hangul Jamo
+    dw 0x2E80, 0x2E99                ; CJK Radicals Supplement
+    dw 0x2E9B, 0x2EF3
+    dw 0x2F00, 0x2FD5                ; Kangxi Radicals
+    dw 0x2FF0, 0x2FFB                ; Ideographic Description
+    dw 0x3000, 0x303E                ; CJK Symbols and Punctuation
+    dw 0x3041, 0x3096                ; Hiragana
+    dw 0x3099, 0x30FF                ; Katakana
+    dw 0x3105, 0x312F                ; Bopomofo
+    dw 0x3131, 0x318E                ; Hangul Compatibility Jamo
+    dw 0x3190, 0x31E3                ; Kanbun, CJK Strokes
+    dw 0x31F0, 0x321E                ; Katakana Phonetic Ext, Enclosed CJK
+    dw 0x3220, 0x3247
+    dw 0x3250, 0x4DBF                ; Enclosed CJK, CJK Ext A
+    dw 0x4E00, 0xA48C                ; CJK Unified Ideographs, Yi
+    dw 0xA490, 0xA4C6                ; Yi Radicals
+    dw 0xA960, 0xA97C                ; Hangul Jamo Extended-A
+    dw 0xAC00, 0xD7A3                ; Hangul Syllables
+    dw 0xF900, 0xFAFF                ; CJK Compatibility Ideographs
+    dw 0xFE10, 0xFE19                ; Vertical forms
+    dw 0xFE30, 0xFE52                ; CJK Compatibility Forms
+    dw 0xFE54, 0xFE66
+    dw 0xFE68, 0xFE6B
+    dw 0xFF01, 0xFF60                ; Fullwidth forms
+    dw 0xFFE0, 0xFFE6                ; Fullwidth signs
+    ; --- emoji and symbols that render wide ---------------------------
     dw 0x231A, 0x231B                ; WATCH, HOURGLASS
     dw 0x23E9, 0x23EC                ; FAST FORWARD..PAUSE
     dw 0x23F0, 0x23F0                ; ALARM CLOCK
@@ -8727,7 +8757,18 @@ vt_process:
     jmp .vtp_put_char
 .vtp_put_char_bmp:
     movzx eax, ax
-    jmp .vtp_put_char
+    ; East Asian Wide text takes two cells, exactly as the emoji path
+    ; above already arranges. ATTR_IS_WIDE drives both the continuation
+    ; cell and the 2-cell cursor step, so this is the same shipped
+    ; mechanism, not the pad-cell rewrite that v0.3.30 took back out.
+    push rax
+    call is_wide_bmp                  ; CF=1 if the codepoint is EAW-wide
+    pop rax
+    jnc .vtp_put_char
+    or byte [cur_attrs], 32           ; ATTR_IS_WIDE
+    call grid_put_char
+    and byte [cur_attrs], ~32
+    jmp .vtp_loop
 
 .vtp_utf8_lead:
     ; Lead byte
@@ -10772,10 +10813,15 @@ grid_put_char:
     ; overdraws the blank, so it is safe. Wide *text* glyphs are left alone
     ; — their glyph is drawn in the text pass and a spacer would erase its
     ; right half.
-    mov cl, [cur_attrs]
-    and cl, 8 | 32                           ; ATTR_IS_EMOJI | ATTR_IS_WIDE
-    cmp cl, 8 | 32
-    jne .gpc_no_widecont
+    ; Wide TEXT gets the same treatment. The old comment here said a
+    ; spacer would erase the glyph's right half; it does not. Background
+    ; is filled for the whole run first and glyphs composite on top, and
+    ; SPACE uploads as a zero-area mask, so the wide glyph's right half
+    ; survives. Leaving the cell unwritten was the actual bug: it kept
+    ; the previous frame's content, which is what left CJK residue on
+    ; screen after a redraw.
+    test byte [cur_attrs], 32                ; ATTR_IS_WIDE
+    jz .gpc_no_widecont
     mov rax, [cursor_col]
     inc rax
     cmp rax, [grid_cols]
