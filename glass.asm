@@ -9502,11 +9502,67 @@ vt_process:
     je .vtp_csi_set_mode
     cmp al, 'l'
     je .vtp_csi_reset_mode
+    cmp al, 'n'
+    je .vtp_csi_dsr
     cmp al, ' '
     je .vtp_csi_space       ; intermediate byte for CSI Ps SP q
     ; Check for 'q' with space intermediate (cursor style)
     cmp al, 'q'
     je .vtp_csi_check_q
+    jmp .vtp_loop
+
+; CSI Ps n — Device Status Report. 5 asks "are you there", 6 asks where
+; the cursor is. The answer goes back up the pty as though it were typed,
+; which is how the asker reads it: a shell probing the column, or a TUI
+; measuring how wide a string actually came out. Without this, anything
+; that measures its own output against the terminal got silence.
+; CSI ? Ps n is DEC's private variant and means something else, so it is
+; left alone.
+.vtp_csi_dsr:
+    cmp byte [vt_private], 0
+    jne .vtp_loop
+    mov eax, [vt_params]
+    cmp eax, 5
+    je .vtp_dsr_ok
+    cmp eax, 6
+    jne .vtp_loop
+    push rbx
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf + 1], '['
+    mov rdi, [cursor_row]
+    inc rdi                          ; the wire is 1-based
+    lea rsi, [key_out_buf + 2]
+    call itoa_decimal
+    lea rbx, [key_out_buf + 2]
+    add rbx, rax
+    mov byte [rbx], ';'
+    inc rbx
+    mov rdi, [cursor_col]
+    inc rdi
+    mov rsi, rbx
+    call itoa_decimal
+    add rbx, rax
+    mov byte [rbx], 'R'
+    inc rbx
+    lea rax, [key_out_buf]
+    sub rbx, rax                     ; total bytes written
+    mov rdx, rbx
+    pop rbx
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    syscall
+    jmp .vtp_loop
+.vtp_dsr_ok:
+    mov byte [key_out_buf], 0x1B
+    mov byte [key_out_buf + 1], '['
+    mov byte [key_out_buf + 2], '0'
+    mov byte [key_out_buf + 3], 'n'
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [key_out_buf]
+    mov rdx, 4
+    syscall
     jmp .vtp_loop
 
 ; CSI SP: intermediate byte; stay in CSI state for next char
