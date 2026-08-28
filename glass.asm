@@ -1223,6 +1223,8 @@ cfg_font_path_bold_italic:      resb 512
 cfg_font_path_bold_italic_set:  resq 1
 cfg_font_path_emoji:            resb 512
 cfg_font_path_emoji_set:        resq 1
+cfg_font_path_fallback:         resb 512
+cfg_font_path_fallback_set:     resq 1
 
 ; 5-slot per-style font snapshot pool. Slots 0-3 are the outline
 ; styles; slot 4 is the color-bitmap emoji font (Noto Color Emoji)
@@ -1236,8 +1238,10 @@ cfg_font_path_emoji_set:        resq 1
 ; per-font state without another bump.
 %define TTF_FONT_SLOT_SIZE 768
 %define TTF_FONT_SLOT_EMOJI 4
-ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 5
-ttf_font_slot_loaded:   resb 5
+%define TTF_FONT_SLOT_FALLBACK 5
+ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 6
+ttf_font_slot_loaded:   resb 6
+ttf_fallback_tried:     resb 1          ; 1 once we've attempted the open
 ttf_font_active_slot:   resq 1          ; index of the currently-restored slot
 cfg_ttf_weight:     resq 1          ; variation weight (0 = font's fvar default)
 ttf_active:         resq 1          ; 1 once glyph_load_font succeeds
@@ -15714,7 +15718,16 @@ load_config:
     je .lc_fp_bold_or_bi
     cmp dword [rsi+10], 'emoj'
     je .lc_fp_emoji_check
+    cmp dword [rsi+10], 'fall'
+    je .lc_fp_fallback_check
     jmp .lc_skip_line
+.lc_fp_fallback_check:
+    cmp dword [rsi+14], 'back'
+    jne .lc_skip_line
+    add rsi, 18
+    lea rdi, [cfg_font_path_fallback]
+    lea r8, [cfg_font_path_fallback_set]
+    jmp .lc_fp_copy_value
 .lc_fp_italic_check:
     cmp word [rsi+14], 'ic'
     jne .lc_skip_line
@@ -19721,6 +19734,124 @@ ttf_autodetect_emoji_path:
     db 0                             ; list terminator
 
 ; ---------------------------------------------------------------------
+; ttf_fallback_ensure_loaded — open the fallback face on first need and
+; snapshot it into its slot. rax = 1 when the slot is usable, 0 when
+; there is no fallback configured or the file would not load.
+;
+; Lazy on purpose: most sessions never meet a glyph the main font lacks,
+; and a CJK face is megabytes. A session that never needs one never
+; opens the file. One failed attempt is remembered so a bad path costs
+; a single open, not one per missing glyph.
+; ---------------------------------------------------------------------
+ttf_fallback_ensure_loaded:
+    cmp byte [ttf_font_slot_loaded + TTF_FONT_SLOT_FALLBACK], 0
+    jne .tfel_yes
+    cmp byte [ttf_fallback_tried], 0
+    jne .tfel_no
+    mov byte [ttf_fallback_tried], 1
+    cmp qword [cfg_font_path_fallback_set], 0
+    je .tfel_no
+    push rbx
+    push r12
+    mov r12, [ttf_font_active_slot]       ; whose state we must put back
+    lea rdi, [cfg_font_path_fallback]
+    call glyph_load_font
+    test rax, rax
+    jnz .tfel_restore_no
+    mov rdi, [cfg_ttf_weight]
+    call glyph_set_weight
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * TTF_FONT_SLOT_FALLBACK]
+    call glyph_save_pf_state
+    mov byte [ttf_font_slot_loaded + TTF_FONT_SLOT_FALLBACK], 1
+    mov ebx, 1
+    jmp .tfel_restore
+.tfel_restore_no:
+    xor ebx, ebx
+.tfel_restore:
+    ; glyph_load_font left the engine pointing at the new face — put the
+    ; caller's slot back before returning.
+    mov rdi, r12
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
+    call glyph_restore_pf_state
+    mov [ttf_font_active_slot], r12
+    mov rax, rbx
+    pop r12
+    pop rbx
+    ret
+.tfel_yes:
+    mov eax, 1
+    ret
+.tfel_no:
+    xor eax, eax
+    ret
+
+; ---------------------------------------------------------------------
+; ttf_render_with_fallback — rdi = codepoint. Renders it from the
+; fallback face into output_buf, leaving the engine's W/H/bearings/
+; advance in rcx/rdx/r8/r9/r10 exactly as glyph_render_to_alpha does.
+; rax = 0 on success, non-zero when there is no fallback or it has no
+; glyph either. The active slot is always put back.
+; ---------------------------------------------------------------------
+ttf_render_with_fallback:
+    push rbx
+    push r12
+    push r13
+    mov r13, rdi                          ; codepoint
+    call ttf_fallback_ensure_loaded
+    test rax, rax
+    jz .trwf_fail
+    ; Set the size here rather than inheriting the caller's rsi: the
+    ; open above clobbers it, so the first missing glyph of a session
+    ; rendered at a junk size and came out blank while every later one
+    ; was fine.
+    mov rsi, [cfg_font_size]
+    test rsi, rsi
+    jnz .trwf_have_size
+    mov rsi, DEFAULT_FONT_SIZE
+.trwf_have_size:
+    mov r12, [ttf_font_active_slot]
+    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * TTF_FONT_SLOT_FALLBACK]
+    push rsi
+    call glyph_restore_pf_state
+    pop rsi
+    mov qword [ttf_font_active_slot], TTF_FONT_SLOT_FALLBACK
+    mov rdi, r13
+    call glyph_render_to_alpha
+    ; Hold the engine's outputs across the slot restore, which walks
+    ; the same registers.
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    mov rdi, r12
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
+    call glyph_restore_pf_state
+    mov [ttf_font_active_slot], r12
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    test eax, eax
+    jnz .trwf_fail
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.trwf_fail:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---------------------------------------------------------------------
 ; cbdt_render_emoji_to_raster — pull the PNG for this codepoint out of
 ; the loaded color-emoji TTF (Noto Color Emoji), pipe it through
 ; convert(1) to RGBA at the cell-pixmap size, and leave the result in
@@ -20993,9 +21124,19 @@ ttf_upload_glyph:
     jz .have_glyph
 .try_sub_23f4:
     cmp rbx, 0x23F4                    ; ⏴ medium-triangle-left → ◀
-    jne .empty_glyph
+    jne .try_fallback_font
     mov rdi, 0x25C0
     call glyph_render_to_alpha
+    test eax, eax
+    jz .have_glyph
+.try_fallback_font:
+    ; Last stop before drawing nothing: a second face for the glyphs
+    ; the configured one simply does not carry. DejaVu Sans Mono has
+    ; no Japanese at all, so a CJK mail subject came out blank. The
+    ; main font has already been asked and failed by the time we get
+    ; here, so this costs nothing until it is needed.
+    mov rdi, rbx
+    call ttf_render_with_fallback
     test eax, eax
     jz .have_glyph
 .empty_glyph:
