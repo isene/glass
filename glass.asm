@@ -5879,10 +5879,19 @@ pty_fork:
     ; the kitty-default look. NASM word literal 'M=' = 0x3D4D, which
     ; matches the LE byte order of "M=" in memory at offsets 8..9.
     cmp dword [rax], 'COLO'
-    jne .ptf_env_keep
+    jne .ptf_chk_glass_id
     cmp dword [rax+4], 'RTER'
-    jne .ptf_env_keep
+    jne .ptf_chk_glass_id
     cmp word [rax+8], 'M='
+    je .ptf_env_skip
+.ptf_chk_glass_id:
+    ; Drop an inherited _GLASS_ID= (glass inside glass) so the one we
+    ; append below is the only copy.
+    cmp dword [rax], '_GLA'
+    jne .ptf_env_keep
+    cmp dword [rax+4], 'SS_I'
+    jne .ptf_env_keep
+    cmp word [rax+8], 'D='
     je .ptf_env_skip
 .ptf_env_keep:
     mov [rdi + rcx*8], rax
@@ -5901,6 +5910,17 @@ pty_fork:
     ; Always inject our COLORTERM=truecolor (we dropped any inherited
     ; value above, so we can append unconditionally).
     lea rax, [colorterm_env]
+    mov [rdi + rcx*8], rax
+    inc ecx
+    ; _GLASS_ID=1 tells a child it is really glass, not kitty. We
+    ; advertise TERM=xterm-kitty so apps use the kitty graphics and
+    ; keyboard protocols, which means TERM cannot distinguish us from
+    ; real kitty. crust's clipboard_copy wants that distinction: under
+    ; glass it skips its xclip helper, because glass owns the selection
+    ; itself after OSC 52 and an xclip spawned afterwards would take it
+    ; away and then die with the app's pty. The string existed since
+    ; the early days but was never appended to the child env.
+    lea rax, [glass_id_env]
     mov [rdi + rcx*8], rax
     inc ecx
 .ptf_env_done:
