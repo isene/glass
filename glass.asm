@@ -751,6 +751,14 @@ vt_pending_esc:      resb 1
 img_table:          resb IMG_SLOTS * IMG_SLOT_SIZE
 img_evict_next:     resd 1          ; round-robin eviction cursor
 place_table:        resb PLACE_SLOTS * PLACE_SLOT_SIZE
+; Pixel rectangle covering placements made since the last frame. The
+; image overlay pass composites into the back pixmap, so the partial-BLT
+; bbox has to cover it or the picture never reaches the window.
+place_dmg_x0:       resd 1
+place_dmg_y0:       resd 1
+place_dmg_x1:       resd 1
+place_dmg_y1:       resd 1
+place_dmg_valid:    resb 1
 place_count:        resq 1
 img_decode_buf:     resq 1          ; mmap'd RGBA scratch (decoded PNG)
 img_decode_len:     resq 1          ; allocated bytes
@@ -12787,8 +12795,21 @@ render_screen:
     ; renders start empty and grow per paint site via expand_bbox.
     mov byte [blt_dirty], 0
     cmp qword [all_dirty], 0
-    je .rs_bbox_init_done
+    je .rs_bbox_no_full
     call bbox_full_window
+.rs_bbox_no_full:
+    ; Fold in any placement made since the last frame, so the image the
+    ; overlay pass is about to composite actually reaches the window.
+    cmp byte [place_dmg_valid], 0
+    je .rs_bbox_init_done
+    mov edi, [place_dmg_x0]
+    mov esi, [place_dmg_y0]
+    mov edx, [place_dmg_x1]
+    sub edx, edi                          ; w
+    mov ecx, [place_dmg_y1]
+    sub ecx, esi                          ; h
+    call expand_bbox
+    mov byte [place_dmg_valid], 0
 .rs_bbox_init_done:
     ; Invalidate the GC fg cache at the start of every render. The
     ; cache is correct WITHIN a render (bg-fill / restore / cursor
@@ -18565,6 +18586,41 @@ place_add:
     mov [r9 + 8], cx
     mov [r9 + 10], r8w
     mov dword [r9 + 12], 0
+    ; Damage the placement's rectangle. Until v0.3.58 this was free:
+    ; paint_margins widened the BLT bbox to the whole window every
+    ; frame, so a newly placed image was copied along with everything
+    ; else. The bbox now covers only the cells that changed, and an
+    ; image sits outside it, so the picture stayed invisible until
+    ; something forced a full repaint (a workspace switch, an external
+    ; viewer opening and closing). Deleting a placement already set
+    ; all_dirty for the same reason; placing one damages just its own
+    ; rectangle instead, so a page turn does not repaint the window.
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    movzx r9d, word [char_width]
+    movzx r10d, word [char_height]
+    mov eax, edx                          ; col
+    imul eax, r9d                         ; x0 = col * char_width
+    mov r11d, ecx                         ; cell_w
+    imul r11d, r9d
+    add r11d, eax                         ; x1 = x0 + cell_w * char_width
+    mov edx, esi                          ; row
+    imul edx, r10d                        ; y0 = row * char_height
+    imul r8d, r10d
+    add r8d, edx                          ; y1 = y0 + cell_h * char_height
+    call place_damage_union
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
     pop rbx
     ret
 .pa_next:
@@ -18572,6 +18628,36 @@ place_add:
     jmp .pa_scan
 .pa_full:
     pop rbx
+    ret
+
+; eax = x0, edx = y0, r11d = x1, r8d = y1. Union into the pending
+; placement damage rect, which render_screen folds into the BLT bbox.
+place_damage_union:
+    cmp byte [place_dmg_valid], 0
+    jne .pdu_merge
+    mov [place_dmg_x0], eax
+    mov [place_dmg_y0], edx
+    mov [place_dmg_x1], r11d
+    mov [place_dmg_y1], r8d
+    mov byte [place_dmg_valid], 1
+    ret
+.pdu_merge:
+    cmp eax, [place_dmg_x0]
+    jge .pdu_x0_ok
+    mov [place_dmg_x0], eax
+.pdu_x0_ok:
+    cmp edx, [place_dmg_y0]
+    jge .pdu_y0_ok
+    mov [place_dmg_y0], edx
+.pdu_y0_ok:
+    cmp r11d, [place_dmg_x1]
+    jle .pdu_x1_ok
+    mov [place_dmg_x1], r11d
+.pdu_x1_ok:
+    cmp r8d, [place_dmg_y1]
+    jle .pdu_y1_ok
+    mov [place_dmg_y1], r8d
+.pdu_y1_ok:
     ret
 
 place_clear_image:
