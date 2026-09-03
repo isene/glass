@@ -117,7 +117,7 @@
 %define IMG_SLOTS           256
 %define IMG_SLOT_SIZE       32
 %define PLACE_SLOTS         256
-%define PLACE_SLOT_SIZE     16
+%define PLACE_SLOT_SIZE     32          ; grew from 16 for the source rect
 %define MAX_IMG_DIM         8192             ; sanity cap on width/height
 %define IMG_DECODE_MAX      67108864         ; 64MB max decoded RGBA
 %define MMAP_PROT_RW        3
@@ -14739,6 +14739,44 @@ rs_row_loop:
     ; in 16.16 fixed-point. Values are stored big-endian per RENDER.
     mov ebx, [rsi + 4]               ; src_w
     mov r15d, [rsi + 8]              ; src_h
+    ; Source-rect crop. With x,y,w,h on the placement, only that band
+    ; of the image is scaled into the cells: the transform's scale
+    ; comes from the band, and m13/m23 shift the sampling origin to
+    ; (x, y). Without it the whole image was squashed into the cells,
+    ; so a tall page placed with a crop came out right-sized but
+    ; wrong-shaped. w=0 or h=0 keeps the old whole-image behaviour.
+    ; The band is clamped to the image so sampling never leaves it.
+    mov dword [img_crop_x], 0
+    mov dword [img_crop_y], 0
+    mov r8d, [r13 + 20]              ; crop w
+    test r8d, r8d
+    jz .rs_imgs_no_crop
+    mov r11d, [r13 + 24]             ; crop h
+    test r11d, r11d
+    jz .rs_imgs_no_crop
+    mov eax, [r13 + 12]              ; crop x
+    cmp eax, ebx
+    jae .rs_imgs_no_crop             ; origin past the image: ignore
+    mov ecx, [r13 + 16]              ; crop y
+    cmp ecx, r15d
+    jae .rs_imgs_no_crop
+    mov edx, ebx
+    sub edx, eax                     ; pixels left of the right edge
+    cmp r8d, edx
+    jbe .rs_imgs_crop_w_ok
+    mov r8d, edx
+.rs_imgs_crop_w_ok:
+    mov edx, r15d
+    sub edx, ecx                     ; pixels above the bottom edge
+    cmp r11d, edx
+    jbe .rs_imgs_crop_h_ok
+    mov r11d, edx
+.rs_imgs_crop_h_ok:
+    mov [img_crop_x], eax
+    mov [img_crop_y], ecx
+    mov ebx, r8d                     ; scale from the band, not the image
+    mov r15d, r11d
+.rs_imgs_no_crop:
     movzx eax, word [r13 + 8]        ; cell_w
     movzx ecx, word [char_width]
     imul eax, ecx
@@ -14764,7 +14802,9 @@ rs_row_loop:
     div r9d
     mov [rdi+8], eax
     mov dword [rdi+12], 0            ; m12
-    mov dword [rdi+16], 0            ; m13
+    mov eax, [img_crop_x]
+    shl eax, 16
+    mov [rdi+16], eax                ; m13 = crop x, 16.16
     mov dword [rdi+20], 0            ; m21
     ; m22 = (src_h << 16) / dst_h
     mov eax, r15d
@@ -14772,7 +14812,9 @@ rs_row_loop:
     xor edx, edx
     div r10d
     mov [rdi+24], eax
-    mov dword [rdi+28], 0            ; m23
+    mov eax, [img_crop_y]
+    shl eax, 16
+    mov [rdi+28], eax                ; m23 = crop y, 16.16
     mov dword [rdi+32], 0            ; m31
     mov dword [rdi+36], 0            ; m32
     mov dword [rdi+40], 0x00010000   ; m33 = 1.0
@@ -17658,6 +17700,27 @@ apc_kv_r:           resw 1          ; dest cell rows
 apc_kv_s:           resd 1          ; source pixel width (raw RGBA)
 apc_kv_v:           resd 1          ; source pixel height (raw RGBA)
 apc_kv_d:           resb 1          ; delete target ('a' / 'i')
+; Source rectangle on a placement (kitty lowercase x, y, w, h): which
+; band of the SOURCE image, in pixels, goes into the c x r cells.
+; w=0 or h=0 means the whole image.
+apc_kv_x:           resd 1
+apc_kv_y:           resd 1
+apc_kv_w:           resd 1
+apc_kv_h:           resd 1
+; Copy of the four above at the moment a place command was deferred,
+; so the replay after the image finishes assembling still has them.
+apc_deferred_place_x: resd 1
+apc_deferred_place_y: resd 1
+apc_deferred_place_w: resd 1
+apc_deferred_place_h: resd 1
+; What place_add stores into the slot. Callers set these first.
+place_src_x:        resd 1
+place_src_y:        resd 1
+place_src_w:        resd 1
+place_src_h:        resd 1
+; Scratch for the overlay pass: the crop origin feeding m13/m23.
+img_crop_x:         resd 1
+img_crop_y:         resd 1
 apc_payload_off:    resq 1          ; offset of payload start in apc_body
 
 section .text
@@ -17674,6 +17737,10 @@ apc_reset_kv:
     mov word [apc_kv_r], 0
     mov dword [apc_kv_s], 0
     mov dword [apc_kv_v], 0
+    mov dword [apc_kv_x], 0
+    mov dword [apc_kv_y], 0
+    mov dword [apc_kv_w], 0
+    mov dword [apc_kv_h], 0
     mov byte [apc_kv_d], 0
     ret
 
@@ -17778,6 +17845,14 @@ apc_parse_value:
     je .apv_v
     cmp al, 'd'
     je .apv_d
+    cmp al, 'x'
+    je .apv_x
+    cmp al, 'y'
+    je .apv_y
+    cmp al, 'w'
+    je .apv_w
+    cmp al, 'h'
+    je .apv_h
     jmp .apv_skip                    ; unknown key — skip
 .apv_a:
     movzx eax, byte [rsi]
@@ -17824,6 +17899,22 @@ apc_parse_value:
     movzx eax, byte [rsi]
     mov [apc_kv_d], al
     inc rsi
+    jmp .apv_skip
+.apv_x:
+    call apc_parse_uint
+    mov [apc_kv_x], eax
+    jmp .apv_skip
+.apv_y:
+    call apc_parse_uint
+    mov [apc_kv_y], eax
+    jmp .apv_skip
+.apv_w:
+    call apc_parse_uint
+    mov [apc_kv_w], eax
+    jmp .apv_skip
+.apv_h:
+    call apc_parse_uint
+    mov [apc_kv_h], eax
 .apv_skip:
     movzx ecx, byte [rsi]
     test cl, cl
@@ -18605,7 +18696,15 @@ place_add:
     mov [r9 + 6], dx
     mov [r9 + 8], cx
     mov [r9 + 10], r8w
-    mov dword [r9 + 12], 0
+    mov eax, [place_src_x]
+    mov [r9 + 12], eax
+    mov eax, [place_src_y]
+    mov [r9 + 16], eax
+    mov eax, [place_src_w]
+    mov [r9 + 20], eax
+    mov eax, [place_src_h]
+    mov [r9 + 24], eax
+    mov dword [r9 + 28], 0
     ; Damage the placement's rectangle. Until v0.3.58 this was free:
     ; paint_margins widened the BLT bbox to the whole window every
     ; frame, so a newly placed image was copied along with everything
@@ -18911,6 +19010,14 @@ handle_kitty_apc:
     mov r8d, eax
 .hka_drain_have_ch:
     ; place_add(edi=id, rsi=row, rdx=col, ecx=cw, r8d=ch)
+    mov eax, [apc_deferred_place_x]
+    mov [place_src_x], eax
+    mov eax, [apc_deferred_place_y]
+    mov [place_src_y], eax
+    mov eax, [apc_deferred_place_w]
+    mov [place_src_w], eax
+    mov eax, [apc_deferred_place_h]
+    mov [place_src_h], eax
     mov rsi, [apc_deferred_place_row]
     mov rdx, [apc_deferred_place_col]
     mov edi, [apc_pending_id]
@@ -18944,6 +19051,14 @@ handle_kitty_apc:
     mov [apc_deferred_place_cw], ax
     movzx eax, word [apc_kv_r]
     mov [apc_deferred_place_ch], ax
+    mov eax, [apc_kv_x]
+    mov [apc_deferred_place_x], eax
+    mov eax, [apc_kv_y]
+    mov [apc_deferred_place_y], eax
+    mov eax, [apc_kv_w]
+    mov [apc_deferred_place_w], eax
+    mov eax, [apc_kv_h]
+    mov [apc_deferred_place_h], eax
     ; Log: place deferred.
     mov edi, 'p'
     mov esi, [apc_kv_i]
@@ -19001,6 +19116,14 @@ handle_kitty_apc:
     mov r8d, eax
 .hka_have_ch:
     ; place_add: rdi=id, esi=row, edx=col, ecx=cw, r8d=ch
+    mov eax, [apc_kv_x]
+    mov [place_src_x], eax
+    mov eax, [apc_kv_y]
+    mov [place_src_y], eax
+    mov eax, [apc_kv_w]
+    mov [place_src_w], eax
+    mov eax, [apc_kv_h]
+    mov [place_src_h], eax
     mov rdi, [cursor_row]
     mov rsi, rdi
     mov edi, [apc_kv_i]
@@ -19264,6 +19387,14 @@ kitty_finalize_image:
     movzx r9d, word [char_height]
     div r9d
     mov r8d, eax                     ; cell_h
+    mov eax, [apc_kv_x]
+    mov [place_src_x], eax
+    mov eax, [apc_kv_y]
+    mov [place_src_y], eax
+    mov eax, [apc_kv_w]
+    mov [place_src_w], eax
+    mov eax, [apc_kv_h]
+    mov [place_src_h], eax
     mov rsi, [cursor_row]
     mov rdx, [cursor_col]
     mov edi, [apc_pending_id]
