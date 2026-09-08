@@ -259,15 +259,17 @@ convert_arg_bg:   db "-background", 0
 convert_arg_none: db "none", 0
 convert_arg_depth:db "-depth", 0
 convert_arg_8:    db "8", 0
-convert_arg_rgba: db "RGBA:-", 0
 ; PNG → RGBA conversion for kitty graphics: `convert png:- rgba:-`
 convert_arg_png_in: db "png:-", 0
 convert_arg_rgba_lower: db "rgba:-", 0
-; PNG → BGRA conversion for the CBDT emoji raster path. On
-; little-endian x86, X11 ARGB32 expects bytes in [B,G,R,A] order, so
-; asking ImageMagick for bgra:- directly lets us PutImage straight
-; through with no in-asm swap pass. Image-upload (kitty graphics)
-; still uses rgba:- + the post-decode swap in image_upload_raster.
+; BGRA output for every emoji raster path (CBDT PNG, pango single,
+; pango ZWJ sequence). On little-endian x86, X11 ARGB32 expects bytes
+; in [B,G,R,A] order, so asking ImageMagick for bgra:- lets us PutImage
+; straight through with no in-asm swap pass. The pango paths asked for
+; RGBA:- until v0.3.63 and every coloured ZWJ emoji came out with red
+; and blue swapped (a yellow dancer rendered blue). Image-upload (kitty
+; graphics) still uses rgba:- + the post-decode swap in
+; image_upload_raster.
 convert_arg_bgra_lower: db "bgra:-", 0
 
 ; Advertised TERM for the child shell. Set to xterm-kitty so apps
@@ -4524,7 +4526,7 @@ render_emoji_glyph:
     mov [emoji_argv + 6*8], rax
     lea rax, [convert_arg_8]
     mov [emoji_argv + 7*8], rax
-    lea rax, [convert_arg_rgba]
+    lea rax, [convert_arg_bgra_lower]  ; BGRA = ARGB32 memory order on LE
     mov [emoji_argv + 8*8], rax
     mov qword [emoji_argv + 9*8], 0
 
@@ -4620,6 +4622,11 @@ render_emoji_glyph:
     ; If we got no data, bail (child failed)
     test r14, r14
     jz .reg_done
+
+    ; convert emits straight alpha; XRender wants premultiplied. Do it
+    ; before the cache write so cached bytes are upload-ready.
+    mov rdi, r14
+    call premul_raster_buf
 
     ; Persist this glyph so the next glass session is instant.
     mov rdi, r14
@@ -4871,7 +4878,7 @@ render_emoji_seq_glyph:
     mov [emoji_argv + 6*8], rax
     lea rax, [convert_arg_8]
     mov [emoji_argv + 7*8], rax
-    lea rax, [convert_arg_rgba]
+    lea rax, [convert_arg_bgra_lower]  ; BGRA = ARGB32 memory order on LE
     mov [emoji_argv + 8*8], rax
     mov qword [emoji_argv + 9*8], 0
 
@@ -4956,6 +4963,10 @@ render_emoji_seq_glyph:
     pop r14
     test r14, r14
     jz .resg_done
+
+    ; Straight alpha from convert → premultiplied for XRender OP_OVER.
+    mov rdi, r14
+    call premul_raster_buf
 
     ; Recompute pixmap dims (clobbered by read loop).
     movzx r13d, word [char_width]
@@ -20649,40 +20660,8 @@ png_decode_to_emoji_buf:
     test rbx, rbx
     jz .pde_fail_norestore
 
-    ; Premultiply alpha: walk emoji_raster_buf 4 bytes at a time,
-    ; replace (R, G, B, A) with (R*A/256, G*A/256, B*A/256, A). The
-    ; /256 (shr 8) is one off from /255 at the very brightest values
-    ; — invisible for emoji compositing.
-    push rbx
-    xor ecx, ecx
-.pde_premul:
-    cmp rcx, rbx
-    jge .pde_premul_done
-    movzx eax, byte [emoji_raster_buf + rcx + 3]   ; alpha
-    cmp al, 0xFF
-    je .pde_premul_skip                            ; opaque: no-op
-    test al, al
-    jz .pde_premul_zero                            ; transparent: zero RGB
-    movzx edx, byte [emoji_raster_buf + rcx + 0]
-    imul edx, eax
-    shr edx, 8
-    mov [emoji_raster_buf + rcx + 0], dl
-    movzx edx, byte [emoji_raster_buf + rcx + 1]
-    imul edx, eax
-    shr edx, 8
-    mov [emoji_raster_buf + rcx + 1], dl
-    movzx edx, byte [emoji_raster_buf + rcx + 2]
-    imul edx, eax
-    shr edx, 8
-    mov [emoji_raster_buf + rcx + 2], dl
-    jmp .pde_premul_skip
-.pde_premul_zero:
-    mov dword [emoji_raster_buf + rcx], 0
-.pde_premul_skip:
-    add rcx, 4
-    jmp .pde_premul
-.pde_premul_done:
-    pop rbx
+    mov rdi, rbx
+    call premul_raster_buf
 
     mov rax, rbx
     jmp .pde_ret
@@ -20716,6 +20695,46 @@ png_decode_to_emoji_buf:
 .pde_alpha_premul_arg: db "premultiply", 0
 .pde_filter_arg:    db "-filter", 0
 .pde_filter_lanczos_arg: db "Lanczos", 0
+
+; ---------------------------------------------------------------------
+; premul_raster_buf — rdi = byte count in emoji_raster_buf. Walks the
+; buffer 4 bytes at a time and replaces (B, G, R, A) with (B*A/256,
+; G*A/256, R*A/256, A). XRender's OP_OVER assumes premultiplied source
+; pixels; convert emits straight alpha. The /256 (shr 8) is one off
+; from /255 at the brightest values, invisible for emoji compositing.
+; Every convert-fed path (CBDT PNG, pango single, pango ZWJ sequence)
+; calls this after the read. Clobbers eax, ecx, edx.
+; ---------------------------------------------------------------------
+premul_raster_buf:
+    xor ecx, ecx
+.prb_loop:
+    cmp rcx, rdi
+    jge .prb_done
+    movzx eax, byte [emoji_raster_buf + rcx + 3]   ; alpha
+    cmp al, 0xFF
+    je .prb_skip                                   ; opaque: no-op
+    test al, al
+    jz .prb_zero                                   ; transparent: zero RGB
+    movzx edx, byte [emoji_raster_buf + rcx + 0]
+    imul edx, eax
+    shr edx, 8
+    mov [emoji_raster_buf + rcx + 0], dl
+    movzx edx, byte [emoji_raster_buf + rcx + 1]
+    imul edx, eax
+    shr edx, 8
+    mov [emoji_raster_buf + rcx + 1], dl
+    movzx edx, byte [emoji_raster_buf + rcx + 2]
+    imul edx, eax
+    shr edx, 8
+    mov [emoji_raster_buf + rcx + 2], dl
+    jmp .prb_skip
+.prb_zero:
+    mov dword [emoji_raster_buf + rcx], 0
+.prb_skip:
+    add rcx, 4
+    jmp .prb_loop
+.prb_done:
+    ret
 
 ; ---------------------------------------------------------------------
 ; ttf_render_smp_to_raster — render an SMP codepoint via the embedded
