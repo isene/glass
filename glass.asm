@@ -1004,7 +1004,10 @@ cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
 cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
 row_wrapped:        resb MAX_ROWS    ; 1 = row N's last char wrapped to N+1
 osc8_uri_offsets:   resd 256        ; offset in osc8_uris per link id
-osc8_uris:          resb 4096       ; null-terminated URIs from OSC 8
+osc8_uris:          resb 131072     ; null-terminated URIs from OSC 8:
+                                    ; 255 ids x 512 bytes, so the pool
+                                    ; cannot fill before the ids wrap
+                                    ; (untouched .bss pages cost nothing)
 osc8_uris_pos:      resq 1          ; next free byte in osc8_uris
 osc8_count:         resq 1          ; number of distinct URIs registered
 cfg_buf:            resb 4096
@@ -9289,6 +9292,38 @@ vt_process:
     mov rdx, [osc_pos]
     sub rdx, rcx                ; URI length
     jz .vtp_osc8_close
+    ; Cap URI length at 511 to keep things sane.
+    cmp rdx, 511
+    jle .vtp_osc8_uri_len_ok
+    mov rdx, 511
+.vtp_osc8_uri_len_ok:
+    ; Reuse the id of an identical URI already in the pool. A TUI
+    ; re-sends every OSC 8 open on each repaint, so without this a
+    ; mail with a few 400-byte tracking links filled the pool on the
+    ; third paint and every later link in the window went dead.
+    mov r8, 1
+.vtp_osc8_dedupe:
+    cmp r8, [osc8_count]
+    ja .vtp_osc8_new
+    mov r9d, [osc8_uri_offsets + r8*4]   ; pool offset of id r8
+    xor r10d, r10d
+.vtp_osc8_dedupe_cmp:
+    cmp r10, rdx
+    je .vtp_osc8_dedupe_tail
+    movzx r11d, byte [osc8_uris + r9 + r10]
+    cmp r11b, [osc_buf + rcx + r10]
+    jne .vtp_osc8_dedupe_next
+    inc r10
+    jmp .vtp_osc8_dedupe_cmp
+.vtp_osc8_dedupe_tail:
+    cmp byte [osc8_uris + r9 + r10], 0   ; same length too
+    jne .vtp_osc8_dedupe_next
+    mov byte [cur_osc8_id], r8b
+    jmp .vtp_loop
+.vtp_osc8_dedupe_next:
+    inc r8
+    jmp .vtp_osc8_dedupe
+.vtp_osc8_new:
     ; Allocate next link id (1..255). Wrap when full.
     mov rax, [osc8_count]
     inc rax
@@ -9299,17 +9334,12 @@ vt_process:
 .vtp_osc8_id_ok:
     mov [osc8_count], rax
     mov byte [cur_osc8_id], al
-    ; Cap URI length at 511 to keep things sane.
-    cmp rdx, 511
-    jle .vtp_osc8_uri_len_ok
-    mov rdx, 511
-.vtp_osc8_uri_len_ok:
     ; Bail if remaining osc8_uris space is insufficient (need rdx + 1 bytes)
     mov r8, [osc8_uris_pos]
     mov r9, r8
     add r9, rdx
     inc r9
-    cmp r9, 4096
+    cmp r9, 131072
     jle .vtp_osc8_uri_room
     mov byte [cur_osc8_id], 0    ; out of room, drop
     jmp .vtp_loop
