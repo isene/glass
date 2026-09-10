@@ -6281,6 +6281,32 @@ event_loop:
     syscall
 
 ; Handle X11 events
+; ----------------------------------------------------------------------------
+; hover_update — rdi = row, rsi = col (cells under the pointer). Sets
+; hover_url_idx (url_list, live grid) and hover_osc8_* (OSC 8, scrollback
+; too) and forces a repaint when the url_list hover changes. Shared by the
+; selection path and the mouse-report path of the motion handler.
+; Clobbers caller-saved regs.
+; ----------------------------------------------------------------------------
+hover_update:
+    push rdi
+    push rsi
+    call url_at_cell                          ; eax = idx or -1
+    movsxd rcx, eax                           ; sign-extend (eax may be -1)
+    mov rdx, [hover_url_idx]
+    cmp rcx, rdx
+    je .hu_same
+    mov [hover_url_idx], rcx
+    mov qword [all_dirty], 1
+    call request_render
+.hu_same:
+    mov rdi, [rsp + 8]                        ; row
+    mov rsi, [rsp]                            ; col
+    call osc8_hover_check                     ; updates hover_osc8_*
+    pop rsi
+    pop rdi
+    ret
+
 handle_x11_events:
     push rbx
     push r12
@@ -6950,6 +6976,21 @@ handle_x11_events:
     div ecx
     ; Determine which button is held for motion encoding
     ; button 32 + 0/1/2 for motion with button 1/2/3
+    ; Link hover stays live while an app owns the mouse (modes 2/3).
+    ; Claude Code 2.1.267 leaves any-motion tracking on at its prompt,
+    ; which used to switch off link hover in every glass it ran in.
+    ; A held button is a drag, not a hover.
+    movzx ecx, word [x11_buf + rbx + 28]
+    test ecx, 0x700
+    jnz .hxe_mn_rep_send
+    push rax
+    push r12
+    mov rdi, rax
+    mov rsi, r12
+    call hover_update
+    pop r12
+    pop rax
+.hxe_mn_rep_send:
     movzx ecx, word [x11_buf + rbx + 28]
     mov edi, 32              ; motion flag
     test ecx, 0x100          ; Button1Mask
@@ -6997,22 +7038,9 @@ handle_x11_events:
     je .hxe_mn_drag_path
     push rax
     push r12
-    ; --- url_list-based hover (live grid only) ---
     mov rdi, rax
     mov rsi, r12
-    call url_at_cell                          ; eax = idx or -1
-    movsxd rcx, eax                           ; sign-extend (eax may be -1)
-    mov rdx, [hover_url_idx]
-    cmp rcx, rdx
-    je .hxe_mn_hover_url_same
-    mov [hover_url_idx], rcx
-    mov qword [all_dirty], 1
-    call request_render
-.hxe_mn_hover_url_same:
-    ; --- OSC 8 hover (works in scrollback too, via cell_ptr_at_view) ---
-    mov rdi, [rsp + 8]                        ; saved row
-    mov rsi, [rsp]                            ; saved col
-    call osc8_hover_check                     ; updates hover_osc8_*
+    call hover_update
     pop r12
     pop rax
     jmp .hxe_mn_done
