@@ -941,6 +941,12 @@ hover_osc8_id:        resb 1        ; non-zero ⇒ hovering an OSC 8 cell
 hover_osc8_row:       resd 1        ; view row of the hover (0..grid_rows-1)
 hover_osc8_col_start: resd 1
 hover_osc8_col_end:   resd 1        ; inclusive
+; Last pointer cell seen by hover_update. render_screen re-runs the hover
+; check there, so a link that scrolls away under a parked pointer drops
+; its underline instead of leaving a line at the old row (v0.3.65).
+hover_last_row:       resd 1
+hover_last_col:       resd 1
+hover_have_pos:       resb 1        ; 1 once the pointer has been seen
 
 ; Logging — see log_open_glass / log_write_buf in .text. fd=0 means
 ; "log file unavailable" (kernel never returns 0 from open with
@@ -6289,6 +6295,9 @@ event_loop:
 ; Clobbers caller-saved regs.
 ; ----------------------------------------------------------------------------
 hover_update:
+    mov [hover_last_row], edi                 ; remembered for re-checks on render
+    mov [hover_last_col], esi
+    mov byte [hover_have_pos], 1
     push rdi
     push rsi
     call url_at_cell                          ; eax = idx or -1
@@ -12781,6 +12790,21 @@ render_screen:
     ;   [draw_picture]  = back-pixmap Picture (or render_window_picture)
     ;   [needs_blt]     = 1 if we must CopyArea at the end
     call ensure_back_buffer
+
+    ; Re-check the link hover at the last pointer cell. Output scrolls
+    ; text under a parked pointer; without this the underline stayed at
+    ; its stored row and underlined whatever moved in (v0.3.65). A change
+    ; sets all_dirty before the dirty-row logic below, so it lands in
+    ; this frame. Cost: a few cell reads per render, only once the
+    ; pointer has visited the window.
+    cmp byte [hover_have_pos], 0
+    je .rs_hover_recheck_done
+    cmp qword [sel_button_held], 1            ; a drag is not a hover
+    je .rs_hover_recheck_done
+    mov edi, [hover_last_row]
+    mov esi, [hover_last_col]
+    call hover_update
+.rs_hover_recheck_done:
 
     ; ─────────────────────────────────────────────────────────────────
     ; Per-row dirty-skip global invalidation: a number of state changes
