@@ -8622,6 +8622,47 @@ vt_process:
     mov eax, 0x20
     mov [utf8_char], eax
 .vtp_sp_done:
+    ; ── Flag pairs: two regional indicators (U+1F1E6..U+1F1FF) ─────
+    ; 🇪🇺 is U+1F1EA U+1F1FA with nothing between them, so the ZWJ scan
+    ; below never groups them and each letter came out as its own boxed
+    ; glyph (the second painting over the next character). A regional
+    ; indicator is F0 9F 87 A6..BF in UTF-8; when one follows the base,
+    ; both go to the sequence store and pango draws the flag.
+    cmp eax, 0x1F1E6
+    jb .vtp_flag_no
+    cmp eax, 0x1F1FF
+    ja .vtp_flag_no
+    lea r9, [r14 + 4]
+    cmp r9, r13
+    jg .vtp_flag_no                       ; second half not in the buffer yet
+    cmp byte [r12 + r14], 0xF0
+    jne .vtp_flag_no
+    cmp byte [r12 + r14 + 1], 0x9F
+    jne .vtp_flag_no
+    cmp byte [r12 + r14 + 2], 0x87
+    jne .vtp_flag_no
+    movzx ecx, byte [r12 + r14 + 3]
+    cmp cl, 0xA6
+    jb .vtp_flag_no
+    cmp cl, 0xBF
+    ja .vtp_flag_no
+    lea r15, [emoji_seq_scan_buf]
+    push rax
+    mov edi, eax
+    mov rsi, r15
+    call encode_utf8
+    add r15, rax
+    pop rax
+    mov ecx, 4
+.vtp_flag_copy:
+    mov dl, [r12 + r14]
+    mov [r15], dl
+    inc r14
+    inc r15
+    dec ecx
+    jnz .vtp_flag_copy
+    jmp .vtp_zw_asm_done
+.vtp_flag_no:
     ; ── ZWJ emoji sequence detection ───────────────────────────────
     ; eax = base codepoint. A ZWJ emoji (polar bear 🐻‍❄️, families,
     ; professions, flags) is `BASE [VS16] (ZWJ BASE [VS16])+`. If a ZWJ
