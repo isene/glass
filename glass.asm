@@ -1238,6 +1238,9 @@ kbd_ev_alt:         resd 1
 kbd_ev_text:        resd 1
 kbd_ev_mods:        resd 1
 kbd_ev_need:        resd 1
+place_under_any:    resb 1          ; a placement with z < 0 exists (per render)
+run_under:          resb 1          ; the current text run sits over such an image
+pc_pass:            resd 1          ; place_composite: 1 = draw the z < 0 ones
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
@@ -13432,7 +13435,245 @@ blt_back_to_window:
     ret
 
 ; Render entire screen to X11
+; Once per render: is any placement under the text (z < 0)? Such an
+; image is composited before the rows, so every row repaints over it.
+place_scan_under:
+    mov byte [place_under_any], 0
+    cmp qword [place_count], 0
+    je .psn_ret
+    mov ecx, PLACE_SLOTS
+    lea rsi, [place_table]
+.psn_loop:
+    cmp dword [rsi], 0
+    je .psn_next
+    cmp dword [rsi + 28], 0
+    jge .psn_next
+    mov byte [place_under_any], 1
+    mov qword [all_dirty], 1
+    ret
+.psn_next:
+    add rsi, PLACE_SLOT_SIZE
+    dec ecx
+    jnz .psn_loop
+.psn_ret:
+    ret
+
+; esi = row, edx = col. eax = 1 when the cell lies inside a placement
+; with z < 0. Leaves rdi, rbx and r12, r13 alone (the run scanner's).
+cell_under_image:
+    push rbx
+    mov ecx, PLACE_SLOTS
+    lea rbx, [place_table]
+.cui_loop:
+    cmp dword [rbx], 0
+    je .cui_next
+    cmp dword [rbx + 28], 0
+    jge .cui_next
+    movzx eax, word [rbx + 4]        ; anchor row
+    cmp esi, eax
+    jb .cui_next
+    movzx r8d, word [rbx + 10]       ; cell_h
+    add eax, r8d
+    cmp esi, eax
+    jae .cui_next
+    movzx eax, word [rbx + 6]        ; anchor col
+    cmp edx, eax
+    jb .cui_next
+    movzx r8d, word [rbx + 8]        ; cell_w
+    add eax, r8d
+    cmp edx, eax
+    jae .cui_next
+    mov eax, 1
+    pop rbx
+    ret
+.cui_next:
+    add rbx, PLACE_SLOT_SIZE
+    dec ecx
+    jnz .cui_loop
+    xor eax, eax
+    pop rbx
+    ret
+
+; edi = 0 for the placements with z < 0 (drawn before the rows, under
+; the text), 1 for the rest (after the rows, over it). Composites each
+; entry in place_table via XRender, scaled into its cell rectangle.
+place_composite:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    xor eax, eax
+    test edi, edi
+    jnz .pc_over
+    inc eax
+.pc_over:
+    mov [pc_pass], eax               ; 1 when this pass draws z < 0
+    xor r12d, r12d
+.rs_imgs_loop:
+    cmp r12, PLACE_SLOTS
+    jge .rs_imgs_done
+    mov eax, r12d
+    imul eax, PLACE_SLOT_SIZE
+    lea r13, [place_table + rax]
+    mov edi, [r13]
+    test edi, edi
+    jz .rs_imgs_next
+    mov eax, [r13 + 28]              ; z
+    shr eax, 31                      ; 1 when under the text
+    cmp eax, [pc_pass]
+    jne .rs_imgs_next                ; not this pass
+    call img_find
+    test rsi, rsi
+    jz .rs_imgs_next
+    mov r14d, [rsi + 16]             ; picture id (r14 callee-saved)
+    test r14d, r14d
+    jz .rs_imgs_next
+
+    ; SetPictureTransform: rescale the source picture so Composite's
+    ; 1:1 sampling maps the full source into the destination cell
+    ; rectangle. Matrix is
+    ;   ( src_w/dst_w   0             0 )
+    ;   ( 0             src_h/dst_h   0 )
+    ;   ( 0             0             1 )
+    ; in 16.16 fixed-point. Values are stored big-endian per RENDER.
+    mov ebx, [rsi + 4]               ; src_w
+    mov r15d, [rsi + 8]              ; src_h
+    ; Source-rect crop. With x,y,w,h on the placement, only that band
+    ; of the image is scaled into the cells: the transform's scale
+    ; comes from the band, and m13/m23 shift the sampling origin to
+    ; (x, y). Without it the whole image was squashed into the cells,
+    ; so a tall page placed with a crop came out right-sized but
+    ; wrong-shaped. w=0 or h=0 keeps the old whole-image behaviour.
+    ; The band is clamped to the image so sampling never leaves it.
+    mov dword [img_crop_x], 0
+    mov dword [img_crop_y], 0
+    mov r8d, [r13 + 20]              ; crop w
+    test r8d, r8d
+    jz .rs_imgs_no_crop
+    mov r11d, [r13 + 24]             ; crop h
+    test r11d, r11d
+    jz .rs_imgs_no_crop
+    mov eax, [r13 + 12]              ; crop x
+    cmp eax, ebx
+    jae .rs_imgs_no_crop             ; origin past the image: ignore
+    mov ecx, [r13 + 16]              ; crop y
+    cmp ecx, r15d
+    jae .rs_imgs_no_crop
+    mov edx, ebx
+    sub edx, eax                     ; pixels left of the right edge
+    cmp r8d, edx
+    jbe .rs_imgs_crop_w_ok
+    mov r8d, edx
+.rs_imgs_crop_w_ok:
+    mov edx, r15d
+    sub edx, ecx                     ; pixels above the bottom edge
+    cmp r11d, edx
+    jbe .rs_imgs_crop_h_ok
+    mov r11d, edx
+.rs_imgs_crop_h_ok:
+    mov [img_crop_x], eax
+    mov [img_crop_y], ecx
+    mov ebx, r8d                     ; scale from the band, not the image
+    mov r15d, r11d
+.rs_imgs_no_crop:
+    movzx eax, word [r13 + 8]        ; cell_w
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov r9d, eax                     ; dst_w
+    test r9d, r9d
+    jz .rs_imgs_skip_xform
+    movzx eax, word [r13 + 10]       ; cell_h
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov r10d, eax                    ; dst_h
+    test r10d, r10d
+    jz .rs_imgs_skip_xform
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_SET_PICTURE_TRANSFORM
+    mov word [rdi+2], 11
+    mov [rdi+4], r14d                ; source picture
+    ; m11 = (src_w << 16) / dst_w
+    mov eax, ebx
+    shl rax, 16
+    xor edx, edx
+    div r9d
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0            ; m12
+    mov eax, [img_crop_x]
+    shl eax, 16
+    mov [rdi+16], eax                ; m13 = crop x, 16.16
+    mov dword [rdi+20], 0            ; m21
+    ; m22 = (src_h << 16) / dst_h
+    mov eax, r15d
+    shl rax, 16
+    xor edx, edx
+    div r10d
+    mov [rdi+24], eax
+    mov eax, [img_crop_y]
+    shl eax, 16
+    mov [rdi+28], eax                ; m23 = crop y, 16.16
+    mov dword [rdi+32], 0            ; m31
+    mov dword [rdi+36], 0            ; m32
+    mov dword [rdi+40], 0x00010000   ; m33 = 1.0
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_imgs_skip_xform:
+    lea rdi, [tmp_buf]
+    mov al, [render_major]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_COMPOSITE
+    mov word [rdi+2], 9
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov [rdi+8], r14d                ; src picture
+    mov dword [rdi+12], 0            ; mask = None
+    mov eax, [draw_picture]
+    mov [rdi+16], eax                ; dst
+    mov word [rdi+20], 0             ; src x
+    mov word [rdi+22], 0             ; src y
+    mov word [rdi+24], 0             ; mask x
+    mov word [rdi+26], 0             ; mask y
+    movzx eax, word [r13 + 6]        ; anchor_col
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+28], ax
+    movzx eax, word [r13 + 4]        ; anchor_row
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+30], ax
+    movzx eax, word [r13 + 8]        ; cell_w
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [rdi+32], ax
+    movzx eax, word [r13 + 10]       ; cell_h
+    movzx ecx, word [char_height]
+    imul eax, ecx
+    mov word [rdi+34], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 36
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_imgs_next:
+    inc r12
+    jmp .rs_imgs_loop
+.rs_imgs_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 render_screen:
+    call place_scan_under            ; z < 0 images force a full repaint
     push rbx
     push r12
     push r13
@@ -13781,6 +14022,13 @@ render_screen:
     ; edges every frame and undo the partial-BLT win. The post-row
     ; gated paint still cleans glyph bleed because bleed only happens
     ; when a row paints (which sets blt_dirty=1).
+    cmp byte [place_under_any], 0    ; images under the text go first
+    je .rs_no_under_pass
+    cmp dword [render_major], 0
+    je .rs_no_under_pass
+    xor edi, edi
+    call place_composite
+.rs_no_under_pass:
     jmp rs_row_loop
 
 paint_margins:
@@ -14266,6 +14514,14 @@ rs_row_loop:
 .rs_run_start:
     cmp r13, [row_paint_end]      ; was grid_cols — narrowed by dirty scan
     jge .rs_next_row
+    mov byte [run_under], 0
+    cmp byte [place_under_any], 0
+    je .rs_start_under_done
+    mov esi, r12d
+    mov edx, r13d
+    call cell_under_image         ; this run starts over a z < 0 image?
+    mov [run_under], al
+.rs_start_under_done:
 
     ; Get effective fg/bg pixel of cell (apply inverse attr + selection).
     ; cell[2] bit 0 = use palette[7] for fg; otherwise cell[8-11] is the
@@ -14378,6 +14634,19 @@ rs_row_loop:
     movzx r11d, byte [run_italic]
     cmp esi, r11d
     jne .rs_run_draw
+    cmp byte [place_under_any], 0    ; a run ends at the edge of an image
+    je .rs_scan_under_same           ; it sits on, so its background can
+    push rax                         ; be left out only where the image is
+    push rcx
+    mov esi, r12d
+    mov edx, ebx
+    call cell_under_image
+    mov r11d, eax
+    pop rcx
+    pop rax
+    cmp r11b, [run_under]
+    jne .rs_run_draw
+.rs_scan_under_same:
     ; Same color, add to run as CHAR2B (big-endian: byte1=high, byte2=low)
     movzx edx, word [rax]           ; UCS-2 char (little-endian)
     mov [rdi + rcx*2 + 1], dl       ; low byte (byte2)
@@ -14451,6 +14720,8 @@ rs_row_loop:
     ; If pseudo-transparency is active and this run's effective bg pixel
     ; equals palette[0] (the see-through default), draw text without
     ; filling so the wallpaper-tinted BackPixmap shows through.
+    cmp byte [run_under], 0          ; over a z < 0 image: glyphs only
+    jne .rs_polytext
     cmp byte [pseudo_full], 1
     jne .rs_imagetext
     mov eax, [palette]
@@ -14585,6 +14856,8 @@ rs_row_loop:
     ; Skip bg fill when pseudo-transparency is active and bg matches the
     ; default (palette[0]) — leaves the wallpaper-tinted BackPixmap
     ; visible behind the glyphs.
+    cmp byte [run_under], 0          ; over a z < 0 image: no background
+    jne .rs_ttf_no_bg
     cmp byte [pseudo_full], 1
     jne .rs_ttf_fill_bg
     mov eax, [palette]
@@ -15461,155 +15734,8 @@ rs_row_loop:
     ; XRender, scaled into its declared cell rectangle.
     cmp dword [render_major], 0
     je .rs_imgs_done
-    xor r12d, r12d
-.rs_imgs_loop:
-    cmp r12, PLACE_SLOTS
-    jge .rs_imgs_done
-    mov eax, r12d
-    imul eax, PLACE_SLOT_SIZE
-    lea r13, [place_table + rax]
-    mov edi, [r13]
-    test edi, edi
-    jz .rs_imgs_next
-    call img_find
-    test rsi, rsi
-    jz .rs_imgs_next
-    mov r14d, [rsi + 16]             ; picture id (r14 callee-saved)
-    test r14d, r14d
-    jz .rs_imgs_next
-
-    ; SetPictureTransform: rescale the source picture so Composite's
-    ; 1:1 sampling maps the full source into the destination cell
-    ; rectangle. Matrix is
-    ;   ( src_w/dst_w   0             0 )
-    ;   ( 0             src_h/dst_h   0 )
-    ;   ( 0             0             1 )
-    ; in 16.16 fixed-point. Values are stored big-endian per RENDER.
-    mov ebx, [rsi + 4]               ; src_w
-    mov r15d, [rsi + 8]              ; src_h
-    ; Source-rect crop. With x,y,w,h on the placement, only that band
-    ; of the image is scaled into the cells: the transform's scale
-    ; comes from the band, and m13/m23 shift the sampling origin to
-    ; (x, y). Without it the whole image was squashed into the cells,
-    ; so a tall page placed with a crop came out right-sized but
-    ; wrong-shaped. w=0 or h=0 keeps the old whole-image behaviour.
-    ; The band is clamped to the image so sampling never leaves it.
-    mov dword [img_crop_x], 0
-    mov dword [img_crop_y], 0
-    mov r8d, [r13 + 20]              ; crop w
-    test r8d, r8d
-    jz .rs_imgs_no_crop
-    mov r11d, [r13 + 24]             ; crop h
-    test r11d, r11d
-    jz .rs_imgs_no_crop
-    mov eax, [r13 + 12]              ; crop x
-    cmp eax, ebx
-    jae .rs_imgs_no_crop             ; origin past the image: ignore
-    mov ecx, [r13 + 16]              ; crop y
-    cmp ecx, r15d
-    jae .rs_imgs_no_crop
-    mov edx, ebx
-    sub edx, eax                     ; pixels left of the right edge
-    cmp r8d, edx
-    jbe .rs_imgs_crop_w_ok
-    mov r8d, edx
-.rs_imgs_crop_w_ok:
-    mov edx, r15d
-    sub edx, ecx                     ; pixels above the bottom edge
-    cmp r11d, edx
-    jbe .rs_imgs_crop_h_ok
-    mov r11d, edx
-.rs_imgs_crop_h_ok:
-    mov [img_crop_x], eax
-    mov [img_crop_y], ecx
-    mov ebx, r8d                     ; scale from the band, not the image
-    mov r15d, r11d
-.rs_imgs_no_crop:
-    movzx eax, word [r13 + 8]        ; cell_w
-    movzx ecx, word [char_width]
-    imul eax, ecx
-    mov r9d, eax                     ; dst_w
-    test r9d, r9d
-    jz .rs_imgs_skip_xform
-    movzx eax, word [r13 + 10]       ; cell_h
-    movzx ecx, word [char_height]
-    imul eax, ecx
-    mov r10d, eax                    ; dst_h
-    test r10d, r10d
-    jz .rs_imgs_skip_xform
-    lea rdi, [tmp_buf]
-    mov al, [render_major]
-    mov [rdi], al
-    mov byte [rdi+1], RENDER_SET_PICTURE_TRANSFORM
-    mov word [rdi+2], 11
-    mov [rdi+4], r14d                ; source picture
-    ; m11 = (src_w << 16) / dst_w
-    mov eax, ebx
-    shl rax, 16
-    xor edx, edx
-    div r9d
-    mov [rdi+8], eax
-    mov dword [rdi+12], 0            ; m12
-    mov eax, [img_crop_x]
-    shl eax, 16
-    mov [rdi+16], eax                ; m13 = crop x, 16.16
-    mov dword [rdi+20], 0            ; m21
-    ; m22 = (src_h << 16) / dst_h
-    mov eax, r15d
-    shl rax, 16
-    xor edx, edx
-    div r10d
-    mov [rdi+24], eax
-    mov eax, [img_crop_y]
-    shl eax, 16
-    mov [rdi+28], eax                ; m23 = crop y, 16.16
-    mov dword [rdi+32], 0            ; m31
-    mov dword [rdi+36], 0            ; m32
-    mov dword [rdi+40], 0x00010000   ; m33 = 1.0
-    lea rsi, [tmp_buf]
-    mov rdx, 44
-    call x11_buffer
-    inc dword [x11_seq]
-.rs_imgs_skip_xform:
-    lea rdi, [tmp_buf]
-    mov al, [render_major]
-    mov [rdi], al
-    mov byte [rdi+1], RENDER_COMPOSITE
-    mov word [rdi+2], 9
-    mov byte [rdi+4], RENDER_OP_OVER
-    mov byte [rdi+5], 0
-    mov word [rdi+6], 0
-    mov [rdi+8], r14d                ; src picture
-    mov dword [rdi+12], 0            ; mask = None
-    mov eax, [draw_picture]
-    mov [rdi+16], eax                ; dst
-    mov word [rdi+20], 0             ; src x
-    mov word [rdi+22], 0             ; src y
-    mov word [rdi+24], 0             ; mask x
-    mov word [rdi+26], 0             ; mask y
-    movzx eax, word [r13 + 6]        ; anchor_col
-    movzx ecx, word [char_width]
-    imul eax, ecx
-    mov word [rdi+28], ax
-    movzx eax, word [r13 + 4]        ; anchor_row
-    movzx ecx, word [char_height]
-    imul eax, ecx
-    mov word [rdi+30], ax
-    movzx eax, word [r13 + 8]        ; cell_w
-    movzx ecx, word [char_width]
-    imul eax, ecx
-    mov word [rdi+32], ax
-    movzx eax, word [r13 + 10]       ; cell_h
-    movzx ecx, word [char_height]
-    imul eax, ecx
-    mov word [rdi+34], ax
-    lea rsi, [tmp_buf]
-    mov rdx, 36
-    call x11_buffer
-    inc dword [x11_seq]
-.rs_imgs_next:
-    inc r12
-    jmp .rs_imgs_loop
+    mov edi, 1                       ; the over pass; z<0 ran before the rows
+    call place_composite
 .rs_imgs_done:
 
 .rs_cursor:
