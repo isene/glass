@@ -13,6 +13,9 @@
 %define SYS_POLL        7
 %define SYS_MMAP        9
 %define SYS_MUNMAP      11
+%define SYS_FSTAT       5
+%define SYS_PREAD64     17
+%define SYS_UNLINK      87
 %define SYS_IOCTL       16
 %define SYS_DUP2        33
 %define SYS_GETPID      39
@@ -276,6 +279,12 @@ convert_arg_bgra_lower: db "bgra:-", 0
 ; (glow, ueberzug, etc.) detect that glass supports kitty graphics.
 ; Change from xterm-256color happens once image display is wired up.
 kitty_term_env: db "TERM=xterm-kitty", 0
+apc_str_ok:     db "OK"
+apc_str_ok_len  equ $ - apc_str_ok
+apc_str_enoent: db "ENOENT:file not found"
+apc_str_enoent_len equ $ - apc_str_enoent
+apc_str_einval: db "EINVAL:bad size"
+apc_str_einval_len equ $ - apc_str_einval
 ; _GLASS_ID= identifies glass specifically so apps that want to test
 ; for glass (vs. real kitty) can branch. Not yet used by any known
 ; client, but cheap to advertise.
@@ -9504,6 +9513,10 @@ vt_process:
 
 .vtp_full_reset:
     call grid_clear
+    cmp qword [place_count], 0
+    je .vtp_full_reset_no_places
+    call place_clear_all
+.vtp_full_reset_no_places:
     mov byte [vt_pending_esc], 0        ; clear any half-finished ST/APC carry
     mov qword [cursor_row], 0
     mov qword [cursor_col], 0
@@ -10218,6 +10231,9 @@ vt_process:
     jmp .vtp_loop
 .vtp_ed_all:
     call grid_clear
+    cmp qword [place_count], 0       ; a clear takes the images too
+    je .vtp_loop
+    call place_clear_all
     jmp .vtp_loop
 
 ; CSI K - Erase in Line
@@ -11312,6 +11328,12 @@ grid_scroll_region_up:
     ; session history into a top-anchored scroll region while keeping
     ; an input/status row fixed at the bottom; without this save no
     ; line ever enters scrollback during a CC session.)
+    cmp qword [place_count], 0       ; images ride along with the text
+    je .gsru_no_places
+    mov rdi, r12
+    mov rsi, r13
+    call place_scroll_up
+.gsru_no_places:
     test r12, r12
     jnz .gsru_no_scrollback_save
     push r12
@@ -11563,6 +11585,13 @@ grid_scroll_up:
     je .gsu_no_sel_clear
     mov qword [sel_active], 0
 .gsu_no_sel_clear:
+    cmp qword [place_count], 0       ; images ride along with the text
+    je .gsu_no_places
+    xor edi, edi
+    mov rsi, [grid_rows]
+    dec rsi
+    call place_scroll_up
+.gsu_no_places:
 
     ; Save top row to scrollback circular buffer before scrolling
     mov rax, [scroll_write_pos]
@@ -17856,6 +17885,21 @@ place_src_h:        resd 1
 img_crop_x:         resd 1
 img_crop_y:         resd 1
 apc_payload_off:    resq 1          ; offset of payload start in apc_body
+; v0.3.67: the game path (t=s), f=24, z, replies.
+apc_kv_t:           resb 1          ; transfer: 'd' inline, 's' shm, 'f' file, 't' temp file
+apc_kv_S:           resd 1          ; bytes in the file (0 = unchecked)
+apc_kv_O:           resd 1          ; offset into the file
+apc_kv_z:           resd 1          ; z-index, signed; stored, every placement draws over text
+apc_pending_t:      resb 1
+apc_pending_S:      resd 1
+apc_pending_O:      resd 1
+apc_pending_z:      resd 1
+apc_deferred_place_z: resd 1
+place_z:            resd 1          ; what place_add stores at slot +28
+idb_bgra:           resb 1          ; 1 = img_decode_buf already holds B,G,R,A
+apc_file_fd:        resd 1
+apc_path_buf:       resb 4112       ; "/dev/shm/" + name + NUL
+apc_reply_buf:      resb 64         ; ESC _ G i=N;OK ESC \
 
 section .text
 
@@ -17876,6 +17920,10 @@ apc_reset_kv:
     mov dword [apc_kv_w], 0
     mov dword [apc_kv_h], 0
     mov byte [apc_kv_d], 0
+    mov byte [apc_kv_t], 'd'
+    mov dword [apc_kv_S], 0
+    mov dword [apc_kv_O], 0
+    mov dword [apc_kv_z], 0
     ret
 
 ; Parse decimal at [rsi] into rax. Stops on first non-digit. rsi
@@ -17987,6 +18035,14 @@ apc_parse_value:
     je .apv_w
     cmp al, 'h'
     je .apv_h
+    cmp al, 't'
+    je .apv_t
+    cmp al, 'S'
+    je .apv_S
+    cmp al, 'O'
+    je .apv_O
+    cmp al, 'z'
+    je .apv_z
     jmp .apv_skip                    ; unknown key — skip
 .apv_a:
     movzx eax, byte [rsi]
@@ -18049,6 +18105,32 @@ apc_parse_value:
 .apv_h:
     call apc_parse_uint
     mov [apc_kv_h], eax
+    jmp .apv_skip
+.apv_t:
+    movzx eax, byte [rsi]
+    mov [apc_kv_t], al
+    inc rsi
+    jmp .apv_skip
+.apv_S:
+    call apc_parse_uint
+    mov [apc_kv_S], eax
+    jmp .apv_skip
+.apv_O:
+    call apc_parse_uint
+    mov [apc_kv_O], eax
+    jmp .apv_skip
+.apv_z:
+    mov dl, [rsi]                    ; a leading '-' makes it negative
+    cmp dl, '-'
+    jne .apv_z_digits
+    inc rsi
+.apv_z_digits:
+    call apc_parse_uint              ; leaves dl alone
+    cmp dl, '-'
+    jne .apv_z_store
+    neg eax
+.apv_z_store:
+    mov [apc_kv_z], eax
 .apv_skip:
     movzx ecx, byte [rsi]
     test cl, cl
@@ -18496,7 +18578,14 @@ img_alloc:
     call img_find
     pop rdi
     test rsi, rsi
-    jnz .ia_done
+    jz .ia_fresh
+    ; Same id again (a game sends one image per frame): free the
+    ; server copy first, or every frame leaks a pixmap and a picture.
+    push rdi
+    call img_release_picture_in_rsi
+    pop rdi
+    jmp .ia_take
+.ia_fresh:
     xor ecx, ecx
 .ia_scan:
     cmp ecx, IMG_SLOTS
@@ -18600,6 +18689,11 @@ img_upload_rsi:
     ; in memory are [B, G, R, A]. Kitty wire format and `convert
     ; rgba:-` both deliver [R, G, B, A], so the red and blue channels
     ; would be swapped on screen without this pass.
+    cmp byte [idb_bgra], 0
+    je .iur_need_swap
+    mov byte [idb_bgra], 0           ; f=24 expands straight to B,G,R,A
+    jmp .iur_swap_done
+.iur_need_swap:
     mov rdi, [img_decode_buf]
     test rdi, rdi
     jz .iur_swap_done
@@ -18814,16 +18908,28 @@ place_add:
     ; rdi=id, esi=row, edx=col, ecx=cw, r8d=ch
     push rbx
     xor ebx, ebx
+    xor r10d, r10d                   ; first empty slot, 0 = none yet
 .pa_scan:
     cmp ebx, PLACE_SLOTS
-    jge .pa_full
+    jge .pa_scan_done
     mov eax, ebx
     imul eax, PLACE_SLOT_SIZE
     lea r9, [place_table + rax]
-    cmp dword [r9], 0
-    je .pa_take
     cmp [r9], edi
+    je .pa_take                      ; the image's own slot: replace in place
+    cmp dword [r9], 0
     jne .pa_next
+    test r10, r10
+    jnz .pa_next
+    mov r10, r9
+.pa_next:
+    inc ebx
+    jmp .pa_scan
+.pa_scan_done:
+    test r10, r10
+    jz .pa_full
+    mov r9, r10
+    inc qword [place_count]
 .pa_take:
     mov [r9], edi
     mov [r9 + 4], si
@@ -18838,7 +18944,8 @@ place_add:
     mov [r9 + 20], eax
     mov eax, [place_src_h]
     mov [r9 + 24], eax
-    mov dword [r9 + 28], 0
+    mov eax, [place_z]
+    mov [r9 + 28], eax
     ; Damage the placement's rectangle. Until v0.3.58 this was free:
     ; paint_margins widened the BLT bbox to the whole window every
     ; frame, so a newly placed image was copied along with everything
@@ -18876,9 +18983,6 @@ place_add:
     pop rax
     pop rbx
     ret
-.pa_next:
-    inc ebx
-    jmp .pa_scan
 .pa_full:
     pop rbx
     ret
@@ -18925,6 +19029,7 @@ place_clear_image:
     cmp [rsi], edi
     jne .pci_next
     mov dword [rsi], 0
+    dec qword [place_count]
 .pci_next:
     inc ecx
     jmp .pci_loop
@@ -18945,6 +19050,7 @@ place_clear_all:
     mov ecx, PLACE_SLOTS * PLACE_SLOT_SIZE / 8
     xor eax, eax
     rep stosq
+    mov qword [place_count], 0
     mov qword [all_dirty], 1               ; same reason as place_clear_image
     ret
 
@@ -19003,6 +19109,10 @@ handle_kitty_apc:
     ; wipe the place flag set by the original a=T.
     test r14, r14
     jz .hka_append                   ; inferred: pure continuation, append
+    ; Store the flag before eax is reused below. Until v0.3.67 it was
+    ; stored after, from the low byte of apc_deferred_place_id, so a=T
+    ; uploaded and never placed (glow uses a=t + a=p and never saw it).
+    mov [apc_pending_place], al
     ; New explicit transmit. If a deferred place is parked for a
     ; different image id (the previous transmission was interrupted
     ; before finalise), drop it — its target image will never decode.
@@ -19013,7 +19123,6 @@ handle_kitty_apc:
     je .hka_xmit_no_def_clear        ; same id: keep, the new finalise will drain it
     mov dword [apc_deferred_place_id], 0
 .hka_xmit_no_def_clear:
-    mov [apc_pending_place], al
     mov eax, [apc_kv_i]
     mov [apc_pending_id], eax
     mov eax, [apc_kv_f]
@@ -19024,6 +19133,14 @@ handle_kitty_apc:
     mov [apc_pending_h], eax
     movzx eax, byte [apc_kv_q]
     mov [apc_pending_q], al
+    mov al, [apc_kv_t]
+    mov [apc_pending_t], al
+    mov eax, [apc_kv_S]
+    mov [apc_pending_S], eax
+    mov eax, [apc_kv_O]
+    mov [apc_pending_O], eax
+    mov eax, [apc_kv_z]
+    mov [apc_pending_z], eax
     mov qword [apc_payload_len], 0
     mov byte [apc_pending_active], 1
 .hka_append:
@@ -19152,6 +19269,8 @@ handle_kitty_apc:
     mov [place_src_w], eax
     mov eax, [apc_deferred_place_h]
     mov [place_src_h], eax
+    mov eax, [apc_deferred_place_z]
+    mov [place_z], eax
     mov rsi, [apc_deferred_place_row]
     mov rdx, [apc_deferred_place_col]
     mov edi, [apc_pending_id]
@@ -19193,6 +19312,8 @@ handle_kitty_apc:
     mov [apc_deferred_place_w], eax
     mov eax, [apc_kv_h]
     mov [apc_deferred_place_h], eax
+    mov eax, [apc_kv_z]
+    mov [apc_deferred_place_z], eax
     ; Log: place deferred.
     mov edi, 'p'
     mov esi, [apc_kv_i]
@@ -19258,6 +19379,8 @@ handle_kitty_apc:
     mov [place_src_w], eax
     mov eax, [apc_kv_h]
     mov [place_src_h], eax
+    mov eax, [apc_kv_z]
+    mov [place_z], eax
     mov rdi, [cursor_row]
     mov rsi, rdi
     mov edi, [apc_kv_i]
@@ -19391,6 +19514,13 @@ kitty_finalize_image:
     call base64_decode
     mov r14, rax                     ; decoded byte count
 
+    ; Transfer medium. t=s (POSIX shm), t=f (file) and t=t (temp
+    ; file) carry a name in the payload and the pixels in that file.
+    ; Only the game path takes this; an inline (t=d) client never does.
+    movzx eax, byte [apc_pending_t]
+    cmp al, 'd'
+    jne .kfi_from_file
+
     ; Branch on format.
     mov eax, [apc_pending_fmt]
     cmp eax, 32
@@ -19481,7 +19611,120 @@ kitty_finalize_image:
     jmp .kfi_have_rgba
 
 .kfi_raw_rgb:
-    ; Not implemented for now — drop.
+    ; f=24 inline: three bytes a pixel in r12, r14 bytes. Expand to
+    ; B,G,R,A in img_decode_buf.
+    mov ebx, [apc_pending_w]
+    mov r15d, [apc_pending_h]
+    call kfi_pixel_count
+    test rax, rax
+    jz .kfi_bad_size
+    lea rcx, [rax + rax*2]           ; RGB bytes expected
+    cmp r14, rcx
+    jne .kfi_bad_size
+    shl rax, 2
+    mov r14, rax                     ; RGBA bytes for the upload
+    mov rdi, rax
+    call idb_reserve
+    test eax, eax
+    jz .kfi_unmap_decoded
+    mov rsi, r12
+    mov rdi, [img_decode_buf]
+    mov rcx, r14
+    shr rcx, 2
+    call rgb_expand_bgra
+    jmp .kfi_have_rgba
+
+.kfi_from_file:
+    ; The decoded payload (r12, r14 bytes) is a shm name or a path.
+    ; t=s gets "/dev/shm/" in front, a leading '/' in the name dropped.
+    ; PNG is not taken from a file, only f=24 and f=32. S is unchecked.
+    cmp r14, 4000
+    ja .kfi_bad_size
+    lea rdi, [apc_path_buf]
+    mov rsi, r12
+    mov rcx, r14
+    cmp al, 's'
+    jne .kfi_path_copy
+    mov dword [rdi], '/dev'
+    mov dword [rdi + 4], '/shm'
+    mov byte [rdi + 8], '/'
+    add rdi, 9
+    cmp byte [rsi], '/'
+    jne .kfi_path_copy
+    inc rsi
+    dec rcx
+.kfi_path_copy:
+    rep movsb
+    mov byte [rdi], 0
+    mov rax, SYS_OPEN
+    lea rdi, [apc_path_buf]
+    xor esi, esi                     ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .kfi_no_file
+    mov [apc_file_fd], eax
+    mov ebx, [apc_pending_w]
+    mov r15d, [apc_pending_h]
+    call kfi_pixel_count
+    test rax, rax
+    jz .kfi_file_bad
+    mov r14, rax                     ; pixels
+    mov eax, [apc_pending_fmt]
+    cmp eax, 24
+    je .kfi_file_rgb
+    cmp eax, 32
+    jne .kfi_file_bad
+    shl r14, 2                       ; f=32: bytes = pixels * 4
+    mov rdi, r14
+    call idb_reserve
+    test eax, eax
+    jz .kfi_file_bad
+    mov rdi, [img_decode_buf]
+    mov rsi, r14
+    call kfi_file_read
+    test eax, eax
+    jz .kfi_file_bad
+    call kfi_file_close
+    jmp .kfi_have_rgba
+.kfi_file_rgb:
+    ; f=24: read pixels*3 bytes into the tail of a pixels*4 buffer,
+    ; then expand forward in place. Each pixel is read before it is
+    ; written, and the source stays ahead of the destination.
+    mov rdi, r14
+    shl rdi, 2
+    call idb_reserve
+    test eax, eax
+    jz .kfi_file_bad
+    mov rdi, [img_decode_buf]
+    add rdi, r14
+    lea rsi, [r14 + r14*2]
+    call kfi_file_read
+    test eax, eax
+    jz .kfi_file_bad
+    call kfi_file_close
+    mov rsi, [img_decode_buf]
+    add rsi, r14
+    mov rdi, [img_decode_buf]
+    mov rcx, r14
+    call rgb_expand_bgra
+    shl r14, 2
+    jmp .kfi_have_rgba
+.kfi_file_bad:
+    call kfi_file_close
+.kfi_bad_size:
+    cmp byte [apc_pending_q], 2
+    jae .kfi_unmap_decoded
+    lea rdi, [apc_str_einval]
+    mov esi, apc_str_einval_len
+    call apc_reply
+    jmp .kfi_unmap_decoded
+.kfi_no_file:
+    cmp byte [apc_pending_q], 2
+    jae .kfi_unmap_decoded
+    lea rdi, [apc_str_enoent]
+    mov esi, apc_str_enoent_len
+    call apc_reply
     jmp .kfi_unmap_decoded
 
 .kfi_have_rgba:
@@ -19493,6 +19736,12 @@ kitty_finalize_image:
     mov edx, r15d
     mov r8, r14
     call img_upload_rsi
+    cmp byte [apc_pending_q], 0
+    jne .kfi_no_ok
+    lea rdi, [apc_str_ok]
+    mov esi, apc_str_ok_len
+    call apc_reply
+.kfi_no_ok:
 
     ; If a=T, place at cursor immediately.
     cmp byte [apc_pending_place], 1
@@ -19529,6 +19778,8 @@ kitty_finalize_image:
     mov [place_src_w], eax
     mov eax, [apc_kv_h]
     mov [place_src_h], eax
+    mov eax, [apc_pending_z]
+    mov [place_z], eax
     mov rsi, [cursor_row]
     mov rdx, [cursor_col]
     mov edi, [apc_pending_id]
@@ -19545,6 +19796,209 @@ kitty_finalize_image:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; rdi = bytes wanted in img_decode_buf. Grows the mapping when short.
+; eax = 1 on success.
+idb_reserve:
+    cmp rdi, IMG_DECODE_MAX
+    ja .idr_fail
+    cmp rdi, [img_decode_len]
+    jbe .idr_ok
+    push rdi
+    mov rax, [img_decode_buf]
+    test rax, rax
+    jz .idr_map
+    mov rax, SYS_MUNMAP
+    mov rdi, [img_decode_buf]
+    mov rsi, [img_decode_len]
+    syscall
+    mov qword [img_decode_buf], 0
+    mov qword [img_decode_len], 0
+.idr_map:
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [rsp]
+    mov rdx, MMAP_PROT_RW
+    mov r10, MMAP_FLAGS_PRIV
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    pop rdi
+    cmp rax, -4096
+    ja .idr_fail
+    mov [img_decode_buf], rax
+    mov [img_decode_len], rdi
+.idr_ok:
+    mov eax, 1
+    ret
+.idr_fail:
+    xor eax, eax
+    ret
+
+; rsi = R,G,B source, rdi = B,G,R,A destination, rcx = pixels. The two
+; may share a buffer when the destination starts first.
+rgb_expand_bgra:
+.reb_loop:
+    movzx eax, byte [rsi]
+    movzx edx, byte [rsi + 1]
+    movzx r8d, byte [rsi + 2]
+    mov [rdi], r8b
+    mov [rdi + 1], dl
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0xFF
+    add rsi, 3
+    add rdi, 4
+    dec rcx
+    jnz .reb_loop
+    mov byte [idb_bgra], 1
+    ret
+
+; ebx = width, r15d = height. rax = pixels, or 0 when a side is 0 or
+; over MAX_IMG_DIM.
+kfi_pixel_count:
+    xor eax, eax
+    test ebx, ebx
+    jz .kpc_ret
+    test r15d, r15d
+    jz .kpc_ret
+    cmp ebx, MAX_IMG_DIM
+    ja .kpc_ret
+    cmp r15d, MAX_IMG_DIM
+    ja .kpc_ret
+    mov eax, ebx
+    mov edx, r15d
+    imul rax, rdx
+.kpc_ret:
+    ret
+
+; rdi = destination, rsi = bytes. pread from apc_file_fd at
+; apc_pending_O until every byte is in. eax = 1 on success.
+kfi_file_read:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13d, [apc_pending_O]
+.kfr_loop:
+    test r12, r12
+    jz .kfr_ok
+    mov rax, SYS_PREAD64
+    mov edi, [apc_file_fd]
+    mov rsi, rbx
+    mov rdx, r12
+    mov r10, r13
+    syscall
+    test rax, rax
+    jle .kfr_fail                    ; short file or error
+    add rbx, rax
+    add r13, rax
+    sub r12, rax
+    jmp .kfr_loop
+.kfr_ok:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.kfr_fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Close apc_file_fd. A t=s file is unlinked, a t=t file only under /tmp
+; or /dev/shm, a t=f file is left alone.
+kfi_file_close:
+    mov rax, SYS_CLOSE
+    mov edi, [apc_file_fd]
+    syscall
+    movzx eax, byte [apc_pending_t]
+    cmp al, 's'
+    je .kfc_unlink
+    cmp al, 't'
+    jne .kfc_ret
+    cmp dword [apc_path_buf], '/tmp'
+    jne .kfc_chk_shm
+    cmp byte [apc_path_buf + 4], '/'
+    je .kfc_unlink
+.kfc_chk_shm:
+    cmp dword [apc_path_buf], '/dev'
+    jne .kfc_ret
+    cmp dword [apc_path_buf + 4], '/shm'
+    jne .kfc_ret
+    cmp byte [apc_path_buf + 8], '/'
+    jne .kfc_ret
+.kfc_unlink:
+    mov rax, SYS_UNLINK
+    lea rdi, [apc_path_buf]
+    syscall
+.kfc_ret:
+    ret
+
+; rdi = tail text, esi = its length. Writes ESC _ G i=<id>;<tail> ESC \
+; to the shell side. Callers check the quiet level first.
+apc_reply:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12d, esi
+    lea rdi, [apc_reply_buf]
+    mov byte [rdi], 27
+    mov word [rdi + 1], '_G'
+    mov word [rdi + 3], 'i='
+    add rdi, 5
+    mov eax, [apc_pending_id]
+    call apc_log_u64
+    mov byte [rdi], ';'
+    inc rdi
+    mov rsi, rbx
+    mov ecx, r12d
+    rep movsb
+    mov byte [rdi], 27
+    mov byte [rdi + 1], '\'
+    add rdi, 2
+    lea rsi, [apc_reply_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    syscall
+    pop r12
+    pop rbx
+    ret
+
+; The grid scrolled up one row between rdi (top) and rsi (bottom):
+; placements anchored in that band move up, and one on the top row is
+; dropped. Called only when place_count is non-zero.
+place_scroll_up:
+    push rbx
+    mov ecx, PLACE_SLOTS
+    lea rbx, [place_table]
+.psu_loop:
+    cmp dword [rbx], 0
+    je .psu_next
+    movzx eax, word [rbx + 4]        ; anchor row
+    cmp rax, rdi
+    jb .psu_next                     ; above the band: stays
+    cmp rax, rsi
+    ja .psu_next                     ; below the band: stays
+    cmp rax, rdi
+    je .psu_drop
+    dec eax
+    mov [rbx + 4], ax
+    jmp .psu_next
+.psu_drop:
+    mov dword [rbx], 0
+    dec qword [place_count]
+.psu_next:
+    add rbx, PLACE_SLOT_SIZE
+    dec ecx
+    jnz .psu_loop
+    mov qword [all_dirty], 1
     pop rbx
     ret
 

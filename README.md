@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.66-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.67-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -301,7 +301,7 @@ empty value disables the binding.
 - [ ] Variable-font TTFs (gvar code path SEGVs in library mode; static TTFs work — see `CONFIG-FUTURE.md`)
 - [ ] Tab/split support (multiple PTYs)
 - [ ] Font ligatures
-- [ ] Image display via kitty graphics protocol (APC `ESC _G ... ESC \`) — rasters now silently consumed
+- [x] Image display via kitty graphics protocol (APC `ESC _G ... ESC \`): PNG, RGBA and RGB, inline base64 or a shm/file name (`t=s`, `t=f`), placements scaled into cells and scrolled with the text, `OK`/error replies unless `q`. One placement per image id, no z-order (every image draws over the text). A game can stream 640x400 frames through `/dev/shm` at 60 fps.
 - [ ] WM_CLASS for window manager integration
 
 ## The CHasm Suite
