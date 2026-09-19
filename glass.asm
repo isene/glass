@@ -1231,7 +1231,13 @@ kbd_depth_main:     resd 1
 kbd_depth_alt:      resd 1
 kbd_release_on:     resb 1          ; 1 = KeyRelease in the window's event mask
 kbd_down_map:       resb 32         ; keycodes held: repeat detection, focus-out sweep
-kbd_out_buf:        resb 32
+kbd_out_buf:        resb 48
+kbd_ev_kc:          resd 1          ; handle_keyevent scratch
+kbd_ev_code:        resd 1
+kbd_ev_alt:         resd 1
+kbd_ev_text:        resd 1
+kbd_ev_mods:        resd 1
+kbd_ev_need:        resd 1
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
@@ -6592,10 +6598,12 @@ handle_x11_events:
 .hxe_key_press:
     movzx eax, byte [x11_buf + rbx + 1]
     movzx ecx, word [x11_buf + rbx + 28]
+    cmp qword [kitty_kbd_flags], 0
+    je .hxe_key_press_plain
     test byte [kitty_kbd_flags], 2
-    jz .hxe_key_press_plain
+    jz .hxe_key_first
     ; Event types on: a press of a key already down is a repeat and
-    ; goes out as CSI code;mods:2. A first press takes the usual path.
+    ; goes out as CSI code;mods:2. A first press continues below.
     mov edx, eax
     shr edx, 3
     mov r8d, eax
@@ -6605,17 +6613,32 @@ handle_x11_events:
     jc .hxe_key_repeat
     bts r9d, r8d
     mov [kbd_down_map + rdx], r9b
-    jmp .hxe_key_press_plain
+    jmp .hxe_key_first
 .hxe_key_repeat:
     mov edx, 2
+    jmp .hxe_key_encode
+.hxe_key_first:
+    ; Flag 8: every key as an escape code. Flags 4 or 16 with ctrl, alt
+    ; or super held: the CSI u form with the extra fields. Flag 1 alone
+    ; keeps the legacy bytes for those (Claude Code pushes only flag 1
+    ; and reads Ctrl+C as 0x03).
+    test byte [kitty_kbd_flags], 8
+    jnz .hxe_key_press_code
+    test byte [kitty_kbd_flags], 4 | 16
+    jz .hxe_key_press_plain
+    test ecx, 4 | 8 | 64
+    jz .hxe_key_press_plain
+.hxe_key_press_code:
+    mov edx, 1
+.hxe_key_encode:
     push rbx
     push r12
     call handle_keyevent
     pop r12
     pop rbx
     test eax, eax
-    jnz .hxe_key_done                ; reported as a repeat
-    movzx eax, byte [x11_buf + rbx + 1]   ; else it is a press again
+    jnz .hxe_key_done                ; sent as an escape code
+    movzx eax, byte [x11_buf + rbx + 1]   ; else the usual path
     movzx ecx, word [x11_buf + rbx + 28]
 .hxe_key_press_plain:
     push rbx
@@ -6626,6 +6649,7 @@ handle_x11_events:
 .hxe_key_done:
     add rbx, 32
     jmp .hxe_loop
+
 
 .hxe_key_release:
     ; Only selected while kitty flag 2 is on; a stray one is dropped.
@@ -7751,6 +7775,7 @@ kbd_apply:
     push rsi
     push rdi
     push r8
+    and rax, 31                      ; flags 1, 2, 4, 8, 16 are what glass knows
     call kbd_screen
     mov [rsi], rax
     mov rcx, [kitty_kbd_flags]
@@ -7885,13 +7910,17 @@ da_write:
     syscall
     ret
 
-; Functional keys the release and repeat encoder reports: keysym, code,
+; Keys the escape-code encoder knows besides text keys: keysym, code,
 ; final byte. A final of 'u' is "CSI code;mods:type u", '~' is
-; "CSI code;mods:type ~", a letter is "CSI 1;mods:type L". Enter, Tab and
-; Backspace are left out on purpose: the spec sends no release for them
-; without "report all keys". Modifier keys are not in the table either.
+; "CSI code;mods:type ~", a letter is "CSI 1;mods:type L". Without flag 8
+; Enter, Tab and Backspace get no repeat or release and the modifier
+; keys are never reported, as the spec says.
 kbd_fn_table:
     dd 0xFF1B, 27, 'u'               ; Escape
+    dd 0xFF0D, 13, 'u'               ; Enter
+    dd 0xFF8D, 57414, 'u'            ; KP_Enter
+    dd 0xFF09, 9, 'u'                ; Tab
+    dd 0xFF08, 127, 'u'              ; Backspace
     dd 0xFF52, 1, 'A'                ; Up
     dd 0xFF54, 1, 'B'                ; Down
     dd 0xFF53, 1, 'C'                ; Right
@@ -7914,39 +7943,66 @@ kbd_fn_table:
     dd 0xFFC7, 21, '~'               ; F10
     dd 0xFFC8, 23, '~'               ; F11
     dd 0xFFC9, 24, '~'               ; F12
+    dd 0xFFE1, 57441, 'u'            ; Shift_L
+    dd 0xFFE2, 57447, 'u'            ; Shift_R
+    dd 0xFFE3, 57442, 'u'            ; Control_L
+    dd 0xFFE4, 57448, 'u'            ; Control_R
+    dd 0xFFE9, 57443, 'u'            ; Alt_L
+    dd 0xFFEA, 57449, 'u'            ; Alt_R
+    dd 0xFFEB, 57444, 'u'            ; Super_L
+    dd 0xFFEC, 57450, 'u'            ; Super_R
+    dd 0xFFE5, 57358, 'u'            ; Caps_Lock
+    dd 0xFF7F, 57360, 'u'            ; Num_Lock
+    dd 0xFF14, 57359, 'u'            ; Scroll_Lock
+    dd 0xFF61, 57361, 'u'            ; Print
+    dd 0xFF13, 57362, 'u'            ; Pause
+    dd 0xFF67, 57363, 'u'            ; Menu
     dd 0
 
-; eax = keycode, ecx = X state, edx = 2 repeat or 3 release. Sends the
-; key as an escape code with the event type. eax = 1 when sent, 0 for a
-; key the protocol does not report this way (the press then takes the
-; usual path).
+; eax = keysym. eax = its unicode code point when it is a text key
+; (printable Latin-1 or a unicode keysym), else 0.
+kbd_text_code:
+    cmp eax, 0x20
+    jb .ktc_no
+    cmp eax, 0x7F
+    jb .ktc_yes
+    cmp eax, 0xA0
+    jb .ktc_no
+    cmp eax, 0x100
+    jb .ktc_yes
+    mov ecx, eax
+    and ecx, 0xFF000000
+    cmp ecx, 0x01000000
+    jne .ktc_no
+    and eax, 0x00FFFFFF
+.ktc_yes:
+    ret
+.ktc_no:
+    xor eax, eax
+    ret
+
+; eax = keycode, ecx = X state, edx = 1 press, 2 repeat, 3 release.
+; Sends the key as an escape code with the fields the pushed flags ask
+; for: shifted key (flag 4), event type (flag 2), text (flag 16).
+; eax = 1 when sent, 0 for a key the protocol does not report this way
+; under the current flags (a press then takes the usual path).
 handle_keyevent:
     push rbx
     push r12
     push r13
     mov r12d, edx                    ; type
     mov r13d, ecx                    ; state
+    mov [kbd_ev_kc], eax
     shl eax, 3
     cmp eax, 2048
     jae .hke_no
     mov ebx, [keysym_map + rax*4]    ; unshifted keysym
-    mov eax, ebx                     ; code = the keysym for text keys
-    cmp ebx, 0x20
-    jb .hke_no
-    cmp ebx, 0x7F
-    jb .hke_text
-    cmp ebx, 0xA0
-    jb .hke_no
-    cmp ebx, 0x100
-    jb .hke_text
-    mov ecx, ebx
-    and ecx, 0xFF000000
-    cmp ecx, 0x01000000              ; unicode keysym
-    jne .hke_fn
-    and eax, 0x00FFFFFF
-.hke_text:
+    mov eax, ebx
+    call kbd_text_code
+    test eax, eax
+    jz .hke_fn
     mov ebx, 'u'
-    jmp .hke_emit
+    jmp .hke_classified
 .hke_fn:
     lea rcx, [kbd_fn_table]
 .hke_fn_loop:
@@ -7960,16 +8016,75 @@ handle_keyevent:
 .hke_fn_hit:
     mov eax, [rcx + 4]
     mov ebx, [rcx + 8]
-.hke_emit:
-    ; ESC [ code ; mods : type final
-    lea rdi, [kbd_out_buf]
-    mov byte [rdi], 0x1B
-    mov byte [rdi+1], '['
-    add rdi, 2
-    call apc_log_u64
-    mov byte [rdi], ';'
-    inc rdi
-    mov eax, 1                       ; mods = 1 + bits
+.hke_classified:
+    mov [kbd_ev_code], eax
+    ; Without flag 8: modifier keys never, Enter/Tab/Backspace only
+    ; as a press (a routed one, with modifiers held).
+    test byte [kitty_kbd_flags], 8
+    jnz .hke_allowed
+    cmp eax, 57358
+    jae .hke_no
+    cmp ebx, 'u'
+    jne .hke_allowed
+    cmp r12d, 1
+    je .hke_allowed
+    cmp eax, 13
+    je .hke_no
+    cmp eax, 9
+    je .hke_no
+    cmp eax, 127
+    je .hke_no
+.hke_allowed:
+    ; shifted key (flag 4): the shift column's text code when it differs
+    mov dword [kbd_ev_alt], 0
+    test byte [kitty_kbd_flags], 4
+    jz .hke_alt_done
+    test r13d, 1
+    jz .hke_alt_done
+    cmp ebx, 'u'
+    jne .hke_alt_done
+    mov eax, [kbd_ev_kc]
+    shl eax, 3
+    inc eax
+    mov eax, [keysym_map + rax*4]
+    call kbd_text_code
+    cmp eax, [kbd_ev_code]
+    je .hke_alt_done
+    mov [kbd_ev_alt], eax
+.hke_alt_done:
+    ; text (flag 16): press or repeat of a text key with no ctrl, alt
+    ; or super held; the shifted code when shift is held
+    mov dword [kbd_ev_text], 0
+    test byte [kitty_kbd_flags], 16
+    jz .hke_text_done
+    cmp r12d, 3
+    je .hke_text_done
+    cmp ebx, 'u'
+    jne .hke_text_done
+    cmp dword [kbd_ev_code], 57358
+    jae .hke_text_done
+    test r13d, 4 | 8 | 64
+    jnz .hke_text_done
+    mov eax, [kbd_ev_code]
+    cmp eax, 0x20
+    jb .hke_text_done
+    test r13d, 1
+    jz .hke_text_set
+    mov ecx, [kbd_ev_kc]
+    shl ecx, 3
+    inc ecx
+    push rax
+    mov eax, [keysym_map + rcx*4]
+    call kbd_text_code
+    pop rcx
+    test eax, eax
+    jnz .hke_text_set
+    mov eax, ecx
+.hke_text_set:
+    mov [kbd_ev_text], eax
+.hke_text_done:
+    ; mods = 1 + bits
+    mov eax, 1
     test r13d, 1                     ; Shift
     jz .hke_m1
     inc eax
@@ -7986,13 +8101,64 @@ handle_keyevent:
     jz .hke_m4
     add eax, 8
 .hke_m4:
+    mov [kbd_ev_mods], eax
+    ; the modifier field is needed when mods, type or text says so
+    xor ecx, ecx
+    cmp eax, 1
+    jne .hke_need_mods
+    cmp r12d, 1
+    jne .hke_need_mods
+    cmp dword [kbd_ev_text], 0
+    je .hke_mods_decided
+.hke_need_mods:
+    mov ecx, 1
+.hke_mods_decided:
+    mov [kbd_ev_need], ecx
+    ; ESC [ ...
+    lea rdi, [kbd_out_buf]
+    mov byte [rdi], 0x1B
+    mov byte [rdi+1], '['
+    add rdi, 2
+    cmp ebx, 'u'
+    je .hke_code
+    cmp ebx, '~'
+    je .hke_code
+    ; letter form: the code (always 1) only with a modifier field
+    cmp dword [kbd_ev_need], 0
+    je .hke_final
+.hke_code:
+    mov eax, [kbd_ev_code]
     call apc_log_u64
+    mov eax, [kbd_ev_alt]
+    test eax, eax
+    jz .hke_after_code
+    mov byte [rdi], ':'
+    inc rdi
+    call apc_log_u64
+.hke_after_code:
+    cmp dword [kbd_ev_need], 0
+    je .hke_final
+    mov byte [rdi], ';'
+    inc rdi
+    mov eax, [kbd_ev_mods]
+    call apc_log_u64
+    cmp r12d, 1
+    je .hke_after_type
     mov byte [rdi], ':'
     mov eax, r12d
     add al, '0'
     mov [rdi+1], al
-    mov [rdi+2], bl
-    add rdi, 3
+    add rdi, 2
+.hke_after_type:
+    mov eax, [kbd_ev_text]
+    test eax, eax
+    jz .hke_final
+    mov byte [rdi], ';'
+    inc rdi
+    call apc_log_u64
+.hke_final:
+    mov [rdi], bl
+    inc rdi
     lea rsi, [kbd_out_buf]
     mov rdx, rdi
     sub rdx, rsi
