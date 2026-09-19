@@ -145,6 +145,7 @@
 
 ; X11 masks
 %define KEY_PRESS_MASK      0x00000001
+%define KEY_RELEASE_MASK    0x00000002       ; selected only while kitty flag 2 is on
 %define EXPOSURE_MASK       0x00008000
 %define STRUCTURE_NOTIFY_MASK 0x00020000
 %define FOCUS_CHANGE_MASK   0x00200000
@@ -1215,6 +1216,18 @@ bracketed_paste:    resq 1          ; 1 = bracketed paste mode
 ; which is what Claude Code requests so it can distinguish Shift+Enter /
 ; Alt+Enter from a bare Enter and let the user insert newlines in the prompt.
 kitty_kbd_flags:    resq 1
+; v0.3.69: per-screen flag values and push stacks, as the spec asks, and
+; the state for bit 2 (report event types): KeyRelease is selected on the
+; window only while it is set, so a shell never sees an extra event.
+kbd_flags_main:     resq 1
+kbd_flags_alt:      resq 1
+kbd_stack_main:     resq 8
+kbd_stack_alt:      resq 8
+kbd_depth_main:     resd 1
+kbd_depth_alt:      resd 1
+kbd_release_on:     resb 1          ; 1 = KeyRelease in the window's event mask
+kbd_down_map:       resb 32         ; keycodes held: repeat detection, focus-out sweep
+kbd_out_buf:        resb 32
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
@@ -6360,6 +6373,8 @@ handle_x11_events:
 
     cmp al, EV_KEY_PRESS
     je .hxe_key_press
+    cmp al, EV_KEY_RELEASE
+    je .hxe_key_release
     cmp al, EV_BUTTON_PRESS
     je .hxe_button_press
     cmp al, EV_BUTTON_RELEASE
@@ -6571,16 +6586,63 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_key_press:
-    ; keycode at offset 1, state at offset 28
     movzx eax, byte [x11_buf + rbx + 1]
     movzx ecx, word [x11_buf + rbx + 28]
+    test byte [kitty_kbd_flags], 2
+    jz .hxe_key_press_plain
+    ; Event types on: a press of a key already down is a repeat and
+    ; goes out as CSI code;mods:2. A first press takes the usual path.
+    mov edx, eax
+    shr edx, 3
+    mov r8d, eax
+    and r8d, 7
+    movzx r9d, byte [kbd_down_map + rdx]
+    bt r9d, r8d
+    jc .hxe_key_repeat
+    bts r9d, r8d
+    mov [kbd_down_map + rdx], r9b
+    jmp .hxe_key_press_plain
+.hxe_key_repeat:
+    mov edx, 2
+    push rbx
+    push r12
+    call handle_keyevent
+    pop r12
+    pop rbx
+    test eax, eax
+    jnz .hxe_key_done                ; reported as a repeat
+    movzx eax, byte [x11_buf + rbx + 1]   ; else it is a press again
+    movzx ecx, word [x11_buf + rbx + 28]
+.hxe_key_press_plain:
     push rbx
     push r12
     call handle_keypress
     pop r12
     pop rbx
+.hxe_key_done:
     add rbx, 32
     jmp .hxe_loop
+
+.hxe_key_release:
+    ; Only selected while kitty flag 2 is on; a stray one is dropped.
+    test byte [kitty_kbd_flags], 2
+    jz .hxe_key_done
+    movzx eax, byte [x11_buf + rbx + 1]
+    movzx ecx, word [x11_buf + rbx + 28]
+    mov edx, eax
+    shr edx, 3
+    mov r8d, eax
+    and r8d, 7
+    movzx r9d, byte [kbd_down_map + rdx]
+    btr r9d, r8d
+    mov [kbd_down_map + rdx], r9b
+    mov edx, 3
+    push rbx
+    push r12
+    call handle_keyevent
+    pop r12
+    pop rbx
+    jmp .hxe_key_done
 
 .hxe_unmap:
     ; Off-screen now (workspace switch, or the WM hid us). Stop painting:
@@ -6678,6 +6740,14 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_focus_out:
+    test byte [kitty_kbd_flags], 2   ; held keys get their release
+    jz .hxe_focus_out_keys_done
+    push rbx
+    push r12
+    call kbd_release_all
+    pop r12
+    pop rbx
+.hxe_focus_out_keys_done:
     ; FocusOut (event type 10). Mark unfocused + repaint to apply the
     ; dim overlay. Same all_dirty rationale as FocusIn.
     mov qword [window_focused], 0
@@ -7653,6 +7723,300 @@ apply_window_resize:
 
 ; Handle keypress using X11 keysym map
 ; eax = keycode, ecx = state (modifiers)
+; ── Kitty keyboard protocol state (v0.3.69) ────────────────────────
+; kitty_kbd_flags is the live value. Each screen keeps its own value and
+; its own stack of pushed states, as the spec asks, so a game that dies
+; on the alt screen leaves the shell's keys alone.
+
+; rsi = &current flags, rdi = stack base, r8 = &depth of the active screen
+kbd_screen:
+    lea rsi, [kbd_flags_main]
+    lea rdi, [kbd_stack_main]
+    lea r8, [kbd_depth_main]
+    cmp qword [alt_screen_active], 0
+    je .ks_ret
+    lea rsi, [kbd_flags_alt]
+    lea rdi, [kbd_stack_alt]
+    lea r8, [kbd_depth_alt]
+.ks_ret:
+    ret
+
+; rax = new flags for the active screen. KeyRelease gets selected or
+; dropped on the window when bit 2 changes.
+kbd_apply:
+    push rsi
+    push rdi
+    push r8
+    call kbd_screen
+    mov [rsi], rax
+    mov rcx, [kitty_kbd_flags]
+    mov [kitty_kbd_flags], rax
+    xor rcx, rax
+    test ecx, 2
+    jz .ka_done
+    xor edi, edi
+    test eax, 2
+    jz .ka_sel
+    mov edi, 1
+.ka_sel:
+    call kbd_select_release
+.ka_done:
+    pop r8
+    pop rdi
+    pop rsi
+    ret
+
+; edi = 1 to receive KeyRelease, 0 to stop. One ChangeWindowAttributes.
+; Keys held at the switch are forgotten, so no release goes out for a
+; press that was never reported.
+kbd_select_release:
+    cmp [kbd_release_on], dil
+    je .ksr_done
+    mov [kbd_release_on], dil
+    mov eax, EVENT_MASK_ALL
+    test edi, edi
+    jz .ksr_mask
+    or eax, KEY_RELEASE_MASK
+.ksr_mask:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov ecx, [win_id]
+    mov [rdi+4], ecx
+    mov dword [rdi+8], CW_EVENT_MASK
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    lea rdi, [kbd_down_map]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+.ksr_done:
+    ret
+
+; rax = flags to push: the current state goes on the stack (8 deep)
+kbd_push:
+    push rax
+    call kbd_screen
+    mov ecx, [r8]
+    cmp ecx, 8
+    jae .kp_full
+    mov rdx, [rsi]
+    mov [rdi + rcx*8], rdx
+    inc dword [r8]
+.kp_full:
+    pop rax
+    jmp kbd_apply
+
+; rax = number of states to pop; an empty stack means flags 0
+kbd_pop:
+    call kbd_screen
+.kpo_loop:
+    test rax, rax
+    jz .kpo_done
+    dec rax
+    mov ecx, [r8]
+    test ecx, ecx
+    jz .kpo_empty
+    dec ecx
+    mov [r8], ecx
+    mov rdx, [rdi + rcx*8]
+    mov [rsi], rdx
+    jmp .kpo_loop
+.kpo_empty:
+    mov qword [rsi], 0
+.kpo_done:
+    mov rax, [rsi]
+    jmp kbd_apply
+
+; rax = flags, edx = mode: 1 set, 2 or in, 3 clear
+kbd_set:
+    call kbd_screen
+    mov rcx, [rsi]
+    cmp edx, 2
+    je .kset_or
+    cmp edx, 3
+    jne kbd_apply
+    not rax
+    and rax, rcx
+    jmp kbd_apply
+.kset_or:
+    or rax, rcx
+    jmp kbd_apply
+
+; CSI ? u → CSI ? flags u on the shell side
+kbd_query_reply:
+    lea rdi, [kbd_out_buf]
+    mov byte [rdi], 0x1B
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '?'
+    add rdi, 3
+    mov rax, [kitty_kbd_flags]
+    call apc_log_u64
+    mov byte [rdi], 'u'
+    inc rdi
+    lea rsi, [kbd_out_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    syscall
+    ret
+
+; Functional keys the release and repeat encoder reports: keysym, code,
+; final byte. A final of 'u' is "CSI code;mods:type u", '~' is
+; "CSI code;mods:type ~", a letter is "CSI 1;mods:type L". Enter, Tab and
+; Backspace are left out on purpose: the spec sends no release for them
+; without "report all keys". Modifier keys are not in the table either.
+kbd_fn_table:
+    dd 0xFF1B, 27, 'u'               ; Escape
+    dd 0xFF52, 1, 'A'                ; Up
+    dd 0xFF54, 1, 'B'                ; Down
+    dd 0xFF53, 1, 'C'                ; Right
+    dd 0xFF51, 1, 'D'                ; Left
+    dd 0xFF50, 1, 'H'                ; Home
+    dd 0xFF57, 1, 'F'                ; End
+    dd 0xFFBE, 1, 'P'                ; F1
+    dd 0xFFBF, 1, 'Q'                ; F2
+    dd 0xFFC1, 1, 'S'                ; F4
+    dd 0xFF63, 2, '~'                ; Insert
+    dd 0xFFFF, 3, '~'                ; Delete
+    dd 0xFF55, 5, '~'                ; Page Up
+    dd 0xFF56, 6, '~'                ; Page Down
+    dd 0xFFC0, 13, '~'               ; F3
+    dd 0xFFC2, 15, '~'               ; F5
+    dd 0xFFC3, 17, '~'               ; F6
+    dd 0xFFC4, 18, '~'               ; F7
+    dd 0xFFC5, 19, '~'               ; F8
+    dd 0xFFC6, 20, '~'               ; F9
+    dd 0xFFC7, 21, '~'               ; F10
+    dd 0xFFC8, 23, '~'               ; F11
+    dd 0xFFC9, 24, '~'               ; F12
+    dd 0
+
+; eax = keycode, ecx = X state, edx = 2 repeat or 3 release. Sends the
+; key as an escape code with the event type. eax = 1 when sent, 0 for a
+; key the protocol does not report this way (the press then takes the
+; usual path).
+handle_keyevent:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edx                    ; type
+    mov r13d, ecx                    ; state
+    shl eax, 3
+    cmp eax, 2048
+    jae .hke_no
+    mov ebx, [keysym_map + rax*4]    ; unshifted keysym
+    mov eax, ebx                     ; code = the keysym for text keys
+    cmp ebx, 0x20
+    jb .hke_no
+    cmp ebx, 0x7F
+    jb .hke_text
+    cmp ebx, 0xA0
+    jb .hke_no
+    cmp ebx, 0x100
+    jb .hke_text
+    mov ecx, ebx
+    and ecx, 0xFF000000
+    cmp ecx, 0x01000000              ; unicode keysym
+    jne .hke_fn
+    and eax, 0x00FFFFFF
+.hke_text:
+    mov ebx, 'u'
+    jmp .hke_emit
+.hke_fn:
+    lea rcx, [kbd_fn_table]
+.hke_fn_loop:
+    mov edx, [rcx]
+    test edx, edx
+    jz .hke_no
+    cmp edx, ebx
+    je .hke_fn_hit
+    add rcx, 12
+    jmp .hke_fn_loop
+.hke_fn_hit:
+    mov eax, [rcx + 4]
+    mov ebx, [rcx + 8]
+.hke_emit:
+    ; ESC [ code ; mods : type final
+    lea rdi, [kbd_out_buf]
+    mov byte [rdi], 0x1B
+    mov byte [rdi+1], '['
+    add rdi, 2
+    call apc_log_u64
+    mov byte [rdi], ';'
+    inc rdi
+    mov eax, 1                       ; mods = 1 + bits
+    test r13d, 1                     ; Shift
+    jz .hke_m1
+    inc eax
+.hke_m1:
+    test r13d, 8                     ; Alt (Mod1)
+    jz .hke_m2
+    add eax, 2
+.hke_m2:
+    test r13d, 4                     ; Ctrl
+    jz .hke_m3
+    add eax, 4
+.hke_m3:
+    test r13d, 64                    ; Super (Mod4)
+    jz .hke_m4
+    add eax, 8
+.hke_m4:
+    call apc_log_u64
+    mov byte [rdi], ':'
+    mov eax, r12d
+    add al, '0'
+    mov [rdi+1], al
+    mov [rdi+2], bl
+    add rdi, 3
+    lea rsi, [kbd_out_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    syscall
+    mov eax, 1
+    jmp .hke_ret
+.hke_no:
+    xor eax, eax
+.hke_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Focus left the window: every key still held gets its release, so a
+; game stops moving instead of running on.
+kbd_release_all:
+    push rbx
+    xor ebx, ebx
+.kra_loop:
+    mov eax, ebx
+    shr eax, 3
+    movzx ecx, byte [kbd_down_map + rax]
+    mov edx, ebx
+    and edx, 7
+    bt ecx, edx
+    jnc .kra_next
+    btr ecx, edx
+    mov [kbd_down_map + rax], cl
+    mov eax, ebx
+    xor ecx, ecx
+    mov edx, 3
+    call handle_keyevent
+.kra_next:
+    inc ebx
+    cmp ebx, 256
+    jb .kra_loop
+    pop rbx
+    ret
+
 handle_keypress:
     push rbx
     push r12
@@ -9569,6 +9933,11 @@ vt_process:
     mov rax, [alt_cursor_col]
     mov [cursor_col], rax
     mov qword [alt_screen_active], 0
+    mov qword [kbd_flags_alt], 0         ; RIS: key flags and stacks gone
+    mov dword [kbd_depth_main], 0
+    mov dword [kbd_depth_alt], 0
+    xor eax, eax
+    call kbd_apply
 .vtp_full_reset_done:
     jmp .vtp_loop
 
@@ -9669,34 +10038,40 @@ vt_process:
     je .vtp_csi_kitty_set
     jmp .vtp_loop
 .vtp_csi_kitty_push:
-    ; \e[>Nu — request progressive enhancement at level N (default 1).
-    ; Treat as "set"; we don't keep a stack since callers only care that
-    ; the level is non-zero.
-    mov rax, [vt_param_count]
-    test rax, rax
-    jz .vtp_csi_kitty_default
-    mov rax, [vt_params]
-    jmp .vtp_csi_kitty_store
-.vtp_csi_kitty_default:
-    mov rax, 1
-.vtp_csi_kitty_store:
-    mov [kitty_kbd_flags], rax
+    ; CSI > flags u: push, flags default 0 (spec). Was a plain store
+    ; with default 1 until v0.3.69.
+    xor eax, eax
+    cmp qword [vt_param_count], 0
+    je .vtp_csi_kitty_push_go
+    mov eax, [vt_params]
+.vtp_csi_kitty_push_go:
+    call kbd_push
     jmp .vtp_loop
 .vtp_csi_kitty_pop:
-    ; \e[<u — pop / disable. Return to legacy encoding.
-    mov qword [kitty_kbd_flags], 0
+    ; CSI < n u: pop n states, default 1
+    mov eax, 1
+    cmp qword [vt_param_count], 0
+    je .vtp_csi_kitty_pop_go
+    cmp dword [vt_params], 0
+    je .vtp_csi_kitty_pop_go
+    mov eax, [vt_params]
+.vtp_csi_kitty_pop_go:
+    call kbd_pop
     jmp .vtp_loop
 .vtp_csi_kitty_set:
-    ; \e[=Nu — set flags absolutely.
-    mov rax, [vt_param_count]
-    test rax, rax
-    jz .vtp_csi_kitty_default_set
-    mov rax, [vt_params]
-    jmp .vtp_csi_kitty_set_store
-.vtp_csi_kitty_default_set:
+    ; CSI = flags ; mode u: mode 1 set (default), 2 or in, 3 clear
     xor eax, eax
-.vtp_csi_kitty_set_store:
-    mov [kitty_kbd_flags], rax
+    mov edx, 1
+    cmp qword [vt_param_count], 0
+    je .vtp_csi_kitty_set_go
+    mov eax, [vt_params]
+    cmp qword [vt_param_count], 2
+    jb .vtp_csi_kitty_set_go
+    cmp dword [vt_params + 4], 0
+    je .vtp_csi_kitty_set_go
+    mov edx, [vt_params + 4]
+.vtp_csi_kitty_set_go:
+    call kbd_set
     jmp .vtp_loop
 .vtp_csi_dispatch_open:
     cmp al, 'A'
@@ -9973,6 +10348,8 @@ vt_process:
     mov byte [cur_fg_default], 1
     mov byte [cur_bg_default], 1
     mov qword [alt_screen_active], 1
+    mov rax, [kbd_flags_alt]             ; the alt screen's own key flags
+    call kbd_apply
     mov qword [all_dirty], 1               ; force full redraw post-clear
     jmp .vtp_loop
 
@@ -10029,6 +10406,8 @@ vt_process:
     mov rax, [alt_saved_cursor_col]
     mov [cursor_saved_col], rax
     mov qword [alt_screen_active], 0
+    mov rax, [kbd_flags_main]            ; back to the main screen's key flags
+    call kbd_apply
     ; Reset scroll region, modes, and attributes
     mov qword [scroll_top], 0
     mov qword [scroll_bottom], 0
@@ -10347,7 +10726,10 @@ vt_process:
 ; place. Ignore both private variants here.
 .vtp_csi_restore_cursor:
     cmp byte [vt_private], '?'
-    je .vtp_loop
+    jne .vtp_csi_rc_not_query
+    call kbd_query_reply             ; CSI ? u → CSI ? flags u
+    jmp .vtp_loop
+.vtp_csi_rc_not_query:
     cmp byte [vt_private], '>'
     je .vtp_loop
     mov byte [pending_wrap], 0
