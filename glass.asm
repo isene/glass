@@ -286,6 +286,10 @@ apc_str_enoent: db "ENOENT:file not found"
 apc_str_enoent_len equ $ - apc_str_enoent
 apc_str_einval: db "EINVAL:bad size"
 apc_str_einval_len equ $ - apc_str_einval
+da1_str:        db 27, "[?62;22c"       ; VT220 with ANSI colour
+da1_str_len     equ $ - da1_str
+da2_str:        db 27, "[>1;10;0c"      ; VT220 class, version 10
+da2_str_len     equ $ - da2_str
 ; _GLASS_ID= identifies glass specifically so apps that want to test
 ; for glass (vs. real kitty) can branch. Not yet used by any known
 ; client, but cheap to advertise.
@@ -7867,6 +7871,20 @@ kbd_query_reply:
     syscall
     ret
 
+; Device attributes answers, to the shell side.
+da1_reply:
+    lea rsi, [da1_str]
+    mov edx, da1_str_len
+    jmp da_write
+da2_reply:
+    lea rsi, [da2_str]
+    mov edx, da2_str_len
+da_write:
+    mov rax, SYS_WRITE
+    mov rdi, [pty_master]
+    syscall
+    ret
+
 ; Functional keys the release and repeat encoder reports: keysym, code,
 ; final byte. A final of 'u' is "CSI code;mods:type u", '~' is
 ; "CSI code;mods:type ~", a letter is "CSI 1;mods:type L". Enter, Tab and
@@ -10027,6 +10045,14 @@ vt_process:
     jz .vtp_csi_dispatch_open
     cmp ecx, '?'
     je .vtp_csi_dispatch_open
+    ; CSI > c: secondary device attributes (v0.3.70)
+    cmp al, 'c'
+    jne .vtp_csi_not_da2
+    cmp ecx, '>'
+    jne .vtp_loop
+    call da2_reply
+    jmp .vtp_loop
+.vtp_csi_not_da2:
     ; Allow >/<= ONLY for the 'u' final (kitty keyboard).
     cmp al, 'u'
     jne .vtp_loop
@@ -10074,6 +10100,8 @@ vt_process:
     call kbd_set
     jmp .vtp_loop
 .vtp_csi_dispatch_open:
+    cmp al, 'c'
+    je .vtp_csi_da1
     cmp al, 'A'
     je .vtp_csi_cuu
     cmp al, 'B'
@@ -10724,6 +10752,15 @@ vt_process:
 ; alt-screen-entry that's (0,0)) and the user sees a ghost cursor
 ; block at top-left while their typed text still goes to the right
 ; place. Ignore both private variants here.
+.vtp_csi_da1:
+    ; CSI c / CSI 0 c: primary device attributes. CSI ? c is not a
+    ; query and is dropped. vim, helix and crossterm's keyboard check
+    ; wait for this answer; without it a Rust TUI hung at start.
+    cmp byte [vt_private], '?'
+    je .vtp_loop
+    call da1_reply
+    jmp .vtp_loop
+
 .vtp_csi_restore_cursor:
     cmp byte [vt_private], '?'
     jne .vtp_csi_rc_not_query
