@@ -18319,6 +18319,7 @@ apc_deferred_place_z: resd 1
 place_z:            resd 1          ; what place_add stores at slot +28
 idb_bgra:           resb 1          ; 1 = img_decode_buf already holds B,G,R,A
 apc_file_fd:        resd 1
+apc_stat_buf:       resb 144        ; fstat, for a PNG in a file
 apc_path_buf:       resb 4112       ; "/dev/shm/" + name + NUL
 apc_reply_buf:      resb 64         ; ESC _ G i=N;OK ESC \
 
@@ -19953,6 +19954,7 @@ kitty_finalize_image:
     cmp eax, 24
     je .kfi_raw_rgb
     ; Default: PNG (f=100). Read dimensions from header, fork convert.
+.kfi_png:
     mov rdi, r12
     mov rsi, r14
     call png_dimensions
@@ -20089,6 +20091,8 @@ kitty_finalize_image:
     test rax, rax
     js .kfi_no_file
     mov [apc_file_fd], eax
+    cmp dword [apc_pending_fmt], 100
+    je .kfi_file_png
     mov ebx, [apc_pending_w]
     mov r15d, [apc_pending_h]
     call kfi_pixel_count
@@ -20135,6 +20139,52 @@ kitty_finalize_image:
     call rgb_expand_bgra
     shl r14, 2
     jmp .kfi_have_rgba
+.kfi_file_png:
+    ; PNG in a file (v0.3.71): pull it into a fresh buffer and join the
+    ; inline PNG path, which reads the header and forks convert.
+    mov rax, SYS_FSTAT
+    mov edi, [apc_file_fd]
+    lea rsi, [apc_stat_buf]
+    syscall
+    test rax, rax
+    js .kfi_file_bad
+    mov rax, [apc_stat_buf + 48]     ; st_size
+    mov ecx, [apc_pending_O]
+    sub rax, rcx
+    jle .kfi_file_bad
+    cmp rax, APC_PAYLOAD_MAX
+    ja .kfi_file_bad
+    mov r14, rax                     ; bytes to read
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, r14
+    mov rdx, MMAP_PROT_RW
+    mov r10, MMAP_FLAGS_PRIV
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    cmp rax, -4096
+    ja .kfi_file_bad
+    push rax
+    mov rdi, rax
+    mov rsi, r14
+    call kfi_file_read
+    pop rdi                          ; the file buffer
+    test eax, eax
+    jz .kfi_file_png_fail
+    push rdi                         ; kfi_file_close reuses rdi
+    call kfi_file_close
+    mov rax, SYS_MUNMAP              ; drop the name scratch, adopt the file
+    mov rdi, r12
+    mov rsi, r13
+    syscall
+    pop r12
+    mov r13, r14
+    jmp .kfi_png
+.kfi_file_png_fail:
+    mov rax, SYS_MUNMAP
+    mov rsi, r14
+    syscall
 .kfi_file_bad:
     call kfi_file_close
 .kfi_bad_size:
