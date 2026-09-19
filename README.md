@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.72-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.73-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -302,7 +302,7 @@ empty value disables the binding.
 - [ ] Tab/split support (multiple PTYs)
 - [ ] Font ligatures
 - [x] Kitty keyboard protocol, flags 1 to 16: `CSI > flags u` push, `CSI < n u` pop, `CSI = flags ; mode u` set, `CSI ? u` answered, a stack per screen. Flag 2 reports every repeat and release as `CSI code ; mods : type u`, arrows and F-keys in their own forms. Flag 4 adds the shifted key and flag 16 the text. Flag 8 sends every key as an escape code, modifier keys too. X sends key releases only while flag 2 is on, so a shell sees nothing new. Flag 1 alone keeps the legacy bytes for Ctrl and Alt letters, which is what Claude Code expects.
-- [x] Image display via kitty graphics protocol (APC `ESC _G ... ESC \`): PNG, RGBA and RGB, inline base64 or a shm/file name (`t=s`, `t=f`), placements scaled into cells and scrolled with the text, `OK`/error replies unless `q`. One placement per image id, no z-order (every image draws over the text). A game can stream 640x400 frames through `/dev/shm` at 60 fps.
+- [x] Image display via kitty graphics protocol (APC `ESC _G ... ESC \`): PNG, RGBA and RGB, inline base64 or a shm/file name (`t=s`, `t=f`), placements scaled into cells and scrolled with the text, `OK`/error replies unless `q`. One placement per image id. `z<0` puts an image under the text. It is drawn before the rows, and the cells on it skip their background fill, so glyphs sit on the picture. A game can stream 640x400 frames through `/dev/shm` at 60 fps.
 - [ ] WM_CLASS for window manager integration
 
 ## The CHasm Suite
