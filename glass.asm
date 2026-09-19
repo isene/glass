@@ -17894,6 +17894,8 @@ apc_pending_t:      resb 1
 apc_pending_S:      resd 1
 apc_pending_O:      resd 1
 apc_pending_z:      resd 1
+apc_pending_c:      resw 1          ; c and r from the first chunk, for a=T
+apc_pending_r:      resw 1
 apc_deferred_place_z: resd 1
 place_z:            resd 1          ; what place_add stores at slot +28
 idb_bgra:           resb 1          ; 1 = img_decode_buf already holds B,G,R,A
@@ -19141,6 +19143,10 @@ handle_kitty_apc:
     mov [apc_pending_O], eax
     mov eax, [apc_kv_z]
     mov [apc_pending_z], eax
+    mov ax, [apc_kv_c]
+    mov [apc_pending_c], ax
+    mov ax, [apc_kv_r]
+    mov [apc_pending_r], ax
     mov qword [apc_payload_len], 0
     mov byte [apc_pending_active], 1
 .hka_append:
@@ -19750,6 +19756,12 @@ kitty_finalize_image:
     call img_find
     test rsi, rsi
     jz .kfi_unmap_decoded
+    ; c and r from the transmit decide the cell area, as with a=p.
+    ; Until v0.3.68 a=T sized it from the pixels alone, so a game frame
+    ; sat at its own size in the corner instead of filling the window.
+    movzx ecx, word [apc_pending_c]
+    test ecx, ecx
+    jnz .kfi_have_cw
     mov eax, [rsi + 4]
     movzx edx, word [char_width]
     test edx, edx
@@ -19760,6 +19772,10 @@ kitty_finalize_image:
     movzx r8d, word [char_width]
     div r8d
     mov ecx, eax                     ; cell_w
+.kfi_have_cw:
+    movzx r8d, word [apc_pending_r]
+    test r8d, r8d
+    jnz .kfi_have_ch
     mov eax, [rsi + 8]
     movzx edx, word [char_height]
     test edx, edx
@@ -19770,6 +19786,7 @@ kitty_finalize_image:
     movzx r9d, word [char_height]
     div r9d
     mov r8d, eax                     ; cell_h
+.kfi_have_ch:
     mov eax, [apc_kv_x]
     mov [place_src_x], eax
     mov eax, [apc_kv_y]
