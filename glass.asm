@@ -19398,11 +19398,24 @@ img_upload_rsi:
     mov r14, rdx                     ; height
     mov r15, r8                      ; bytes
 
-    ; Swap R and B bytes in img_decode_buf. ARGB32 picture format has
-    ; R=bit16, G=bit8, B=bit0, so on a little-endian server the bytes
-    ; in memory are [B, G, R, A]. Kitty wire format and `convert
-    ; rgba:-` both deliver [R, G, B, A], so the red and blue channels
-    ; would be swapped on screen without this pass.
+    ; One pass over img_decode_buf doing two things.
+    ;
+    ; 1. Swap R and B. ARGB32 picture format has R=bit16, G=bit8,
+    ;    B=bit0, so on a little-endian server the bytes in memory are
+    ;    [B, G, R, A]. Kitty wire format and `convert rgba:-` both
+    ;    deliver [R, G, B, A], so red and blue would be swapped.
+    ;
+    ; 2. Scale the colour bytes by alpha. XRender's over operator wants
+    ;    a premultiplied source and both our sources carry straight
+    ;    alpha, the same conversion the emoji path does through
+    ;    premul_raster_buf. Until frame 0.1.15 frame blended as if the
+    ;    source were straight, so the pair happened to agree and images
+    ;    looked right on frame while blobbing on any other X server.
+    ;    Both sides were corrected together.
+    ;
+    ; Fully clear and fully opaque pixels take one branch each and cost
+    ; nothing, which is what a game frame is made of. The f=24 expand
+    ; already wrote B,G,R,A with A=255, so it skips the loop.
     cmp byte [idb_bgra], 0
     je .iur_need_swap
     mov byte [idb_bgra], 0           ; f=24 expands straight to B,G,R,A
@@ -19420,6 +19433,27 @@ img_upload_rsi:
     mov dl, [rdi+2]
     mov [rdi], dl
     mov [rdi+2], al
+    movzx eax, byte [rdi+3]          ; alpha
+    cmp al, 0xFF
+    je .iur_swap_next                ; opaque: already premultiplied
+    test al, al
+    jz .iur_swap_clear               ; clear: the over operator adds nothing
+    movzx edx, byte [rdi+0]
+    imul edx, eax
+    shr edx, 8
+    mov [rdi+0], dl
+    movzx edx, byte [rdi+1]
+    imul edx, eax
+    shr edx, 8
+    mov [rdi+1], dl
+    movzx edx, byte [rdi+2]
+    imul edx, eax
+    shr edx, 8
+    mov [rdi+2], dl
+    jmp .iur_swap_next
+.iur_swap_clear:
+    mov dword [rdi], 0
+.iur_swap_next:
     add rdi, 4
     dec rcx
     jnz .iur_swap
