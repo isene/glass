@@ -163,6 +163,7 @@
 %define GC_FOREGROUND       0x00000004
 %define GC_BACKGROUND       0x00000008
 %define GC_FONT             0x00004000
+%define GC_GRAPHICS_EXP     0x00010000
 
 ; Terminal defaults
 %define DEFAULT_COLS    80
@@ -3537,12 +3538,12 @@ x11_create_gc:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CREATE_GC
     mov byte [rdi+1], 0
-    mov word [rdi+2], 7      ; length = 4 + 3 values
+    mov word [rdi+2], 8      ; length = 4 + 4 values
     mov eax, [gc_id]
     mov [rdi+4], eax         ; cid
     mov eax, [win_id]
     mov [rdi+8], eax         ; drawable
-    mov dword [rdi+12], GC_FOREGROUND | GC_BACKGROUND | GC_FONT
+    mov dword [rdi+12], GC_FOREGROUND | GC_GRAPHICS_EXP | GC_BACKGROUND | GC_FONT | GC_GRAPHICS_EXP
     ; GC foreground: use cfg_fg_pixel or white
     cmp byte [cfg_fg_set], 1
     jne .xgc_def_fg
@@ -3566,9 +3567,13 @@ x11_create_gc:
     mov eax, [font_id]
     mov [rdi+24], eax        ; font
     mov [gc_current_font], eax
+    ; graphics-exposures OFF. The X default is on, which makes the server
+    ; answer every CopyArea with a NoExposure event. glass never reads those
+    ; and scrolls by CopyArea, so the default is pure wire traffic per scroll.
+    mov dword [rdi+28], 0    ; graphics-exposures = False
 
     lea rsi, [tmp_buf]
-    mov rdx, 28
+    mov rdx, 32
     call x11_buffer
     inc dword [x11_seq]
 
@@ -3579,7 +3584,7 @@ x11_create_gc:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CREATE_GC
     mov byte [rdi+1], 0
-    mov word [rdi+2], 5      ; length = 4 + 1 value
+    mov word [rdi+2], 6      ; length = 4 + 2 values
     mov eax, [gc_bg_id]
     mov [rdi+4], eax
     mov eax, [win_id]
@@ -3594,9 +3599,10 @@ x11_create_gc:
     mov eax, [x11_black_pixel]
 .xgcbg_set:
     mov [rdi+16], eax
+    mov dword [rdi+20], 0    ; graphics-exposures = False
 
     lea rsi, [tmp_buf]
-    mov rdx, 20
+    mov rdx, 24
     call x11_buffer
     inc dword [x11_seq]
 
