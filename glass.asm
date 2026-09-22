@@ -939,6 +939,7 @@ url_list:           resb 768        ; 32 URLs, each 24 bytes
 url_count:          resq 1
 url_strings:        resb 8192       ; extracted URL text
 url_str_pos:        resq 1
+su_row_delta:       resq 1          ; view row base minus live row base
 
 ; Hover state. Tracks which url_list[] entry the mouse pointer is
 ; currently over; -1 = none. Drives both the hover-underline render
@@ -15224,6 +15225,7 @@ rs_row_loop:
     imul rax, MAX_COLS
     add rax, r13
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx eax, byte [grid + rax + 5]
     cmp eax, ecx
     jne .rs_link_draw
@@ -17619,6 +17621,23 @@ scan_urls:
 .su_row_loop:
     cmp r12, [grid_rows]
     jge .su_o8_init                    ; http walk done → continue to OSC 8 sweep
+    ; Follow the VIEW, not the live grid. When the terminal is scrolled the
+    ; visible rows come from the scrollback, while hover_update passes VIEW
+    ; coordinates to url_at_cell. Reading the live grid here meant a URL you
+    ; had scrolled to was never found: no underline, no click, until you
+    ; scrolled back to the bottom. OSC 8 links kept working the whole time,
+    ; because that path already reads the view (cell_ptr_at_view).
+    ;
+    ; Every read below computes the LIVE offset; this delta turns it into the
+    ; view one, so the ten read sites each need a single added line.
+    mov rdi, r12
+    call row_src_ptr                   ; rax = first cell of this view row
+    mov rcx, r12
+    imul rcx, MAX_COLS * CELL_SIZE
+    lea rdx, [grid]
+    add rcx, rdx                       ; where the live row would sit
+    sub rax, rcx
+    mov [su_row_delta], rax
     xor r13d, r13d             ; current col
 
 .su_col_loop:
@@ -17630,6 +17649,7 @@ scan_urls:
     imul rax, MAX_COLS
     add rax, r13
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, 'h'
     jne .su_next_col
@@ -17646,6 +17666,7 @@ scan_urls:
     add rax, r13
     inc rax
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, 't'
     jne .su_next_col
@@ -17656,6 +17677,7 @@ scan_urls:
     add rax, r13
     add rax, 2
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, 't'
     jne .su_next_col
@@ -17666,6 +17688,7 @@ scan_urls:
     add rax, r13
     add rax, 3
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, 'p'
     jne .su_next_col
@@ -17681,6 +17704,7 @@ scan_urls:
     imul rax, MAX_COLS
     add rax, r14
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, 's'
     jne .su_check_colon
@@ -17696,6 +17720,7 @@ scan_urls:
     imul rax, MAX_COLS
     add rax, r14
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, ':'
     jne .su_next_col
@@ -17705,6 +17730,7 @@ scan_urls:
     add rax, r14
     inc rax
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, '/'
     jne .su_next_col
@@ -17714,6 +17740,7 @@ scan_urls:
     add rax, r14
     add rax, 2
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     cmp dl, '/'
     jne .su_next_col
@@ -17729,6 +17756,7 @@ scan_urls:
     imul rax, MAX_COLS
     add rax, r15
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     ; Stop at whitespace or certain delimiters
     cmp dl, ' '
@@ -17770,6 +17798,7 @@ scan_urls:
     imul rax, MAX_COLS
     add rax, rcx
     imul rax, CELL_SIZE
+    add rax, [su_row_delta]
     movzx edx, word [grid + rax]
     pop rcx
     cmp dl, 0x7F
@@ -17828,6 +17857,17 @@ scan_urls:
 .su_o8_row:
     cmp r12, [grid_rows]
     jge .su_done
+    ; Same view correction as the http walk above: the OSC 8 runs this
+    ; builds are indexed by VIEW row, so the cells must be read from the
+    ; view too.
+    mov rdi, r12
+    call row_src_ptr
+    mov rcx, r12
+    imul rcx, MAX_COLS * CELL_SIZE
+    lea rdx, [grid]
+    add rcx, rdx
+    sub rax, rcx
+    mov [su_row_delta], rax
     xor r13d, r13d                          ; col
     xor r14d, r14d                        ; current run's link id (0 = no run)
     xor r15d, r15d                          ; current run's start col
