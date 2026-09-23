@@ -116,6 +116,8 @@
 
 ; Kitty graphics protocol
 %define APC_BODY_MAX        16384            ; one APC body cap (glow chunks ~4K)
+%define OSC_BUF_MAX         22016            ; OSC payload: "c;" + 21844 base64 + NUL
+%define OSC52_B64_MAX       21844            ; base64 that decodes to <= 16383 bytes
 %define APC_PAYLOAD_MAX     16777216         ; 16MB accumulator for base64 chunks
 %define IMG_SLOTS           256
 %define IMG_SLOT_SIZE       32
@@ -1262,9 +1264,9 @@ render_pending:     resb 1
 child_forked:       resq 1          ; 1 if child has been forked
 
 ; OSC title
-osc_buf:            resb 4096        ; OSC payload buffer; sized to fit
-                                    ; long OSC 8 hyperlink URIs (mail-merge
-                                    ; tracking URLs commonly exceed 256 b).
+osc_buf:            resb OSC_BUF_MAX ; OSC payload buffer; sized so an
+                                    ; OSC 52 copy can fill all of sel_buf
+                                    ; (16 KB of text is 21848 in base64).
 osc_pos:            resq 1
 osc_num:            resq 1          ; OSC number (0, 2, etc.)
 osc_collecting:     resq 1          ; 1 = collecting title text
@@ -2653,6 +2655,26 @@ x11_flush:
 ; rsi = data, rdx = length
 x11_buffer:
     push rbx
+    ; Room check: a 16 KB selection reply is bigger than the whole buffer.
+    ; Flush first if it would not fit; if it can never fit, write it
+    ; straight to the socket.
+    mov rbx, [x11_write_pos]
+    add rbx, rdx
+    cmp rbx, 16384
+    jbe .xb_fits
+    push rsi
+    push rdx
+    call x11_flush
+    pop rdx
+    pop rsi
+    cmp rdx, 16384
+    jbe .xb_fits
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    pop rbx
+    ret
+.xb_fits:
     mov rbx, [x11_write_pos]
     lea rdi, [x11_write_buf + rbx]
     xor ecx, ecx
@@ -9869,8 +9891,8 @@ vt_process:
     cmp qword [osc_collecting], 1
     jne .vtp_loop
     mov rcx, [osc_pos]
-    cmp rcx, 4094
-    jge .vtp_loop            ; buffer full (osc_buf is 4096; reserve 1 for null)
+    cmp rcx, OSC_BUF_MAX - 2
+    jge .vtp_loop            ; buffer full (reserve 1 for null)
     mov [osc_buf + rcx], al
     inc rcx
     mov [osc_pos], rcx
@@ -9910,7 +9932,11 @@ vt_process:
     jz .vtp_loop                  ; empty: ignore (clear semantics not implemented)
     cmp byte [osc_buf + rcx], '?'
     je .vtp_loop                  ; query: we don't reply
-    ; Decode straight into sel_buf.
+    ; Decode straight into sel_buf, never more than it holds.
+    cmp rdx, OSC52_B64_MAX
+    jbe .vtp_osc52_b64_ok
+    mov edx, OSC52_B64_MAX
+.vtp_osc52_b64_ok:
     lea rdi, [osc_buf + rcx]
     lea rsi, [sel_buf]
     mov rcx, rdx
@@ -10025,6 +10051,10 @@ vt_process:
     mov rcx, [osc_pos]
     test rcx, rcx
     jz .vtp_loop             ; empty title, skip
+    cmp rcx, 1024            ; a title longer than this is noise
+    jbe .vtp_osc_title_len_ok
+    mov ecx, 1024
+.vtp_osc_title_len_ok:
     push r14
     push r13
     push r12
