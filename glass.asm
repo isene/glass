@@ -2254,7 +2254,12 @@ x11_get_keymap:
     ; Flush and read reply
     call x11_flush
 
-    ; Read reply header (32 bytes minimum)
+    ; Read reply header (32 bytes minimum). An event can arrive first:
+    ; frame v0.1.22 and older sent root PropertyNotify to every client,
+    ; and one read as this reply made keysyms_per_kc 0, so the parse
+    ; loop below stepped by 0 and spun forever. Skip events; stop on
+    ; an error.
+.xgk_hdr:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [x11_buf]
@@ -2262,9 +2267,17 @@ x11_get_keymap:
     syscall
     cmp rax, 32
     jl .xgk_done
+    cmp byte [x11_buf], 1
+    je .xgk_have_reply
+    cmp byte [x11_buf], 0
+    je .xgk_done                     ; X error
+    jmp .xgk_hdr                     ; an event: not ours, skip it
+.xgk_have_reply:
 
     ; Reply byte 1 = keysyms_per_keycode
     movzx eax, byte [x11_buf + 1]
+    test eax, eax
+    jz .xgk_done
     mov [keysyms_per_kc], eax
     mov ebx, eax                     ; keysyms_per_kc
 
@@ -2360,7 +2373,7 @@ alloc_xid:
 log_open_glass:
     mov rax, SYS_OPEN
     lea rdi, [log_path_glass]
-    mov rsi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov rsi, 0x80441                     ; O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
     mov rdx, 0o644
     syscall
     test rax, rax
@@ -2427,7 +2440,7 @@ apc_log_open:
     je .alo_done
     mov rax, SYS_OPEN
     mov rdi, r12
-    mov esi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov esi, 0x80441                     ; O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
     mov edx, 0o644
     syscall
     test rax, rax
@@ -18196,6 +18209,47 @@ cell_ptr_at_view:
 ; Both lookups now route the cell read through cell_ptr_at_view so
 ; OSC 8 hyperlinks remain clickable even after the source row has
 ; scrolled into the scrollback buffer.
+; xdg_open_detached — rdi = URL (NUL-terminated). Runs xdg-open without
+; leaving a zombie: the child forks again and exits at once, so xdg-open
+; is adopted by init, and glass reaps only that short-lived child. Each
+; link click used to leave an <defunct> xdg-open for the life of the glass.
+xdg_open_detached:
+    push rbx
+    mov rbx, rdi
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .xod_ret                      ; fork failed
+    jnz .xod_reap                    ; parent
+    mov rax, SYS_FORK                ; child: fork the real opener
+    syscall
+    test rax, rax
+    jnz .xod_child_exit
+    sub rsp, 32                      ; grandchild: exec xdg-open url
+    lea rax, [xdg_open]
+    mov [rsp], rax
+    mov [rsp + 8], rbx
+    mov qword [rsp + 16], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [xdg_open]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+.xod_child_exit:
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.xod_reap:
+    mov rdi, rax                     ; wait for that child only
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    mov rax, SYS_WAIT4
+    syscall
+.xod_ret:
+    pop rbx
+    ret
+
 url_open_at:
     push rbx
     push r12
@@ -18215,24 +18269,9 @@ url_open_at:
     ; Look up URI offset (must survive the upcoming syscall, so park it
     ; in r13 — we no longer need the col after this point).
     mov r13d, [osc8_uri_offsets + rax*4]
-    mov rax, SYS_FORK
-    syscall
-    test rax, rax
-    jnz .uoa_opened          ; parent: success path
-    sub rsp, 32
-    lea rax, [xdg_open]
-    mov [rsp], rax
-    lea rax, [osc8_uris + r13]
-    mov [rsp+8], rax
-    mov qword [rsp+16], 0
-    mov rax, SYS_EXECVE
-    lea rdi, [xdg_open]
-    mov rsi, rsp
-    mov rdx, [envp]
-    syscall
-    mov rdi, 1
-    mov rax, SYS_EXIT
-    syscall
+    lea rdi, [osc8_uris + r13]
+    call xdg_open_detached
+    jmp .uoa_opened
 .uoa_no_osc8:
 
     xor ebx, ebx             ; url index
@@ -18258,29 +18297,9 @@ url_open_at:
 
     ; Match! Fork and exec xdg-open with the URL
     mov r12d, [url_list + rax + 8]   ; str_offset
-    mov r13d, [url_list + rax + 12]  ; str_len (for reference)
-
-    mov rax, SYS_FORK
-    syscall
-    test rax, rax
-    jnz .uoa_opened          ; parent: success
-    ; Child process
-    ; Build argv: ["/usr/bin/xdg-open", url_string, NULL]
-    sub rsp, 32
-    lea rax, [xdg_open]
-    mov [rsp], rax
-    lea rax, [url_strings + r12]
-    mov [rsp+8], rax
-    mov qword [rsp+16], 0
-    mov rax, SYS_EXECVE
-    lea rdi, [xdg_open]
-    mov rsi, rsp
-    mov rdx, [envp]
-    syscall
-    ; If exec fails, exit child
-    mov rdi, 1
-    mov rax, SYS_EXIT
-    syscall
+    lea rdi, [url_strings + r12]
+    call xdg_open_detached
+    jmp .uoa_opened
 
 .uoa_next:
     inc rbx
