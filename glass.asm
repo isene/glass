@@ -3634,6 +3634,16 @@ x11_create_gc:
 .xgcbg_def:
     mov eax, [x11_black_pixel]
 .xgcbg_set:
+    ; In ARGB mode the bg-fill pixel needs the configured alpha, or a
+    ; fill (e.g. clearing a shrunk window) paints alpha 0 = fully
+    ; transparent, showing whatever is behind glass. Issue #4.
+    cmp dword [x11_argb_colormap], 0
+    je .xgcbg_no_alpha
+    and eax, 0x00FFFFFF
+    movzx ecx, byte [cfg_opacity]
+    shl ecx, 24
+    or eax, ecx
+.xgcbg_no_alpha:
     mov [rdi+16], eax
     mov dword [rdi+20], 0    ; graphics-exposures = False
 
@@ -12696,12 +12706,18 @@ selection_extract:
 .se_row_grid_shifted:
     mov rax, r12
     sub rax, [scroll_offset]
+    js .se_done                  ; guard: row must be in [0, MAX_ROWS)
+    cmp rax, MAX_ROWS
+    jge .se_done
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
     lea rbx, [grid + rax]
     jmp .se_row_base_done
 .se_row_live:
     mov rax, r12
+    js .se_done                  ; guard: row must be in [0, MAX_ROWS)
+    cmp rax, MAX_ROWS
+    jge .se_done
     imul rax, MAX_COLS
     imul rax, CELL_SIZE
     lea rbx, [grid + rax]
