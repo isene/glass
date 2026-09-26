@@ -889,6 +889,7 @@ char_height:        resw 1
 keysym_map:         resd 2048       ; 256 keycodes × 8 keysyms each
 keysyms_per_kc:     resd 1
 hkp_unshifted_ksym: resd 1          ; saved unshifted keysym for special checks
+hkp_probe:          resb 1          ; 1 = shortcuts only; 2 = no shortcut matched
 
 ; Scrollback
 scroll_buf:         resb MAX_COLS * 1000 * CELL_SIZE  ; 1000 lines
@@ -6675,8 +6676,7 @@ handle_x11_events:
 .hxe_key_first:
     ; Flag 8: every key as an escape code. Flags 4 or 16 with ctrl, alt
     ; or super held: the CSI u form with the extra fields. Flag 1 alone
-    ; keeps the legacy bytes for those (Claude Code pushes only flag 1
-    ; and reads Ctrl+C as 0x03).
+    ; keeps the legacy bytes for those (Ctrl+C stays 0x03).
     test byte [kitty_kbd_flags], 8
     jnz .hxe_key_press_code
     test byte [kitty_kbd_flags], 4 | 16
@@ -6684,6 +6684,24 @@ handle_x11_events:
     test ecx, 4 | 8 | 64
     jz .hxe_key_press_plain
 .hxe_key_press_code:
+    ; glass's own shortcuts win over the app's keyboard mode, as in
+    ; kitty. Claude Code pushes flags 5, which sent Alt+b and every other
+    ; glass Alt key to the app instead. handle_keypress in probe mode
+    ; runs a matching shortcut, or returns at once with hkp_probe = 2.
+    test ecx, 1 | 4 | 8                  ; shortcuts all use Shift/Ctrl/Alt
+    jz .hxe_key_code_go
+    mov byte [hkp_probe], 1
+    push rbx
+    push r12
+    call handle_keypress
+    pop r12
+    pop rbx
+    cmp byte [hkp_probe], 2
+    mov byte [hkp_probe], 0              ; (mov leaves the flags alone)
+    jne .hxe_key_done                    ; a shortcut ran
+    movzx eax, byte [x11_buf + rbx + 1]
+    movzx ecx, word [x11_buf + rbx + 28]
+.hxe_key_code_go:
     mov edx, 1
 .hxe_key_encode:
     push rbx
@@ -8366,6 +8384,11 @@ handle_keypress:
     inc ecx
     jmp .hkp_kbd_loop
 .hkp_no_alt:
+    cmp byte [hkp_probe], 0
+    je .hkp_not_probe
+    mov byte [hkp_probe], 2               ; not a shortcut: the caller
+    jmp .hkp_done                         ; sends it as a kitty code
+.hkp_not_probe:
 
     ; Dead-key composition. Two cases:
     ;   1. The current keysym IS a dead key (0xFE50..0xFE7F): stash it
