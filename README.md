@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.80-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.81-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -79,12 +79,14 @@ palette = tokyonight
 color1 = #e06c75
 font_path = /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
 font_path_fallback = /usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf
+font_path_fallback2 = /usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf
 ```
 
 `font_path_fallback` names a second face to try for any glyph the main
 font has no outline for, which is how CJK, Cyrillic or box-drawing text
-renders when the main font stops at Latin. Leave it out and nothing
-changes.
+renders when the main font stops at Latin. `font_path_fallback2` is
+tried after it, for symbols the CJK face lacks, like ⋮. A fallback
+glyph is centred in one cell. Leave both out and nothing changes.
 
 The default 16-color palette matches kitty's defaults so most modern
 TUIs (claude-code, lazygit, lazydocker, helix, etc.) render the way
