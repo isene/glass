@@ -1294,12 +1294,15 @@ cfg_font_path_emoji:            resb 512
 cfg_font_path_emoji_set:        resq 1
 cfg_font_path_fallback:         resb 512
 cfg_font_path_fallback_set:     resq 1
+cfg_font_path_fallback2:        resb 512   ; tried after the first (symbols
+cfg_font_path_fallback2_set:    resq 1     ; a CJK face lacks, like ⋮)
 
 ; 5-slot per-style font snapshot pool. Slots 0-3 are the outline
 ; styles; slot 4 is the color-bitmap emoji font (Noto Color Emoji)
 ; used by the CBDT path. Outline slot index = (italic ? 1 : 0) |
 ; (bold ? 2 : 0):
-;   0 = regular, 1 = italic, 2 = bold, 3 = bold-italic, 4 = emoji.
+;   0 = regular, 1 = italic, 2 = bold, 3 = bold-italic, 4 = emoji,
+;   5 and 6 = the two lazy fallbacks (font_path_fallback, _fallback2).
 ; ttf_font_slot_loaded[idx] = 1 if that slot was successfully loaded
 ; via glyph_load_font + glyph_save_pf_state at startup; 0 falls back.
 ; Slot size must be ≥ glyph's GLYPH_PF_STATE_SIZE (currently 520 bytes
@@ -1308,9 +1311,10 @@ cfg_font_path_fallback_set:     resq 1
 %define TTF_FONT_SLOT_SIZE 768
 %define TTF_FONT_SLOT_EMOJI 4
 %define TTF_FONT_SLOT_FALLBACK 5
-ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 6
-ttf_font_slot_loaded:   resb 6
-ttf_fallback_tried:     resb 1          ; 1 once we've attempted the open
+%define TTF_FONT_SLOT_FALLBACK2 6
+ttf_font_slot_buf:      resb TTF_FONT_SLOT_SIZE * 7
+ttf_font_slot_loaded:   resb 7
+ttf_fallback_tried:     resb 2          ; per fallback: 1 once we've attempted the open
 ttf_font_active_slot:   resq 1          ; index of the currently-restored slot
 cfg_ttf_weight:     resq 1          ; variation weight (0 = font's fvar default)
 ttf_active:         resq 1          ; 1 once glyph_load_font succeeds
@@ -16952,9 +16956,16 @@ load_config:
 .lc_fp_fallback_check:
     cmp dword [rsi+14], 'back'
     jne .lc_skip_line
+    cmp byte [rsi+18], '2'
+    je .lc_fp_fallback2
     add rsi, 18
     lea rdi, [cfg_font_path_fallback]
     lea r8, [cfg_font_path_fallback_set]
+    jmp .lc_fp_copy_value
+.lc_fp_fallback2:
+    add rsi, 19
+    lea rdi, [cfg_font_path_fallback2]
+    lea r8, [cfg_font_path_fallback2_set]
     jmp .lc_fp_copy_value
 .lc_fp_italic_check:
     cmp word [rsi+14], 'ic'
@@ -21695,26 +21706,36 @@ ttf_autodetect_emoji_path:
 ; opens the file. One failed attempt is remembered so a bad path costs
 ; a single open, not one per missing glyph.
 ; ---------------------------------------------------------------------
-ttf_fallback_ensure_loaded:
-    cmp byte [ttf_font_slot_loaded + TTF_FONT_SLOT_FALLBACK], 0
+ttf_fallback_ensure_loaded:                 ; edi = TTF_FONT_SLOT_FALLBACK or _FALLBACK2
+    cmp byte [ttf_font_slot_loaded + rdi], 0
     jne .tfel_yes
-    cmp byte [ttf_fallback_tried], 0
+    cmp byte [ttf_fallback_tried + rdi - TTF_FONT_SLOT_FALLBACK], 0
     jne .tfel_no
-    mov byte [ttf_fallback_tried], 1
-    cmp qword [cfg_font_path_fallback_set], 0
-    je .tfel_no
+    mov byte [ttf_fallback_tried + rdi - TTF_FONT_SLOT_FALLBACK], 1
+    lea rsi, [cfg_font_path_fallback]
+    mov rax, [cfg_font_path_fallback_set]
+    cmp edi, TTF_FONT_SLOT_FALLBACK
+    je .tfel_have_path
+    lea rsi, [cfg_font_path_fallback2]
+    mov rax, [cfg_font_path_fallback2_set]
+.tfel_have_path:
+    test rax, rax
+    jz .tfel_no
     push rbx
     push r12
+    mov ebx, edi                          ; slot to fill
     mov r12, [ttf_font_active_slot]       ; whose state we must put back
-    lea rdi, [cfg_font_path_fallback]
+    mov rdi, rsi
     call glyph_load_font
     test rax, rax
     jnz .tfel_restore_no
     mov rdi, [cfg_ttf_weight]
     call glyph_set_weight
-    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * TTF_FONT_SLOT_FALLBACK]
+    mov rdi, rbx
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
     call glyph_save_pf_state
-    mov byte [ttf_font_slot_loaded + TTF_FONT_SLOT_FALLBACK], 1
+    mov byte [ttf_font_slot_loaded + rbx], 1
     mov ebx, 1
     jmp .tfel_restore
 .tfel_restore_no:
@@ -21746,10 +21767,26 @@ ttf_fallback_ensure_loaded:
 ; glyph either. The active slot is always put back.
 ; ---------------------------------------------------------------------
 ttf_render_with_fallback:
+    push rdi
+    mov esi, TTF_FONT_SLOT_FALLBACK
+    call ttf_render_from_slot
+    pop rdi
+    test eax, eax
+    jz .trwf_ret
+    mov esi, TTF_FONT_SLOT_FALLBACK2      ; e.g. ⋮, which Droid lacks
+    jmp ttf_render_from_slot
+.trwf_ret:
+    ret
+
+; ttf_render_from_slot — rdi = codepoint, esi = fallback slot. Same
+; contract as ttf_render_with_fallback, for one face.
+ttf_render_from_slot:
     push rbx
     push r12
     push r13
     mov r13, rdi                          ; codepoint
+    mov ebx, esi                          ; slot
+    mov edi, esi
     call ttf_fallback_ensure_loaded
     test rax, rax
     jz .trwf_fail
@@ -21763,11 +21800,13 @@ ttf_render_with_fallback:
     mov rsi, DEFAULT_FONT_SIZE
 .trwf_have_size:
     mov r12, [ttf_font_active_slot]
-    lea rdi, [ttf_font_slot_buf + TTF_FONT_SLOT_SIZE * TTF_FONT_SLOT_FALLBACK]
+    mov rdi, rbx
+    imul rdi, TTF_FONT_SLOT_SIZE
+    lea rdi, [ttf_font_slot_buf + rdi]
     push rsi
     call glyph_restore_pf_state
     pop rsi
-    mov qword [ttf_font_active_slot], TTF_FONT_SLOT_FALLBACK
+    mov [ttf_font_active_slot], rbx
     mov [twf_size], rsi
     mov rdi, r13
     call glyph_render_to_alpha
@@ -21781,7 +21820,7 @@ ttf_render_with_fallback:
     ; distinct codepoint, since the upload is cached.
     mov eax, r13d
     cmp eax, 0xFFFF
-    ja .trwf_no_rescale
+    ja .trwf_as_is
     push rcx
     push rdx
     push r8
@@ -21793,13 +21832,13 @@ ttf_render_with_fallback:
     pop r8
     pop rdx
     pop rcx
-    jnc .trwf_no_rescale
+    jnc .trwf_as_is
     test r10, r10
-    jz .trwf_no_rescale
+    jz .trwf_as_is
     movzx eax, word [char_width]
     add eax, eax                       ; want = two cells
     cmp r10, rax
-    jae .trwf_no_rescale               ; already fills them
+    jae .trwf_as_is                   ; already fills them
     push rax
     mov rax, [twf_size]
     mul qword [rsp]                    ; size * want
@@ -21811,6 +21850,12 @@ ttf_render_with_fallback:
     mov rsi, rax
     mov rdi, r13
     call glyph_render_to_alpha
+    jmp .trwf_no_rescale
+.trwf_as_is:
+    ; The first render stands. eax held the codepoint for the wide
+    ; check, and returning it read as a failure: every NARROW glyph a
+    ; fallback font drew (⋮, halfwidth kana) came out blank.
+    xor eax, eax
 .trwf_no_rescale:
     ; Hold the engine's outputs across the slot restore, which walks
     ; the same registers.
@@ -21833,6 +21878,16 @@ ttf_render_with_fallback:
     pop rax
     test eax, eax
     jnz .trwf_fail
+    ; A fallback face is not monospace: ⋮ in Symbola advances 6 px in an
+    ; 11 px cell, which pulled the next glyph into this cell. Step one
+    ; cell, and centre a narrow glyph in it the way a mono font would.
+    movzx r11d, word [char_width]
+    sub r11, r10                          ; slack = cell - font advance
+    jle .trwf_no_centre
+    shr r11, 1
+    add r8, r11                           ; bearing_x += slack / 2
+.trwf_no_centre:
+    movzx r10d, word [char_width]
     xor eax, eax
     pop r13
     pop r12
