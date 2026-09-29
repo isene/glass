@@ -468,6 +468,8 @@ bracket_paste_start: db 27, "[200~"
 bracket_paste_start_len equ 6
 bracket_paste_end:   db 27, "[201~"
 bracket_paste_end_len equ 6
+focus_in_seq:       db 27, "[I"             ; DECSET 1004 focus reports
+focus_out_seq:      db 27, "[O"
 
 ; Font size lookup table: size, dpi_size, width, name string
 ; Format: each entry = font name string (null-terminated)
@@ -971,7 +973,6 @@ hover_have_pos:       resb 1        ; 1 once the pointer has been seen
 ; "log file unavailable" (kernel never returns 0 from open with
 ; stdin still open).
 log_fd_glass:       resq 1
-dbg_trace_b:        resb 2               ; TEMP paste-race trace bytes
 
 ; Config (.glassrc)
 cfg_bg_pixel:       resd 1
@@ -1219,6 +1220,8 @@ autowrap:           resq 1          ; 1 = autowrap on (default)
 mouse_tracking:     resq 1          ; 0=off, 1=normal, 2=button, 3=any
 mouse_sgr:          resq 1          ; 1 = SGR mouse encoding
 bracketed_paste:    resq 1          ; 1 = bracketed paste mode
+focus_report:       resb 1          ; DECSET 1004: tell the program when the
+                                    ; window gains or loses focus
 ; Kitty keyboard protocol level (CSI > N u to set, CSI < u to pop, CSI = N u
 ; to push). 0 = legacy encoding; >0 = encode keys with modifiers as
 ; CSI keycode ; modifiers u. Bit 0 (level=1) is "disambiguate escape codes",
@@ -1488,6 +1491,7 @@ _start:
     mov qword [scroll_top], 0
     mov qword [scroll_bottom], 0      ; 0 = use grid_rows-1
     mov qword [bracketed_paste], 0
+    mov byte [focus_report], 0
     mov byte [cfg_osc8_underline], 1   ; standard terminal default; ~/.glassrc can disable
     mov byte [cfg_unfocused_dim], 0    ; off by default (no XRender cost when 0)
     mov qword [window_focused], 1      ; assume focused at startup until told otherwise
@@ -2748,11 +2752,6 @@ x11_drain_until_reply_at:
     jz .xdra_fail                   ; X11 error
     cmp al, 1
     je .xdra_is_reply
-    mov byte [dbg_trace_b], 0xF3     ; TEMP trace: drain_at ate an event
-    mov [dbg_trace_b + 1], al
-    lea rsi, [dbg_trace_b]
-    mov edx, 2
-    call log_write_buf
     jmp .xdra_read_hdr              ; event, drop and reuse slot
 .xdra_is_reply:
     mov eax, [x11_buf + r14 + 4]
@@ -2814,11 +2813,6 @@ x11_drain_until_reply:
     jz .xdr_fail                  ; X11 error
     cmp al, 1
     je .xdr_is_reply
-    mov byte [dbg_trace_b], 0xF5     ; TEMP trace: drain ate an event
-    mov [dbg_trace_b + 1], al
-    lea rsi, [dbg_trace_b]
-    mov edx, 2
-    call log_write_buf
     jmp .xdr_read_hdr             ; event, drop and retry
 .xdr_is_reply:
     ; Reply: drain any extra bytes (reply length in 4-byte units at +4)
@@ -6428,14 +6422,6 @@ handle_x11_events:
 
     ; Event type (first byte, strip send_event flag)
     movzx eax, byte [x11_buf + rbx]
-    mov [dbg_trace_b], al            ; TEMP trace
-    push rsi
-    push rdx
-    lea rsi, [dbg_trace_b]
-    mov edx, 1
-    call log_write_buf
-    pop rdx
-    pop rsi
     and eax, 0x7F
 
     cmp al, 0                ; error
@@ -6831,6 +6817,16 @@ handle_x11_events:
     ; buffer holds a dimmed frame from the FocusOut, and per-row
     ; dirty tracking won't otherwise know to re-render unchanged
     ; cells without the dim).
+    cmp qword [window_focused], 1            ; a real change: report it
+    je .hxe_focus_in_known
+    cmp byte [focus_report], 0
+    je .hxe_focus_in_known
+    mov eax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [focus_in_seq]
+    mov edx, 3
+    syscall
+.hxe_focus_in_known:
     mov qword [window_focused], 1
     cmp byte [cfg_unfocused_dim], 0
     je .hxe_focus_in_done
@@ -6855,6 +6851,16 @@ handle_x11_events:
 .hxe_focus_out_keys_done:
     ; FocusOut (event type 10). Mark unfocused + repaint to apply the
     ; dim overlay. Same all_dirty rationale as FocusIn.
+    cmp qword [window_focused], 0            ; a real change: report it
+    je .hxe_focus_out_known
+    cmp byte [focus_report], 0
+    je .hxe_focus_out_known
+    mov eax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [focus_out_seq]
+    mov edx, 3
+    syscall
+.hxe_focus_out_known:
     mov qword [window_focused], 0
     cmp byte [cfg_unfocused_dim], 0
     je .hxe_focus_out_done
@@ -7563,10 +7569,6 @@ handle_x11_events:
     ; property at offset 20 (CARD32)
     push rbx
     push r12
-    mov byte [dbg_trace_b], 0xF1     ; TEMP trace: sel_notify entered
-    lea rsi, [dbg_trace_b]
-    mov edx, 1
-    call log_write_buf
     mov eax, [x11_buf + rbx + 20]
     test eax, eax
     jz .hxe_sn_done                  ; property = None, paste failed
@@ -10171,6 +10173,7 @@ vt_process:
     mov qword [mouse_tracking], 0
     mov qword [mouse_sgr], 0
     mov qword [bracketed_paste], 0
+    mov byte [focus_report], 0
     ; If on alt screen, switch back to main
     cmp qword [alt_screen_active], 0
     je .vtp_full_reset_done
@@ -10517,6 +10520,8 @@ vt_process:
     je .vtp_mouse_sgr_on
     cmp eax, 2004
     je .vtp_bracketed_paste_on
+    cmp eax, 1004
+    je .vtp_focus_report_on
     cmp eax, 2026
     je .vtp_sync_on
     jmp .vtp_loop
@@ -10542,6 +10547,8 @@ vt_process:
     je .vtp_mouse_sgr_off
     cmp eax, 2004
     je .vtp_bracketed_paste_off
+    cmp eax, 1004
+    je .vtp_focus_report_off
     cmp eax, 2026
     je .vtp_sync_off
     jmp .vtp_loop
@@ -10699,6 +10706,7 @@ vt_process:
     mov qword [mouse_tracking], 0
     mov qword [mouse_sgr], 0
     mov qword [bracketed_paste], 0
+    mov byte [focus_report], 0
     mov byte [cur_fg_default], 1
     mov byte [cur_bg_default], 1
     mov dword [cur_fg_pixel], 0
@@ -10768,6 +10776,23 @@ vt_process:
 
 .vtp_bracketed_paste_off:
     mov qword [bracketed_paste], 0
+    jmp .vtp_loop
+
+; DECSET/DECRST 1004 — focus reports. Claude Code turns them on and keeps
+; its running-command bullet blinking while it believes it has focus; with
+; no reports it believes so forever, in every window.
+.vtp_focus_report_on:
+    mov byte [focus_report], 1
+    cmp qword [window_focused], 0            ; turned on in a window without
+    jne .vtp_loop                            ; focus: say so now
+    mov eax, SYS_WRITE
+    mov rdi, [pty_master]
+    lea rsi, [focus_out_seq]
+    mov edx, 3
+    syscall
+    jmp .vtp_loop
+.vtp_focus_report_off:
+    mov byte [focus_report], 0
     jmp .vtp_loop
 
 ; CSI A - Cursor Up

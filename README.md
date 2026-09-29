@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.81-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.82-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -177,7 +177,7 @@ for v0.4.)
 - VT100/xterm escape sequence parser
 - Alternate screen buffer (CSI ?1049h/l) for vim, less, man, htop
 - Scroll regions (DECSTBM) for vim splits
-- DECSET/DECRST modes: cursor visibility, autowrap, mouse tracking, bracketed paste
+- DECSET/DECRST modes: cursor visibility, autowrap, mouse tracking, bracketed paste, focus reports
 - Cursor shapes: block, underline, bar (CSI q)
 - Insert/delete lines and characters (CSI L/M/@/P/X)
 - SGR: bold, underline, inverse, 8/16/256, full 24-bit truecolor (no quantization)
@@ -194,6 +194,7 @@ for v0.4.)
 - Ctrl and Shift modifiers
 - Mouse reporting (SGR mode 1006) for vim, tmux
 - Bracketed paste mode (CSI ?2004h/l)
+- Focus reports (CSI ?1004h/l): ESC[I and ESC[O when the window gains or loses focus
 - Ctrl+Shift+V pastes CLIPBOARD selection
 - Shift+Insert pastes PRIMARY selection (X11 tradition)
 - Ctrl+D properly exits glass when bare exits (POLLHUP detection)
