@@ -131,6 +131,7 @@
 ; X11 event types
 %define EV_KEY_PRESS        2
 %define EV_KEY_RELEASE      3
+%define SYNC_MAX_MS         1000     ; longest a 2026 sync block holds a paint
 %define EV_EXPOSE           12
 %define EV_CONFIGURE_NOTIFY 22
 %define EV_CLIENT_MESSAGE   33
@@ -909,7 +910,12 @@ scroll_offset:      resq 1          ; current view offset (0 = live)
 ; screen) skips the corrupted cells and the user sees persistent
 ; garbage. Deferring the resize until 2026l lets CC's frame complete
 ; cleanly at OLD bounds before grid_rows/cols change.
+; The sync window also holds back painting: glass drains what the pty has
+; and paints, so a frame that arrives in pieces showed half-drawn for a
+; moment (rows blank in the middle while CC rewrote them). The paint now
+; waits for 2026l, or SYNC_MAX_MS after 2026h if the app never sends it.
 sync_active:         resb 1         ; 1 = inside DECSET 2026 sync block
+sync_since:          resq 1         ; click_now_ms at the block's 2026h
 pending_resize_set:  resb 1         ; 1 = ConfigureNotify deferred
 pending_resize_w:    resw 1         ; new window width to apply
 pending_resize_h:    resw 1         ; new window height to apply
@@ -6201,6 +6207,28 @@ event_loop:
 .ev_poll_blink_only:
     mov rcx, r8
 .ev_poll_have_deadlines:
+    ; A paint held back by a sync block must still happen at its
+    ; timeout, even if the app sends nothing more.
+    cmp byte [render_pending], 0
+    je .ev_poll_deadlines_done
+    cmp byte [sync_active], 0
+    je .ev_poll_deadlines_done
+    push rcx
+    call click_now_ms
+    pop rcx
+    mov r8, [sync_since]
+    add r8, SYNC_MAX_MS
+    sub r8, rax
+    jg .ev_poll_sync_pos
+    mov r8d, 1
+.ev_poll_sync_pos:
+    test rcx, rcx
+    jz .ev_poll_sync_only
+    cmp r8, rcx
+    jge .ev_poll_deadlines_done
+.ev_poll_sync_only:
+    mov rcx, r8
+.ev_poll_deadlines_done:
     test rcx, rcx
     jz .ev_poll_infinite
     mov rdx, rcx
@@ -6344,6 +6372,13 @@ event_loop:
     ; 60× per drag-second instead of once) and the per-keystroke flicker.
     cmp byte [render_pending], 0
     je .ev_loop
+    cmp byte [sync_active], 0                 ; the app is mid-frame: paint
+    je .ev_render_now                         ; when it ends (2026l), or once
+    call click_now_ms                         ; SYNC_MAX_MS have passed
+    sub rax, [sync_since]
+    cmp rax, SYNC_MAX_MS
+    jb .ev_loop                               ; render_pending stays set
+.ev_render_now:
     mov byte [render_pending], 0
     cmp byte [win_mapped], 0                  ; hidden workspace: the grid is
     je .ev_loop                               ; current, the pixels can wait
@@ -10555,12 +10590,15 @@ vt_process:
 
 ; DECSET/DECRST 2026 — synchronized output mode. Used by modern TUIs
 ; (Claude Code, etc.) to wrap each render frame so the terminal can
-; coalesce updates. We don't double-buffer rendering, but we DO use
-; the sync window to defer ConfigureNotify resize application until
-; the in-flight frame finishes. See sync_active comments at BSS for
-; the full rationale.
+; coalesce updates. The sync window defers painting (event loop) and
+; ConfigureNotify resize application until the in-flight frame
+; finishes. See sync_active comments at BSS for the full rationale.
 .vtp_sync_on:
+    cmp byte [sync_active], 0
+    jne .vtp_loop                            ; already in a block: keep its start
     mov byte [sync_active], 1
+    call click_now_ms
+    mov [sync_since], rax
     jmp .vtp_loop
 .vtp_sync_off:
     mov byte [sync_active], 0
