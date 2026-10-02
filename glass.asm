@@ -12770,7 +12770,7 @@ selection_extract:
     ; Compute row base pointer with the same scroll-offset mapping the
     ; renderer uses, so a selection in the scrollback view extracts the
     ; scrollback bytes — not whatever happens to live at grid[row]
-    ; right now. (Selecting "hyper /home/geir/..." in scrollback would
+    ; right now. (Selecting "hyper /home/you/..." in scrollback would
     ; otherwise pull a completely unrelated live-grid line — the bug
     ; reported when paste returned text the user never highlighted.)
     mov rax, [scroll_offset]
