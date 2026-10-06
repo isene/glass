@@ -303,7 +303,7 @@ It never touches your own display. Each case is a fault that was once
 reported, and fails on the glass from before its fix.
 
 It needs frame built beside this repo (or on your PATH), and gcc,
-libx11-dev, xdotool and xclip.
+libx11-dev, xdotool, xclip and ImageMagick.
 
 ## Roadmap
 

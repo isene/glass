@@ -9,7 +9,8 @@
 # talks to the terminal, reads pixels back with xpix, and writes "ok ..."
 # or "FAIL ..." lines to $RESULT. lib.sh has the helpers.
 #
-# Needs gcc, libx11-dev, xdotool and xclip.
+# Needs gcc, libx11-dev, xdotool, xclip and ImageMagick (glass decodes a PNG
+# with convert).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 GLASS=${GLASS:-$HERE/../glass}
