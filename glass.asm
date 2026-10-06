@@ -6389,7 +6389,30 @@ event_loop:
     ; Expose-only redraws, focus-change repaints, etc.
     cmp byte [last_frame_painted], 0
     je .ev_render_no_url_scan
+    call hover_span                           ; what this frame underlined
+    push rax
     call scan_urls
+    ; The frame above checked the hover against the URL list from BEFORE
+    ; its own grid change. Check again against the fresh list: if the link
+    ; under the pointer moved or went, paint once more. Without this its
+    ; underline stayed on the screen until something else drew (v0.3.84).
+    cmp byte [hover_have_pos], 0
+    je .ev_hover_fresh
+    cmp qword [sel_button_held], 1            ; a drag is not a hover
+    je .ev_hover_fresh
+    mov edi, [hover_last_row]
+    mov esi, [hover_last_col]
+    call hover_update
+.ev_hover_fresh:
+    call hover_span
+    pop rcx
+    cmp rax, rcx
+    je .ev_hover_same
+    mov qword [all_dirty], 1
+    jmp .ev_render_now                        ; now: the loop sleeps in poll
+.ev_hover_same:
+    cmp byte [render_pending], 0              ; an OSC 8 hover changed
+    jne .ev_render_now
 .ev_render_no_url_scan:
     call x11_flush
     jmp .ev_loop
@@ -6415,6 +6438,17 @@ event_loop:
 ; selection path and the mouse-report path of the motion handler.
 ; Clobbers caller-saved regs.
 ; ----------------------------------------------------------------------------
+; hover_span: rax = the rows and columns of the hovered URL as one qword
+; (its url_list entry: start row, start col, end row, end col), -1 if none.
+hover_span:
+    mov rax, [hover_url_idx]
+    test rax, rax
+    js .hs_done
+    imul rax, 24
+    mov rax, [url_list + rax]
+.hs_done:
+    ret
+
 hover_update:
     mov [hover_last_row], edi                 ; remembered for re-checks on render
     mov [hover_last_col], esi
@@ -15438,12 +15472,8 @@ rs_row_loop:
     ; pass triggers a full repaint when hover_url_idx changes (set
     ; by the motion handler), which clears the previous underline by
     ; repainting all rows fresh.
-    ; Also skip while the user is in scrollback (scroll_offset != 0).
-    ; The url_list rows index the LIVE grid; in scrollback view the
-    ; same rows show different cells, so painting the underline there
-    ; would just stamp an orphan blue bar over unrelated text.
-    cmp qword [scroll_offset], 0
-    jne .rs_hover_url_done
+    ; url_list rows are VIEW rows (scan_urls follows the view), so the
+    ; underline lands on the right cells in the scrollback too.
     mov r12, [hover_url_idx]
     test r12, r12
     js .rs_hover_url_done                ; -1 → not hovering

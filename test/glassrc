@@ -1,0 +1,4 @@
+# The config every case runs with. Loud colours, so a pixel check can tell
+# them apart from anything else on the screen.
+bg_cycle = #000000,#00ffff
+url_underline = #ff00ff
