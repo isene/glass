@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.83-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.84-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -294,6 +294,16 @@ key.paste       = alt+v
 Modifiers: `alt`, `ctrl`, `shift`. Keys: any single ASCII character or
 the named keys `plus`, `minus`, `underscore`, `equal`, `space`. An
 empty value disables the binding.
+
+## Tests
+
+`test/run.sh` runs every case in `test/cases/`, each in its own glass on a
+scratch [frame](https://github.com/isene/frame) that draws to plain memory.
+It never touches your own display. Each case is a fault that was once
+reported, and fails on the glass from before its fix.
+
+It needs frame built beside this repo (or on your PATH), and gcc,
+libx11-dev, xdotool and xclip.
 
 ## Roadmap
 

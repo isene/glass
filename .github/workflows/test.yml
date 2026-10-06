@@ -1,0 +1,36 @@
+name: Tests
+
+# Each case in test/cases is a fault that was once reported. They run in a
+# glass on a frame that draws to plain memory, so no screen is needed.
+
+on:
+  push:
+    paths:
+      - glass.asm
+      - test/**
+      - .github/workflows/test.yml
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: glass
+      - uses: actions/checkout@v4
+        with:
+          repository: isene/glyph
+          path: glyph
+      - uses: actions/checkout@v4
+        with:
+          repository: isene/frame
+          path: frame
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gcc libx11-dev xdotool xclip fonts-dejavu-core
+      - name: Build glass and frame
+        run: make -C glass && make -C frame
+      - name: Run the cases
+        run: glass/test/run.sh
