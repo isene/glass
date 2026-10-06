@@ -25,7 +25,7 @@ gcc -O1 -o "$T/bin/xpix" "$HERE/xpix.c" -lX11 || { echo "xpix did not build"; ex
 D=23; while [ -e /tmp/.X11-unix/X$D ]; do D=$((D + 1)); done
 "$FRAME" $D --fbtest --noinput >"$T/frame.log" 2>&1 &
 FPID=$!
-trap 'kill $FPID 2>/dev/null; rm -rf "$T"' EXIT
+trap 'kill $FPID 2>/dev/null; rm -rf "$T" /tmp/.X11-unix/X$D' EXIT
 for _ in {1..25}; do [ -S /tmp/.X11-unix/X$D ] && break; sleep 0.2; done
 
 fail=0
