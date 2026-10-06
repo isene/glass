@@ -18806,6 +18806,7 @@ setup_font_name:
 section .bss
 apc_kv_a:           resb 1          ; action: 't','p','T','d', 0=missing
 apc_kv_i:           resd 1          ; image id (decimal)
+apc_auto_id:        resd 1          ; counts the pictures sent with no id
 apc_kv_f:           resd 1          ; format (24/32/100; default 32)
 apc_kv_m:           resb 1          ; more chunks (0/1; default 0)
 apc_kv_q:           resb 1          ; quiet level
@@ -20113,6 +20114,20 @@ handle_kitty_apc:
     mov dword [apc_deferred_place_id], 0
 .hka_xmit_no_def_clear:
     mov eax, [apc_kv_i]
+    ; A picture sent with a=T and no id gets an id from glass. With id 0
+    ; it was stored and never shown; chafa sends its pictures that way
+    ; (v0.3.86). Each gets its own id, so several in a row all stay, and
+    ; the ids start at 2^31, above what programs pick. Nobody can match
+    ; an answer to such a picture, so none is sent.
+    test eax, eax
+    jnz .hka_xmit_have_id
+    cmp byte [apc_pending_place], 1
+    jne .hka_xmit_have_id
+    mov eax, [apc_auto_id]
+    inc dword [apc_auto_id]
+    or eax, 0x80000000
+    mov byte [apc_kv_q], 2
+.hka_xmit_have_id:
     mov [apc_pending_id], eax
     mov eax, [apc_kv_f]
     mov [apc_pending_fmt], eax
