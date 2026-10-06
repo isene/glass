@@ -29,7 +29,7 @@ jobs:
       - name: Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm gcc libx11-dev xdotool xclip fonts-dejavu-core
+          sudo apt-get install -y nasm gcc libx11-dev xdotool xclip imagemagick fonts-dejavu-core
       - name: Build glass and frame
         run: make -C glass && make -C frame
       - name: Run the cases
