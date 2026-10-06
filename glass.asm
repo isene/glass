@@ -13058,12 +13058,15 @@ is_word_char_al:
     ret
 
 ; cell_char_at: rdi=row, rsi=col → al = ASCII char (or '?' for non-ASCII)
+; The row is the one on screen, so scrollback while the view is scrolled
+; up. Reading the live grid there gave a double-click the wrong word ends
+; (v0.3.85).
 cell_char_at:
-    mov rax, rdi
-    imul rax, MAX_COLS
-    add rax, rsi
-    imul rax, CELL_SIZE
-    movzx eax, word [grid + rax]
+    call row_src_ptr
+    push rsi
+    imul rsi, CELL_SIZE
+    movzx eax, word [rax + rsi]
+    pop rsi
     cmp eax, 0x7F
     jbe .cca_done
     mov al, '?'
