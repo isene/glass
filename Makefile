@@ -2,7 +2,7 @@ PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 EMOJI_CACHE_DIR = $(PREFIX)/share/glass/emoji
 
-glass: glass.asm
+glass: glass.asm ../glyph/glyph.asm
 	nasm -f elf64 glass.asm -o glass.o
 	ld glass.o -o glass
 	rm -f glass.o

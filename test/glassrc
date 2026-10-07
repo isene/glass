@@ -2,3 +2,9 @@
 # them apart from anything else on the screen.
 bg_cycle = #000000,#00ffff
 url_underline = #ff00ff
+
+# The fonts most people run with. Symbola is the second fallback because it
+# has the odd characters DejaVu lacks (case 19 needs one of them). A font
+# that is not installed is skipped.
+font_path = /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+font_path_fallback2 = /usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf
