@@ -934,9 +934,9 @@ sel_button_held:    resq 1          ; 1 = mouse button is held
 last_click_time:    resq 1          ; CLOCK_MONOTONIC ms of last button press
 last_click_row:     resq 1
 last_click_col:     resq 1
-click_count:        resq 1          ; 1=single, 2=double, 3=triple
+click_count:        resq 1          ; 1=single, 2=word, 3=sentence, 4=line
 click_ts_buf:       resq 2          ; scratch for clock_gettime (sec, nsec)
-sel_mode:           resq 1          ; 0=char, 1=word, 2=line (locks drag/release)
+sel_mode:           resq 1          ; 0=char, 1=word, 2=line, 3=sentence (non-zero locks drag/release)
 sel_drag_scroll_dir: resb 1         ; 0=none, 1=above (scroll up), 2=below (scroll down)
 owns_primary:       resq 1          ; 1 when glass holds the PRIMARY selection
 owns_clipboard:     resq 1          ; 1 when glass holds the CLIPBOARD selection
@@ -7056,10 +7056,10 @@ handle_x11_events:
     jne .hxe_bp_sel_single
     cmp r12, [last_click_col]
     jne .hxe_bp_sel_single
-    ; Multi-click: bump count (cap at 3)
+    ; Multi-click: bump count (cap at 4)
     mov rdx, [click_count]
     inc rdx
-    cmp rdx, 3
+    cmp rdx, 4
     jbe .hxe_bp_sel_count_ok
     mov rdx, 1
 .hxe_bp_sel_count_ok:
@@ -7083,6 +7083,8 @@ handle_x11_events:
     cmp rdx, 2
     je .hxe_bp_sel_word
     cmp rdx, 3
+    je .hxe_bp_sel_sentence
+    cmp rdx, 4
     je .hxe_bp_sel_line
     ; Single click: clear any prior selection and redraw
     cmp qword [sel_active], 0
@@ -7097,6 +7099,17 @@ handle_x11_events:
     mov rdi, rax             ; row
     mov rsi, r12             ; col
     call find_word_at
+    call selection_extract
+    call selection_claim_primary
+    call request_render
+    jmp .hxe_bp_done2
+.hxe_bp_sel_sentence:
+    mov qword [sel_mode], 3
+    mov qword [sel_button_held], 0
+    mov qword [sel_active], 1
+    mov rdi, rax             ; row
+    mov rsi, r12             ; col
+    call select_sentence_at
     call selection_extract
     call selection_claim_primary
     call request_render
@@ -12847,6 +12860,33 @@ selection_extract:
     lea rbx, [grid + rax]
 .se_row_base_done:
 
+    ; A sentence (sel_mode 3) is copied as one line, so every row after
+    ; its first loses its indent. A row glass wrapped itself keeps its
+    ; leading spaces: they are part of the text.
+    cmp qword [sel_mode], 3
+    jne .se_col_loop
+    cmp r12, [sel_start_row]
+    je .se_col_loop
+    lea rdi, [r12 - 1]
+    call row_is_wrapped
+    test eax, eax
+    jnz .se_col_loop
+.se_skip_indent:
+    cmp r13, r14
+    jge .se_row_end
+    mov rdx, r13
+    imul rdx, CELL_SIZE
+    test byte [rbx + rdx + 4], 8           ; ATTR_IS_EMOJI: no blank
+    jnz .se_col_loop
+    movzx eax, word [rbx + rdx]
+    test eax, eax
+    jz .se_skip_one
+    cmp eax, ' '
+    jne .se_col_loop
+.se_skip_one:
+    inc r13
+    jmp .se_skip_indent
+
     ; Extract characters for this row
 .se_col_loop:
     cmp r13, r14
@@ -12962,7 +13002,8 @@ selection_extract:
     ; line: no newline, no trailing-space trim. bare emits visible
     ; padding right up to grid_cols on wrap, so the space before
     ; the wrap is part of the content.
-    movzx eax, byte [row_wrapped + r12]
+    mov rdi, r12
+    call row_is_wrapped
     test eax, eax
     jnz .se_row_next
     ; Trim trailing spaces before adding newline
@@ -12976,7 +13017,12 @@ selection_extract:
 .se_add_nl:
     cmp r15, 16380
     jge .se_done
-    mov byte [sel_buf + r15], 10
+    mov al, 10
+    cmp qword [sel_mode], 3
+    jne .se_put_nl
+    mov al, ' '                 ; a sentence comes out as one line
+.se_put_nl:
+    mov [sel_buf + r15], al
     inc r15
 
 .se_row_next:
@@ -13140,6 +13186,299 @@ select_line_at:
     dec rax
 .sla_zero:
     mov [sel_end_col], rax
+    ret
+
+; row_is_wrapped: rdi = display row → eax = 1 when glass itself wrapped
+; that row into the next one. Scrollback rows keep no such flag and
+; answer 0. Clobbers rax only.
+row_is_wrapped:
+    mov rax, rdi
+    sub rax, [scroll_offset]
+    js .riw_no
+    cmp rax, MAX_ROWS
+    jae .riw_no
+    movzx eax, byte [row_wrapped + rax]
+    ret
+.riw_no:
+    xor eax, eax
+    ret
+
+; ── Sentence selection (the third click) ────────────────────────────────
+; All of it runs once per triple-click and never from the paint or
+; input loops.
+
+; sent_cp_at: rdi=row, rsi=col → eax = the character in that cell on
+; screen. An empty cell reads as a space, an emoji cell as 0xFFFF.
+; cell_char_at turns every non-ASCII letter into '?', which would end a
+; sentence at each one. Clobbers rcx.
+sent_cp_at:
+    call row_src_ptr
+    mov rcx, rsi
+    imul rcx, CELL_SIZE
+    add rcx, rax
+    movzx eax, word [rcx]
+    test byte [rcx + 4], 8        ; ATTR_IS_EMOJI
+    jz .sca_plain
+    mov eax, 0xFFFF
+    ret
+.sca_plain:
+    test eax, eax
+    jnz .sca_done
+    mov eax, ' '
+.sca_done:
+    ret
+
+; sent_is_term: ZF=1 iff eax is . ! or ?
+sent_is_term:
+    cmp eax, '.'
+    je .sit_done
+    cmp eax, '!'
+    je .sit_done
+    cmp eax, '?'
+.sit_done:
+    ret
+
+; sent_end_at: rdi=row, rsi=col, rdx=the row's last text col → ZF=1 when
+; a sentence ends on this cell. The cell is a . ! or ?, or a closing
+; quote or bracket right behind one, and a space or the end of the row's
+; text follows it. So the dots in "glass.asm" and "v0.3.87" end nothing.
+; Clobbers rax, rcx.
+sent_end_at:
+    cmp rsi, rdx
+    jge .sea_cell
+    inc rsi
+    call sent_cp_at
+    dec rsi
+    cmp eax, ' '
+    jne .sea_ret
+.sea_cell:
+    call sent_cp_at
+    call sent_is_term
+    je .sea_ret
+    cmp eax, '"'
+    je .sea_closer
+    cmp eax, 0x27                 ; '
+    je .sea_closer
+    cmp eax, ')'
+    je .sea_closer
+    cmp eax, ']'
+    jne .sea_ret
+.sea_closer:
+    test rsi, rsi
+    jz .sea_no
+    dec rsi
+    call sent_cp_at
+    inc rsi
+    call sent_is_term
+    ret
+.sea_no:
+    or al, 1                      ; ZF=0
+.sea_ret:
+    ret
+
+; sent_row: rdi=row → rax = first text col (-1 for an empty row), rdx =
+; last text col, rcx = the col where the text starts behind a list mark
+; ("- ", "* ", "+ ", a bullet or other symbol, "12. ", "3) "). rcx = rax
+; when the row opens with no mark. Keeps rdi.
+sent_row:
+    push rbx
+    push r12
+    push r13
+    mov r12, -1                   ; first text col
+    mov r13, -1                   ; last text col
+    xor ebx, ebx
+.sr_scan:
+    cmp rbx, [grid_cols]
+    jge .sr_scanned
+    mov rsi, rbx
+    call sent_cp_at
+    cmp eax, ' '
+    je .sr_next
+    test r12, r12
+    jns .sr_last
+    mov r12, rbx
+.sr_last:
+    mov r13, rbx
+.sr_next:
+    inc rbx
+    jmp .sr_scan
+.sr_scanned:
+    mov rbx, r12                  ; rbx walks over a list mark, if any
+    test r12, r12
+    js .sr_done
+    mov rsi, rbx
+    call sent_cp_at
+    cmp eax, '-'
+    je .sr_mark
+    cmp eax, '*'
+    je .sr_mark
+    cmp eax, '+'
+    je .sr_mark
+    cmp eax, 0x2000               ; bullets, arrows, box lines, emoji
+    jae .sr_mark
+.sr_digit:
+    cmp eax, '0'
+    jb .sr_num_end
+    cmp eax, '9'
+    ja .sr_num_end
+    inc rbx
+    cmp rbx, r13
+    jge .sr_nomark
+    mov rsi, rbx
+    call sent_cp_at
+    jmp .sr_digit
+.sr_num_end:
+    cmp rbx, r12
+    je .sr_nomark                 ; no digit came first
+    cmp eax, '.'
+    je .sr_mark
+    cmp eax, ')'
+    jne .sr_nomark
+.sr_mark:
+    ; rbx = the mark's last cell. A space must follow, then text.
+    inc rbx
+    cmp rbx, r13
+    jge .sr_nomark
+    mov rsi, rbx
+    call sent_cp_at
+    cmp eax, ' '
+    jne .sr_nomark
+.sr_mark_gap:
+    inc rbx                       ; stops at r13 at the latest: it has text
+    mov rsi, rbx
+    call sent_cp_at
+    cmp eax, ' '
+    je .sr_mark_gap
+    jmp .sr_done
+.sr_nomark:
+    mov rbx, r12
+.sr_done:
+    mov rax, r12
+    mov rcx, rbx
+    mov rdx, r13
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; select_sentence_at: rdi=row, rsi=col → the selection becomes the
+; sentence under that cell. glass cannot see where a program wrapped its
+; text, so a sentence runs on over a row end that has no sentence end.
+; It stops at an empty row and at a row that opens with a list mark. An
+; empty row is selected as a line.
+select_sentence_at:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                  ; row being scanned
+    mov r13, rsi                  ; col being scanned
+    call sent_row
+    test rax, rax
+    jns .ssa_text
+    mov rdi, r12
+    call select_line_at
+    jmp .ssa_ret
+.ssa_text:
+    mov r14, rcx                  ; this row's text start
+    mov r15, rdx                  ; this row's last text col
+    cmp r13, r14                  ; a click on the indent, the list mark
+    cmovl r13, r14                ; or behind the text counts as a click
+    cmp r13, r15                  ; on the nearest text cell
+    cmovg r13, r15
+    mov rbx, r12                  ; the clicked cell, for the scan right
+    mov rbp, r13
+    push r15
+
+    ; Left: back to the cell behind the nearest sentence end.
+.ssa_left:
+    cmp r13, r14
+    jle .ssa_up
+    mov rdi, r12
+    lea rsi, [r13 - 1]
+    mov rdx, r15
+    call sent_end_at
+    je .ssa_left_done
+    dec r13
+    jmp .ssa_left
+.ssa_up:
+    ; At the row's text start. The sentence began on a row above when
+    ; this row opens with no list mark and the row above has text that
+    ; ends without a sentence end.
+    mov rdi, r12
+    call sent_row
+    cmp rax, rcx
+    jne .ssa_left_done
+    test r12, r12
+    jz .ssa_left_done
+    lea rdi, [r12 - 1]
+    call sent_row
+    test rax, rax
+    js .ssa_left_done
+    push rcx
+    mov rsi, rdx
+    call sent_end_at
+    pop rcx
+    je .ssa_left_done
+    dec r12
+    mov r14, rcx
+    mov r15, rdx
+    mov r13, rdx
+    jmp .ssa_left
+.ssa_left_done:
+    ; Step over the spaces behind the sentence before this one.
+    cmp r13, r15
+    jge .ssa_start_ok
+    mov rdi, r12
+    mov rsi, r13
+    call sent_cp_at
+    cmp eax, ' '
+    jne .ssa_start_ok
+    inc r13
+    jmp .ssa_left_done
+.ssa_start_ok:
+    mov [sel_start_row], r12
+    mov [sel_start_col], r13
+
+    ; Right: on to the first sentence end at or behind the clicked cell.
+    mov r12, rbx
+    mov r13, rbp
+    pop r15
+.ssa_right:
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, r15
+    call sent_end_at
+    je .ssa_right_done
+    cmp r13, r15
+    jge .ssa_down
+    inc r13
+    jmp .ssa_right
+.ssa_down:
+    lea rdi, [r12 + 1]
+    cmp rdi, [grid_rows]
+    jge .ssa_right_done
+    call sent_row
+    test rax, rax
+    js .ssa_right_done            ; an empty row
+    cmp rax, rcx
+    jne .ssa_right_done           ; a row that opens with a list mark
+    inc r12
+    mov r13, rax
+    mov r15, rdx
+    jmp .ssa_right
+.ssa_right_done:
+    mov [sel_end_row], r12
+    mov [sel_end_col], r13
+.ssa_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret
 
 ; selection_claim_primary: SetSelectionOwner on PRIMARY (atom 1)

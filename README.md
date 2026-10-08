@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.87-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.88-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -208,7 +208,10 @@ for v0.4.)
   block at the bottom of the historical view)
 - Text selection (click and drag, visible inverted highlight)
 - Double-click to select word (alnum + `_-./~+@:%=`)
-- Triple-click to select whole line
+- Triple-click to select the sentence: it ends at `.`, `!` or `?` before a
+  space, runs on over wrapped rows up to an empty row or a list mark, and
+  is copied as one line
+- Quadruple-click to select the whole line
 - Selection populates X11 PRIMARY for paste in other apps
 - Wrap-aware copy: visually-wrapped lines join into one logical line when selected
 - Glass responds to SelectionRequest (TARGETS, UTF8_STRING, STRING)
