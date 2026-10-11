@@ -3,6 +3,11 @@
 bg_cycle = #000000,#00ffff
 url_underline = #ff00ff
 
+# Opacity on, as in the default config: every case then runs in the kind of
+# window daily use has, one that can go see-through. Alt+t steps 100, 50.
+opacity = 100
+opacity_cycle = 100,50
+
 # The fonts most people run with. Symbola is the second fallback because it
 # has the odd characters DejaVu lacks (case 19 needs one of them). A font
 # that is not installed is skipped.

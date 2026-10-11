@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.89-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.90-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -110,10 +110,14 @@ SGR 1 (bold) then has no further effect since terminus has no
 extra-bold beyond bold.
 `cursor_blink` is the toggle interval in milliseconds (omit or set
 to `0` for a steady cursor).
-`opacity` is a 0..100 percentage (100 = opaque, default). Values
-below 100 prefer a 32-bit ARGB visual when a compositor (picom,
-compton, KWin, Mutter, etc.) is detected via `_NET_WM_CM_S0` — that
-gives true per-pixel see-through. With no compositor, glass reads
+`opacity` is a 0..100 percentage (100 = opaque, default). With an
+`opacity` line, glass takes a 32-bit ARGB window when a compositor
+(frame, picom, KWin, Mutter, etc.) is detected via `_NET_WM_CM_S0`.
+The background is see-through; text and coloured cells stay solid.
+At 100 glass tells the compositor the window is solid all over
+(`_NET_WM_OPAQUE_REGION`), so it costs no blending. Keep the
+`opacity` line if you use Alt+t: a window cannot turn into an ARGB
+window after it is made. With no compositor, glass reads
 the desktop wallpaper from `_XROOTPMAP_ID`, samples it strip by
 strip behind the window, blends each pixel with the configured
 `bg` using `opacity`, uploads the blended bitmap as the window's
@@ -281,7 +285,7 @@ serialisation each). This is a stylistic choice, not a defect.
 | Alt+minus | Step font size down to previous preset |
 | Alt+_ / Alt+0 | Reset font size to the configured default |
 | Alt+b | Cycle through `bg_cycle` colors from `~/.glassrc` |
-| Alt+t | Cycle through `opacity_cycle` percentages, or toggle 100↔50 if no cycle is set (compositor → `_NET_WM_WINDOW_OPACITY`; otherwise wallpaper-blend pseudo-transparency) |
+| Alt+t | Cycle through `opacity_cycle` percentages, or toggle 100↔50 if no cycle is set (compositor → see-through background in an ARGB window; otherwise wallpaper-blend pseudo-transparency). Under a compositor it needs an `opacity` line in `~/.glassrc` |
 | Alt+v | Paste from PRIMARY (same as Shift+Insert) |
 
 The six Alt-key shortcuts are rebindable via `~/.glassrc`:

@@ -58,6 +58,7 @@
 %define X11_MAP_WINDOW        8
 %define X11_INTERN_ATOM       16
 %define X11_CHANGE_PROPERTY   18
+%define X11_DELETE_PROPERTY   19
 %define X11_OPEN_FONT         45
 %define X11_CLOSE_FONT        46
 %define X11_QUERY_FONT        47
@@ -531,6 +532,9 @@ fallback_font_xlfd_len equ $ - fallback_font_xlfd - 1
 ; _NET_WM_WINDOW_OPACITY for Alt+t.
 opacity_atom_str: db "_NET_WM_WINDOW_OPACITY"
 opacity_atom_len equ $ - opacity_atom_str
+; Tells the compositor an ARGB window is solid all over (see opq_region_sync).
+opq_atom_str: db "_NET_WM_OPAQUE_REGION"
+opq_atom_len equ $ - opq_atom_str
 
 ; PTY paths
 ptmx_path:      db "/dev/ptmx", 0
@@ -1020,6 +1024,8 @@ opacity_atom_set:   resb 1          ; 1 once interned
 last_opacity_pct:   resb 1          ; last applied percent (0..100)
 last_opacity_init:  resb 1          ; 1 once last_opacity_pct holds a value
 opacity_prop_set:   resb 1          ; 1 if _NET_WM_WINDOW_OPACITY ever set
+opq_atom:           resd 1          ; _NET_WM_OPAQUE_REGION atom id (0 = not looked up)
+opq_last:           resd 1          ; region last sent, w | h << 16 (0 = none)
 original_font_size: resq 1          ; cfg_font_size at startup (for reset)
 
 ; Configurable keybinding table. Five slots, one per Alt-action.
@@ -1676,6 +1682,16 @@ _start:
     cmp byte [cfg_opacity_set], 1
     jne .start_no_compositor_check
     call check_compositor
+    ; An ARGB window is ahead: look up the name it uses to say "solid
+    ; all over", while no event can be in front of the reply.
+    cmp byte [compositor_active], 1
+    jne .start_no_compositor_check
+    cmp dword [x11_argb_visual], 0
+    je .start_no_compositor_check
+    lea rsi, [opq_atom_str]
+    mov edx, opq_atom_len
+    call intern_atom_now
+    mov [opq_atom], eax
 .start_no_compositor_check:
 
     ; Build dynamic font name if font_size configured
@@ -3453,7 +3469,9 @@ x11_create_window:
 .xcw_skip_rows:
 
     ; Decide whether to use the ARGB32 visual for transparency.
-    ; Conditions: opacity configured, opacity < 255, ARGB visual found,
+    ; Conditions: opacity configured (100 too: a window cannot change
+    ; its visual later, and Alt+t did nothing under a compositor in a
+    ; glass that started solid), ARGB visual found,
     ; AND a compositor is running (else alpha bits are stored but
     ; ignored on display, so we'd just look opaque). Without a
     ; compositor we leave the visual alone and let
@@ -3463,9 +3481,6 @@ x11_create_window:
     ; in x11_create_colormap.
     cmp byte [cfg_opacity_set], 1
     jne .xcw_pick_visual
-    movzx eax, byte [cfg_opacity]
-    cmp eax, 255
-    jae .xcw_pick_visual
     cmp dword [x11_argb_visual], 0
     je .xcw_pick_visual
     cmp byte [compositor_active], 1
@@ -3543,6 +3558,7 @@ x11_create_window:
     lea rsi, [tmp_buf]
     call x11_buffer
     inc dword [x11_seq]
+    call opq_region_sync
 
     pop rbx
     ret
@@ -7765,6 +7781,7 @@ apply_window_resize:
     push r12
     mov [win_width], rdi
     mov [win_height], rsi
+    call opq_region_sync
     ; Recalculate grid size
     mov rax, [win_width]
     movzx ecx, word [char_width]
@@ -14661,7 +14678,9 @@ paint_margins:
 .rs_margin_have_pix:
     cmp dword [x11_argb_colormap], 0
     je .rs_margin_no_alpha
-    or eax, 0xFF000000
+    movzx ecx, byte [cfg_opacity]         ; background: as see-through as
+    shl ecx, 24                           ; the cells beside it
+    or eax, ecx
 .rs_margin_no_alpha:
     mov [rdi+12], eax
     lea rsi, [tmp_buf]
@@ -14735,7 +14754,9 @@ paint_margins:
 .rs_margin_bot_have_pix:
     cmp dword [x11_argb_colormap], 0
     je .rs_margin_bot_no_alpha
-    or eax, 0xFF000000
+    movzx ecx, byte [cfg_opacity]
+    shl ecx, 24
+    or eax, ecx
 .rs_margin_bot_no_alpha:
     mov [rdi+12], eax
     lea rsi, [tmp_buf]
@@ -21873,6 +21894,12 @@ bg_cycle_advance:
     mov [cfg_bg_pixel], ebx
     mov byte [cfg_bg_set], 1
     mov [palette], ebx               ; default-bg cells re-route here
+    ; An ARGB window: the new colour has no alpha yet, and with none the
+    ; background went fully see-through.
+    cmp dword [x11_argb_colormap], 0
+    je .bca_no_argb
+    call argb_bg_apply
+.bca_no_argb:
 
     ; Default-bg cells store no pixel in the cell bytes — they read
     ; palette[0] at render time. Changing palette[0] doesn't dirty
@@ -21940,6 +21967,153 @@ pseudo_disable:
     pop rbx
     ret
 
+; rsi = name, edx = its length. Returns the atom in eax, 0 when the
+; server gave none. For start-up only: it reads the reply straight off
+; the socket, so no event may be on its way.
+intern_atom_now:
+    push rbx
+    mov ebx, edx
+    push rsi
+    call x11_flush
+    pop rsi
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    lea eax, [ebx + 3]
+    shr eax, 2
+    add eax, 2
+    mov [rdi+2], ax
+    mov [rdi+4], bx
+    mov word [rdi+6], 0
+    xor ecx, ecx
+.ian_cp:
+    cmp ecx, ebx
+    jge .ian_send
+    mov al, [rsi + rcx]
+    mov [rdi + 8 + rcx], al
+    inc ecx
+    jmp .ian_cp
+.ian_send:
+    lea edx, [ebx + 3]
+    and edx, ~3
+    add edx, 8
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_buf]
+    mov rdx, 32
+    syscall
+    xor ecx, ecx
+    cmp rax, 32
+    jl .ian_done
+    mov ecx, [x11_buf + 8]
+.ian_done:
+    mov eax, ecx
+    pop rbx
+    ret
+
+; An ARGB window is blended pixel by pixel by the compositor, unless it
+; says its whole area is solid (_NET_WM_OPAQUE_REGION). At 100% that
+; blend is wasted work on every repaint, so the region is set then,
+; follows each resize, and is taken away while glass is see-through.
+; Sends nothing when the region is already right.
+opq_region_sync:
+    cmp dword [x11_argb_colormap], 0
+    je .ors_ret
+    cmp dword [opq_atom], 0
+    je .ors_ret
+    xor eax, eax                          ; see-through: no region
+    cmp byte [cfg_opacity], 255
+    jne .ors_have
+    mov eax, [win_height]
+    shl eax, 16
+    mov ax, [win_width]
+.ors_have:
+    cmp eax, [opq_last]
+    je .ors_ret
+    mov [opq_last], eax
+    lea rdi, [tmp_buf]
+    mov ecx, [win_id]
+    mov [rdi+4], ecx
+    mov ecx, [opq_atom]
+    mov [rdi+8], ecx
+    test eax, eax
+    jz .ors_delete
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                   ; replace
+    mov word [rdi+2], 10
+    mov dword [rdi+12], 6                 ; CARDINAL
+    mov dword [rdi+16], 32                ; format, 3 pad bytes
+    mov dword [rdi+20], 4                 ; four values: x, y, w, h
+    mov qword [rdi+24], 0
+    movzx ecx, ax
+    mov [rdi+32], ecx
+    shr eax, 16
+    mov [rdi+36], eax
+    mov edx, 40
+    jmp .ors_send
+.ors_delete:
+    mov byte [rdi], X11_DELETE_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 3
+    mov edx, 12
+.ors_send:
+    lea rsi, [tmp_buf]
+    call x11_buffer
+    inc dword [x11_seq]
+.ors_ret:
+    ret
+
+; The see-through value or the background colour changed in an ARGB
+; window: put the pair into every place that paints the background, and
+; paint it all again.
+argb_bg_apply:
+    call palette_apply_alpha              ; default-bg cells read palette[0]
+    mov eax, [x11_black_pixel]
+    cmp byte [cfg_bg_set], 1
+    jne .aba_pix
+    mov eax, [cfg_bg_pixel]
+.aba_pix:
+    and eax, 0x00FFFFFF
+    movzx ecx, byte [cfg_opacity]
+    shl ecx, 24
+    or eax, ecx
+    push rax
+    lea rdi, [tmp_buf]                    ; the window's own background
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov ecx, [win_id]
+    mov [rdi+4], ecx
+    mov dword [rdi+8], 0x02               ; CW_BACK_PIXEL
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rax
+    lea rdi, [tmp_buf]                    ; the GC that fills with it
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov ecx, [gc_bg_id]
+    mov [rdi+4], ecx
+    mov dword [rdi+8], GC_FOREGROUND
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call opq_region_sync
+    mov qword [all_dirty], 1
+    mov byte [gc_fg_valid], 0
+    call request_render
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Opacity toggle (Alt+t)
 ; ══════════════════════════════════════════════════════════════════════
@@ -21990,6 +22164,22 @@ opacity_toggle_apply:
 .ota_first_apply:
     mov [last_opacity_pct], r12b
     mov byte [last_opacity_init], 1
+
+    ; An ARGB window carries the value in its own pixels: the background
+    ; gets it, text and coloured cells stay solid. This is the path under
+    ; a compositor. It used to set _NET_WM_WINDOW_OPACITY alone, which
+    ; frame does not read, so Alt+t did nothing there.
+    cmp dword [x11_argb_colormap], 0
+    je .ota_no_argb
+    mov eax, r12d
+    imul eax, 255
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    mov [cfg_opacity], al
+    call argb_bg_apply
+    jmp .ota_done
+.ota_no_argb:
 
     ; Skip the ChangeProperty entirely when going to 100% AND we
     ; never set the property in the first place — the compositor's
