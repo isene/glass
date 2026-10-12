@@ -13188,6 +13188,23 @@ find_word_at:
     je .fwa_right
     dec rbx                   ; back up to last word char
 .fwa_right_done:
+    ; The full stop that ends a sentence is not part of its last word
+    ; (v0.3.91). A click on a full stop itself keeps them. The clicked
+    ; cell is no full stop past this check, so the walk back ends there.
+    mov rdi, r12
+    mov rsi, r13
+    call cell_char_at
+    cmp al, '.'
+    je .fwa_right_set
+.fwa_trim:
+    mov rdi, r12
+    mov rsi, rbx
+    call cell_char_at
+    cmp al, '.'
+    jne .fwa_right_set
+    dec rbx
+    jmp .fwa_trim
+.fwa_right_set:
     mov [sel_end_col], rbx
     jmp .fwa_done
 .fwa_single:
