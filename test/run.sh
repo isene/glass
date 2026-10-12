@@ -9,14 +9,15 @@
 # talks to the terminal, reads pixels back with xpix, and writes "ok ..."
 # or "FAIL ..." lines to $RESULT. lib.sh has the helpers.
 #
-# Needs gcc, libx11-dev, xdotool, xclip and ImageMagick (glass decodes a PNG
-# with convert).
+# Needs gcc, libx11-dev, xdotool, xclip, xprop (x11-utils) and ImageMagick
+# (glass decodes a PNG with convert).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 GLASS=${GLASS:-$HERE/../glass}
 FRAME=${FRAME:-$HERE/../../frame/frame}
 [ -x "$FRAME" ] || FRAME=$(command -v frame) || { echo "no frame found: set FRAME=path"; exit 2; }
 [ -x "$GLASS" ] || { echo "no glass at $GLASS: run make"; exit 2; }
+for t in xdotool xclip xprop; do command -v $t >/dev/null || { echo "missing tool: $t"; exit 2; }; done
 
 T=$(mktemp -d); mkdir "$T/home" "$T/bin"
 cp "$HERE/glassrc" "$T/home/.glassrc"

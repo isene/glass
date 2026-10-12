@@ -18,7 +18,7 @@ is "a coloured cell stays solid" "$(screen 5 5)" "$(pix 5 5)"
 if [ $((W % (W / COLS))) -gt 0 ] && [ "$(screen $((W - 1)) 300)" = "$solid" ]; then
     bad "the strip beside the last column is see-through too: it shows $solid"
 else ok "the strip beside the last column is see-through too"; fi
-case $(region) in *"not found"*) ok "a see-through glass no longer says it is solid" ;;
+case $(region) in _NET_WM_OPAQUE_REGION:*"not found"*) ok "a see-through glass no longer says it is solid" ;;
     *) bad "a see-through glass no longer says it is solid: $(region)" ;; esac
 xdotool key alt+b; settle                 # the next colour of the test config: 00ffff
 half=$(screen 300 300); g=$((16#${half:2:2}))
