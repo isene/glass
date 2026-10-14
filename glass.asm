@@ -1018,6 +1018,8 @@ opacity_cycle_count: resq 1
 opacity_cycle_idx:  resq 1
 saved_bg_pixel:     resd 1          ; configured cfg_bg before any cycling
 saved_bg_set:      resb 1          ; 1 if saved_bg_pixel is valid
+osc_bg_saved:      resd 1          ; the background from before OSC 11
+osc_bg_on:         resb 1          ; 1 while a colour from OSC 11 is shown
 opacity_toggle:     resb 1          ; 0 = opaque (or untouched), 1 = ~50%
 opacity_atom:       resd 1          ; _NET_WM_WINDOW_OPACITY atom id
 opacity_atom_set:   resb 1          ; 1 once interned
@@ -10032,7 +10034,7 @@ vt_process:
     cmp al, ';'
     je .vtp_osc_start_text
     ; Digit: build number, capped at 65535. The largest OSC code used
-    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/52, so
+    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/11/52/111, so
     ; cap well above what any sane app emits while preventing 32-bit
     ; wrap into garbage that could match a real opcode.
     cmp al, '0'
@@ -10085,6 +10087,26 @@ vt_process:
     je .vtp_osc_8
     cmp rax, 52
     je .vtp_osc_52
+    cmp rax, 11
+    je .vtp_osc_11
+    cmp rax, 111
+    je .vtp_osc_111
+    jmp .vtp_loop
+
+.vtp_osc_11:
+    ; OSC 11 ; #rrggbb sets the background (prism shows its colour this
+    ; way). A query ("?") and the rgb: form get nothing.
+    cmp qword [osc_pos], 7
+    jb .vtp_loop
+    cmp byte [osc_buf], '#'
+    jne .vtp_loop
+    lea rsi, [osc_buf + 1]
+    call hex_to_pixel
+    call osc_bg_set
+    jmp .vtp_loop
+
+.vtp_osc_111:
+    call osc_bg_reset
     jmp .vtp_loop
 
 .vtp_osc_52:
@@ -21924,27 +21946,58 @@ bg_cycle_advance:
     xor eax, eax
 .bca_idx_ok:
     mov [bg_cycle_idx], rax
+    mov eax, [bg_cycle_pixels + rax*4]
+    call bg_apply
+.bca_done:
+    pop rbx
+    ret
 
-    ; Apply: write the new pixel into the slots that drive rendering.
-    mov ebx, [bg_cycle_pixels + rax*4]
-    mov [cfg_bg_pixel], ebx
+; eax = the new background, 0xRRGGBB. Writes it into the slots that drive
+; rendering and paints the window again.
+bg_apply:
+    mov [cfg_bg_pixel], eax
     mov byte [cfg_bg_set], 1
-    mov [palette], ebx               ; default-bg cells re-route here
+    mov [palette], eax               ; default-bg cells re-route here
     ; An ARGB window: the new colour has no alpha yet, and with none the
     ; background went fully see-through.
     cmp dword [x11_argb_colormap], 0
-    je .bca_no_argb
+    je .ba_no_argb
     call argb_bg_apply
-.bca_no_argb:
-
+.ba_no_argb:
     ; Default-bg cells store no pixel in the cell bytes — they read
     ; palette[0] at render time. Changing palette[0] doesn't dirty
     ; the grid, so the per-row diff would skip and leave the old bg
     ; on screen. Force a full repaint to push the new bg through.
     mov qword [all_dirty], 1
     call request_render
-.bca_done:
-    pop rbx
+    ret
+
+; eax = a background from OSC 11. The first one keeps the colour it
+; replaces, for OSC 111. The colour already shown costs no repaint.
+osc_bg_set:
+    cmp byte [osc_bg_on], 0
+    jne .obs_on
+    mov ecx, [cfg_bg_pixel]
+    cmp byte [cfg_bg_set], 1
+    je .obs_keep
+    xor ecx, ecx                     ; no bg in .glassrc: black
+.obs_keep:
+    mov [osc_bg_saved], ecx
+    mov byte [osc_bg_on], 1
+    jmp bg_apply
+.obs_on:
+    cmp eax, [cfg_bg_pixel]
+    jne bg_apply
+    ret
+
+; OSC 111: the background from before the first OSC 11 comes back.
+osc_bg_reset:
+    cmp byte [osc_bg_on], 0
+    je .obr_done
+    mov byte [osc_bg_on], 0
+    mov eax, [osc_bg_saved]
+    jmp bg_apply
+.obr_done:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════

@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.92-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.93-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -187,6 +187,7 @@ for v0.4.)
 - SGR: bold, underline, inverse, 8/16/256, full 24-bit truecolor (no quantization)
 - Charset designators ESC ( / ) / * / + consumed (no stray 'B' from ncurses)
 - OSC 0/2: dynamic window title
+- OSC 11/111: set the background (`#rrggbb`) and put it back
 - CSI private prefixes: ?, >, =
 - Reply-aware event parsing (variable-size replies don't misalign event stream)
 
