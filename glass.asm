@@ -8403,6 +8403,25 @@ handle_keypress:
     mov ecx, [keysym_map + rax*4]  ; ecx = unshifted keysym
     mov [hkp_unshifted_ksym], ecx
 
+    ; Caps lock (Lock, state bit 1) gives a letter's capital, and Shift
+    ; with it the small letter again (v0.3.92). Ctrl, Alt and AltGr keys
+    ; stay as they are, so Ctrl+c and Alt+t still work with caps lock on.
+    test ebx, 2
+    jz .hkp_no_caps
+    test ebx, 4 | 8 | 0x80
+    jnz .hkp_no_caps
+    lea eax, [rcx - 'a']
+    cmp eax, 26
+    jb .hkp_caps                   ; a..z
+    lea eax, [rcx - 0xE0]
+    cmp eax, 0x1F
+    jae .hkp_no_caps               ; Latin-1 letters are 0xE0..0xFE,
+    cmp ecx, 0xF7                  ; but for the division sign
+    je .hkp_no_caps
+.hkp_caps:
+    xor r13d, 1
+.hkp_no_caps:
+
     ; Check for Shift+Insert (XK_Insert = 0xFF63) on unshifted keysym
     ; Shift+Insert pastes from PRIMARY selection (X11 tradition)
     test ebx, 1                    ; Shift held?
