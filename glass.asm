@@ -1030,7 +1030,7 @@ opq_atom:           resd 1          ; _NET_WM_OPAQUE_REGION atom id (0 = not loo
 opq_last:           resd 1          ; region last sent, w | h << 16 (0 = none)
 original_font_size: resq 1          ; cfg_font_size at startup (for reset)
 
-; Configurable keybinding table. Five slots, one per Alt-action.
+; Configurable keybinding table. One slot per Alt-action.
 ; mod byte holds the required Shift|Ctrl|Alt mask (bits 0,2,3).
 ; A mod value of 0 means the binding is disabled.
 KB_FONT_INC      equ 0
@@ -1039,7 +1039,8 @@ KB_FONT_RESET    equ 2
 KB_BG_CYCLE      equ 3
 KB_OPACITY       equ 4
 KB_PASTE         equ 5
-KB_COUNT         equ 6
+KB_COPY_SCREEN   equ 6
+KB_COUNT         equ 7
 keybind_mods:    resb KB_COUNT
 keybind_keysyms: resd KB_COUNT
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
@@ -8508,6 +8509,8 @@ handle_keypress:
     je .hkp_opacity_toggle
     cmp ecx, KB_PASTE
     je .hkp_paste_primary
+    cmp ecx, KB_COPY_SCREEN
+    je .hkp_copy_screen
 .hkp_kbd_next:
     inc ecx
     jmp .hkp_kbd_loop
@@ -9078,6 +9081,42 @@ handle_keypress:
     ; Request CLIPBOARD selection via ConvertSelection
     mov ecx, [clipboard_atom]
     jmp .hkp_paste_send
+.hkp_copy_screen:
+    ; Alt+c: select every row in view (scrollback rows too, when scrolled
+    ; back) and put the text on PRIMARY and CLIPBOARD. The highlight
+    ; shows what was taken; the next typed key clears it, as after a drag.
+    mov qword [sel_mode], 0
+    mov qword [sel_button_held], 0
+    mov qword [sel_start_row], 0
+    mov qword [sel_start_col], 0
+    mov rax, [grid_rows]
+    dec rax
+    mov [sel_end_row], rax
+    mov rax, [grid_cols]
+    dec rax
+    mov [sel_end_col], rax
+    mov qword [sel_active], 1
+    call selection_extract
+    mov rcx, [sel_len]            ; drop the empty rows and spaces at the end
+.hkp_cs_trim:
+    test rcx, rcx
+    jz .hkp_cs_trimmed
+    movzx eax, byte [sel_buf + rcx - 1]
+    cmp al, ' '
+    je .hkp_cs_cut
+    cmp al, 10
+    jne .hkp_cs_trimmed
+.hkp_cs_cut:
+    dec rcx
+    jmp .hkp_cs_trim
+.hkp_cs_trimmed:
+    mov [sel_len], rcx
+    call selection_claim_primary
+    call selection_claim_clipboard
+    mov qword [all_dirty], 1
+    call request_render
+    jmp .hkp_done
+
 .hkp_paste_primary:
     ; Request PRIMARY selection
     mov ecx, [primary_atom]
@@ -18131,7 +18170,7 @@ load_config:
     ret
 
 .lc_try_keybind:
-    ; Match "key.NAME = ..." for the six Alt-action bindings.
+    ; Match "key.NAME = ..." for the Alt-action bindings.
     cmp dword [rsi], 'key.'
     jne .lc_skip_line
     add rsi, 4
@@ -18184,11 +18223,23 @@ load_config:
     jmp .lc_kb_call
 .lc_kb_try_paste:
     cmp dword [rsi], 'past'
-    jne .lc_skip_line
+    jne .lc_kb_try_copy
     cmp byte [rsi+4], 'e'
     jne .lc_skip_line
     add rsi, 5
     mov edi, KB_PASTE
+    jmp .lc_kb_call
+.lc_kb_try_copy:
+    cmp dword [rsi], 'copy'
+    jne .lc_skip_line
+    cmp dword [rsi+4], '_scr'
+    jne .lc_skip_line
+    cmp word [rsi+8], 'ee'
+    jne .lc_skip_line
+    cmp byte [rsi+10], 'n'
+    jne .lc_skip_line
+    add rsi, 11
+    mov edi, KB_COPY_SCREEN
 .lc_kb_call:
     call lc_skip_to_value
     call parse_keybinding
@@ -21580,6 +21631,9 @@ init_keybindings:
     ; the old tile-level "universal paste" grab; Alt is glass's realm)
     mov byte [keybind_mods + KB_PASTE], 8
     mov dword [keybind_keysyms + KB_PASTE*4], 0x76
+    ; copy_screen: Alt + c — every row in view to PRIMARY and CLIPBOARD
+    mov byte [keybind_mods + KB_COPY_SCREEN], 8
+    mov dword [keybind_keysyms + KB_COPY_SCREEN*4], 0x63
     ret
 
 ; ══════════════════════════════════════════════════════════════════════

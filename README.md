@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.93-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.94-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -288,8 +288,9 @@ serialisation each). This is a stylistic choice, not a defect.
 | Alt+b | Cycle through `bg_cycle` colors from `~/.glassrc` |
 | Alt+t | Cycle through `opacity_cycle` percentages, or toggle 100↔50 if no cycle is set (compositor → see-through background in an ARGB window; otherwise wallpaper-blend pseudo-transparency). Under a compositor it needs an `opacity` line in `~/.glassrc` |
 | Alt+v | Paste from PRIMARY (same as Shift+Insert) |
+| Alt+c | Copy all the text in view to CLIPBOARD and PRIMARY |
 
-The six Alt-key shortcuts are rebindable via `~/.glassrc`:
+The seven Alt-key shortcuts are rebindable via `~/.glassrc`:
 
 ```
 key.font_inc    = alt+plus
@@ -298,6 +299,7 @@ key.font_reset  = alt+underscore
 key.bg_cycle    = alt+b
 key.opacity     = alt+t
 key.paste       = alt+v
+key.copy_screen = alt+c
 ```
 
 Modifiers: `alt`, `ctrl`, `shift`. Keys: any single ASCII character or
