@@ -18500,6 +18500,28 @@ scan_urls:
     jmp .su_url_scan
 
 .su_url_found:
+    ; A comma or full stop right after a link belongs to the sentence
+    ; ("sign in at http://host:8100, then"): drop , . ; : ! ? from the
+    ; end, never into the "://".
+    lea rax, [r14 + 3]
+    cmp r15, rax
+    jle .su_trimmed
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, r15
+    dec rax
+    imul rax, CELL_SIZE
+    add rax, [su_row_delta]
+    movzx edx, word [grid + rax]
+    sub edx, 0x20
+    cmp edx, 31
+    ja .su_trimmed
+    mov eax, 0x8C005002                      ; bits for ! , . : ; ? (char - 0x20)
+    bt eax, edx
+    jnc .su_trimmed
+    dec r15
+    jmp .su_url_found
+.su_trimmed:
     ; URL spans from (r12, r13) to (r12, r15-1)
     ; Store in url_list if room
     mov rax, [url_count]
