@@ -1110,6 +1110,12 @@ row_paint_end:         resq 1
 ; survived into the row below.
 row_dirty_map:         resb MAX_ROWS
 
+; row_painted[r] = 1 when the row loop painted row r this frame. The
+; passes after the rows (link lines, hover lines, emoji, pictures) draw
+; only on these rows: every other row of the back pixmap still shows
+; last frame's result, so drawing there again is work for nothing.
+row_painted:           resb MAX_ROWS
+
 ; Selection-dirty tracking. When the selection rect changes shape
 ; (start/end row/col) or activates/deactivates, only the rows in
 ; the union of OLD ∪ NEW selection bands need a repaint to redraw
@@ -1266,6 +1272,7 @@ kbd_ev_need:        resd 1
 place_under_any:    resb 1          ; a placement with z < 0 exists (per render)
 run_under:          resb 1          ; the current text run sits over such an image
 pc_pass:            resd 1          ; place_composite: 1 = draw the z < 0 ones
+place_full:         resb 1          ; a placement is new this frame: draw them whole
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
@@ -14335,42 +14342,62 @@ place_composite:
     call x11_buffer
     inc dword [x11_seq]
 .rs_imgs_skip_xform:
-    lea rdi, [tmp_buf]
-    mov al, [render_major]
-    mov [rdi], al
-    mov byte [rdi+1], RENDER_COMPOSITE
-    mov word [rdi+2], 9
-    mov byte [rdi+4], RENDER_OP_OVER
-    mov byte [rdi+5], 0
-    mov word [rdi+6], 0
-    mov [rdi+8], r14d                ; src picture
-    mov dword [rdi+12], 0            ; mask = None
-    mov eax, [draw_picture]
-    mov [rdi+16], eax                ; dst
-    mov word [rdi+20], 0             ; src x
-    mov word [rdi+22], 0             ; src y
-    mov word [rdi+24], 0             ; mask x
-    mov word [rdi+26], 0             ; mask y
+    ; Blend the picture only on the rows painted this frame. The other
+    ; rows of the back pixmap still show it from the last frame, and
+    ; blending there again cost the server every pixel of a full-screen
+    ; picture each time a clock ticked. It goes whole when it is new
+    ; this frame, under the text (that repaints every row anyway), or
+    ; past the grid, where paint_margins wipes it.
+    cmp dword [pc_pass], 0
+    jne .pc_whole
+    cmp byte [place_full], 0
+    jne .pc_whole
     movzx eax, word [r13 + 6]        ; anchor_col
-    movzx ecx, word [char_width]
-    imul eax, ecx
-    mov word [rdi+28], ax
-    movzx eax, word [r13 + 4]        ; anchor_row
+    movzx ecx, word [r13 + 8]        ; cell_w
+    add eax, ecx
+    cmp rax, [grid_cols]
+    ja .pc_whole
+    movzx ebx, word [r13 + 4]        ; row = anchor_row
+    movzx r15d, word [r13 + 10]      ; cell_h
+    add r15d, ebx                    ; end row, exclusive
+    cmp r15, [grid_rows]
+    ja .pc_whole
+.pc_find:
+    cmp ebx, r15d
+    jge .rs_imgs_next
+    cmp byte [row_painted + rbx], 0
+    jne .pc_run
+    inc ebx
+    jmp .pc_find
+.pc_run:
+    mov ebp, ebx                     ; first row of a run of painted rows
+.pc_run_end:
+    inc ebx
+    cmp ebx, r15d
+    jge .pc_send_run
+    cmp byte [row_painted + rbx], 0
+    jne .pc_run_end
+.pc_send_run:
     movzx ecx, word [char_height]
-    imul eax, ecx
-    mov word [rdi+30], ax
-    movzx eax, word [r13 + 8]        ; cell_w
-    movzx ecx, word [char_width]
-    imul eax, ecx
-    mov word [rdi+32], ax
-    movzx eax, word [r13 + 10]       ; cell_h
+    mov esi, ebp
+    imul esi, ecx                    ; dst y
+    movzx eax, word [r13 + 4]
+    mov edi, ebp
+    sub edi, eax
+    imul edi, ecx                    ; src y: the run's offset in the picture
+    mov edx, ebx
+    sub edx, ebp
+    imul edx, ecx                    ; height
+    call place_send
+    jmp .pc_find
+.pc_whole:
+    xor edi, edi                     ; src y
+    movzx esi, word [r13 + 4]        ; anchor_row
     movzx ecx, word [char_height]
-    imul eax, ecx
-    mov word [rdi+34], ax
-    lea rsi, [tmp_buf]
-    mov rdx, 36
-    call x11_buffer
-    inc dword [x11_seq]
+    imul esi, ecx                    ; dst y
+    movzx edx, word [r13 + 10]       ; cell_h
+    imul edx, ecx                    ; height
+    call place_send
 .rs_imgs_next:
     inc r12
     jmp .rs_imgs_loop
@@ -14381,6 +14408,40 @@ place_composite:
     pop r12
     pop rbp
     pop rbx
+    ret
+
+; edi = src y, esi = dst y, edx = height, in pixels; r13 = the placement
+; slot, r14d = its picture. One Composite across the placement's width.
+place_send:
+    lea r8, [tmp_buf]
+    mov al, [render_major]
+    mov [r8], al
+    mov byte [r8+1], RENDER_COMPOSITE
+    mov word [r8+2], 9
+    mov byte [r8+4], RENDER_OP_OVER
+    mov byte [r8+5], 0
+    mov word [r8+6], 0
+    mov [r8+8], r14d                 ; src picture
+    mov dword [r8+12], 0             ; mask = None
+    mov eax, [draw_picture]
+    mov [r8+16], eax                 ; dst
+    mov word [r8+20], 0              ; src x
+    mov word [r8+22], di             ; src y
+    mov word [r8+24], 0              ; mask x
+    mov word [r8+26], 0              ; mask y
+    movzx eax, word [r13 + 6]        ; anchor_col
+    movzx ecx, word [char_width]
+    imul eax, ecx
+    mov word [r8+28], ax             ; dst x
+    mov word [r8+30], si             ; dst y
+    movzx eax, word [r13 + 8]        ; cell_w
+    imul eax, ecx
+    mov word [r8+32], ax             ; width
+    mov word [r8+34], dx             ; height
+    lea rsi, [tmp_buf]
+    mov rdx, 36
+    call x11_buffer
+    inc dword [x11_seq]
     ret
 
 render_screen:
@@ -14518,6 +14579,12 @@ render_screen:
     je .rs_bbox_no_full
     call bbox_full_window
 .rs_bbox_no_full:
+    lea rdi, [row_painted]
+    xor eax, eax
+    mov ecx, MAX_ROWS / 8
+    rep stosq
+    mov al, [place_dmg_valid]
+    mov [place_full], al
     ; Fold in any placement made since the last frame, so the image the
     ; overlay pass is about to composite actually reaches the window.
     cmp byte [place_dmg_valid], 0
@@ -15223,6 +15290,7 @@ rs_row_loop:
     jmp .rs_row_ready
 
 .rs_row_ready:
+    mov byte [row_painted + r12], 1
     ; r12 = display row, scan columns for color runs
     mov r13, [row_paint_start]    ; col = start of current run
 
@@ -15905,6 +15973,8 @@ rs_row_loop:
 .rs_link_row:
     cmp r12, [grid_rows]
     jge .rs_link_done
+    cmp byte [row_painted + r12], 0
+    je .rs_link_next_row
     xor r13d, r13d
 .rs_link_scan:
     cmp r13, [grid_cols]
@@ -16010,6 +16080,8 @@ rs_row_loop:
     inc edx                               ; span length in cells
     test edx, edx
     jle .rs_hover_url_done
+    cmp byte [row_painted + rax], 0       ; its row kept last frame's line
+    je .rs_hover_url_done
     push rbx
     push r13
     push r14
@@ -16090,6 +16162,11 @@ rs_row_loop:
 
     ; ─── OSC 8 hover underline (works in scrollback) ──────────────────
     cmp byte [hover_osc8_id], 0
+    je .rs_hover_osc8_done
+    mov eax, [hover_osc8_row]
+    cmp eax, MAX_ROWS
+    jae .rs_hover_osc8_done
+    cmp byte [row_painted + rax], 0       ; its row kept last frame's line
     je .rs_hover_osc8_done
     push rbx
     push r13
@@ -16362,6 +16439,8 @@ rs_row_loop:
 .rs_emoji_row:
     cmp r12, [grid_rows]
     jge .rs_emoji_done
+    cmp byte [row_painted + r12], 0
+    je .rs_emoji_next_row
     xor r13d, r13d
 .rs_emoji_col:
     cmp r13, [grid_cols]
