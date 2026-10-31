@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.97-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.98-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -98,6 +98,12 @@ where `N` is `0..15` — handy for tweaking a single slot without
 redefining the rest. Order in the file matters: a `palette =` line
 overwrites earlier `colorN` lines, but explicit `bg`/`fg` keys are
 re-applied after the theme so they're never clobbered.
+
+`tint = #RRGGBB` paints the whole terminal in one colour: each pixel
+keeps its brightness and takes the tint's colour. It reaches the 256
+colours (16 to 255), truecolor text and pictures, so an app with its own
+colours turns the tint's colour too. The 16 ANSI colours stay as the
+theme sets them, and strong reds stay red, so an error still reads as one.
 
 Available font sizes: 10, 13, 15, 18, 20 (misc-fixed, always present),
 22, 24, 28, 32 (xos4-terminus, requires the `xfonts-terminus` package

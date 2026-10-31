@@ -991,6 +991,7 @@ cfg_bg_pixel:       resd 1
 cfg_fg_pixel:       resd 1
 cfg_cursor_pixel:   resd 1
 cfg_url_pixel:      resd 1          ; hover-URL underline color
+cfg_tint:           resd 1          ; tint = #RRGGBB: 0 = off, else 0xFFRRGGBB
 cfg_bg_set:         resb 1
 cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
@@ -1541,6 +1542,7 @@ _start:
     call load_config
     ; GLASS_BG env overrides the file background (per-session colour).
     call apply_bg_env
+    call tint_palette
     ; Snapshot the configured font_size so Alt+_ (font reset) can
     ; return to it later regardless of how often the user hit Alt+plus.
     mov rax, [cfg_font_size]
@@ -11718,6 +11720,12 @@ vt_process:
     or ecx, edx
     or ecx, esi
     or ecx, 0xFF000000
+    cmp dword [cfg_tint], 0
+    je .vtp_sgr_fg_true_set
+    mov eax, ecx
+    call tint_pixel
+    mov ecx, eax
+.vtp_sgr_fg_true_set:
     mov [cur_fg_pixel], ecx
     mov byte [cur_fg_default], 0
     jmp .vtp_sgr_next
@@ -11764,6 +11772,12 @@ vt_process:
     or ecx, edx
     or ecx, esi
     or ecx, 0xFF000000
+    cmp dword [cfg_tint], 0
+    je .vtp_sgr_bg_true_set
+    mov eax, ecx
+    call tint_pixel
+    mov ecx, eax
+.vtp_sgr_bg_true_set:
     mov [cur_bg_pixel], ecx
     mov byte [cur_bg_default], 0
     jmp .vtp_sgr_next
@@ -17428,6 +17442,82 @@ palette_apply_alpha:
     pop rbx
     ret
 
+; tint = #RRGGBB in .glassrc paints the screen in one colour: each pixel
+; keeps its brightness and takes the tint's colour, so text, the 256
+; colours and pictures all turn the tint's hue. Reds stay red, so a
+; warning still reads as one (the red pill of the matrix view).
+; tint_pixel: eax = 0xAARRGGBB in and out, alpha kept, other regs kept.
+; A premultiplied pixel stays premultiplied (no channel exceeds alpha).
+tint_pixel:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov ecx, eax
+    shr ecx, 16
+    and ecx, 0xFF                    ; R
+    mov edx, eax
+    shr edx, 8
+    and edx, 0xFF                    ; G
+    movzx esi, al                    ; B
+    cmp ecx, 96                      ; red: R > 96, R > 2G, R > 2B
+    jbe .tp_tint
+    lea edi, [rdx*2]
+    cmp ecx, edi
+    jbe .tp_tint
+    lea edi, [rsi*2]
+    cmp ecx, edi
+    ja .tp_done
+.tp_tint:
+    imul ecx, ecx, 77                ; brightness 0..255
+    imul edx, edx, 150
+    imul esi, esi, 29
+    add ecx, edx
+    add ecx, esi
+    shr ecx, 8
+    and eax, 0xFF000000
+    movzx edx, byte [cfg_tint + 2]   ; R of the tint
+    imul edx, ecx
+    add edx, 255
+    shr edx, 8
+    shl edx, 16
+    or eax, edx
+    movzx edx, byte [cfg_tint + 1]   ; G
+    imul edx, ecx
+    add edx, 255
+    shr edx, 8
+    shl edx, 8
+    or eax, edx
+    movzx edx, byte [cfg_tint]       ; B
+    imul edx, ecx
+    add edx, 255
+    shr edx, 8
+    or eax, edx
+.tp_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; Tint palette entries 16..255 once, after the config is read. The 16
+; ANSI colours belong to the theme (palette =, colorN) and stay as set.
+tint_palette:
+    cmp dword [cfg_tint], 0
+    je .tpl_done
+    push rbx
+    mov ebx, 16
+.tpl_loop:
+    mov eax, [palette + rbx*4]
+    call tint_pixel
+    mov [palette + rbx*4], eax
+    inc ebx
+    cmp ebx, 256
+    jb .tpl_loop
+    pop rbx
+.tpl_done:
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Configuration loading (~/.glassrc)
 ; ══════════════════════════════════════════════════════════════════════
@@ -17576,9 +17666,9 @@ load_config:
 .lc_try_cursor:
     ; Match "cursor" but NOT "cursor_blink" (which we handle separately)
     cmp dword [rsi], 'curs'
-    jne .lc_try_url_underline
+    jne .lc_try_tint
     cmp word [rsi+4], 'or'
-    jne .lc_try_url_underline
+    jne .lc_try_tint
     movzx eax, byte [rsi+6]
     cmp al, ' '
     je .lc_cursor_color
@@ -17586,7 +17676,7 @@ load_config:
     je .lc_cursor_color
     cmp al, '='
     je .lc_cursor_color
-    jmp .lc_try_url_underline       ; not "cursor", try next
+    jmp .lc_try_tint                ; not "cursor", try next
 .lc_cursor_color:
     add rsi, 6
     call lc_skip_to_value
@@ -17596,6 +17686,27 @@ load_config:
     call hex_to_pixel
     mov [cfg_cursor_pixel], eax
     mov byte [cfg_cursor_set], 1
+    jmp .lc_skip_line
+
+.lc_try_tint:
+    cmp dword [rsi], 'tint'
+    jne .lc_try_url_underline
+    movzx eax, byte [rsi+4]
+    cmp al, ' '
+    je .lc_tint
+    cmp al, 9
+    je .lc_tint
+    cmp al, '='
+    jne .lc_try_url_underline
+.lc_tint:
+    add rsi, 4
+    call lc_skip_to_value
+    cmp byte [rsi], '#'
+    jne .lc_skip_line
+    inc rsi
+    call hex_to_pixel
+    or eax, 0xFF000000               ; set, even for #000000
+    mov [cfg_tint], eax
     jmp .lc_skip_line
 
 .lc_try_url_underline:
@@ -20367,6 +20478,24 @@ img_upload_rsi:
     dec rcx
     jnz .iur_swap
 .iur_swap_done:
+
+    ; tint = #RRGGBB: pictures take the tint too. One compare when off.
+    cmp dword [cfg_tint], 0
+    je .iur_tint_done
+    mov rdi, [img_decode_buf]
+    test rdi, rdi
+    jz .iur_tint_done
+    mov rcx, r15
+    shr rcx, 2
+    jz .iur_tint_done
+.iur_tint:
+    mov eax, [rdi]
+    call tint_pixel
+    mov [rdi], eax
+    add rdi, 4
+    dec rcx
+    jnz .iur_tint
+.iur_tint_done:
 
     ; Sanity check
     cmp dword [render_major], 0
