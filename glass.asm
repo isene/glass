@@ -1272,7 +1272,9 @@ kbd_ev_need:        resd 1
 place_under_any:    resb 1          ; a placement with z < 0 exists (per render)
 run_under:          resb 1          ; the current text run sits over such an image
 pc_pass:            resd 1          ; place_composite: 1 = draw the z < 0 ones
-place_full:         resb 1          ; a placement is new this frame: draw them whole
+place_new:          resb 1          ; a picture was placed since the last frame
+place_row0:         resd 1          ; the rows it covers, the last one excluded
+place_row1:         resd 1
 cursor_style:       resq 1          ; 0=block, 1=underline, 2=bar
 scroll_top:         resq 1          ; scroll region top (0-based, default 0)
 scroll_bottom:      resq 1          ; scroll region bottom (0-based, default grid_rows-1)
@@ -14345,12 +14347,10 @@ place_composite:
     ; Blend the picture only on the rows painted this frame. The other
     ; rows of the back pixmap still show it from the last frame, and
     ; blending there again cost the server every pixel of a full-screen
-    ; picture each time a clock ticked. It goes whole when it is new
-    ; this frame, under the text (that repaints every row anyway), or
-    ; past the grid, where paint_margins wipes it.
+    ; picture each time a clock ticked. A new picture's rows repaint
+    ; (.rs_place_dmap). It goes whole under the text (that repaints
+    ; every row anyway) or past the grid, where paint_margins wipes it.
     cmp dword [pc_pass], 0
-    jne .pc_whole
-    cmp byte [place_full], 0
     jne .pc_whole
     movzx eax, word [r13 + 6]        ; anchor_col
     movzx ecx, word [r13 + 8]        ; cell_w
@@ -14584,11 +14584,22 @@ render_screen:
     mov ecx, MAX_ROWS / 8
     rep stosq
     mov al, [place_dmg_valid]
-    mov [place_full], al
+    mov [place_new], al
     ; Fold in any placement made since the last frame, so the image the
     ; overlay pass is about to composite actually reaches the window.
     cmp byte [place_dmg_valid], 0
     je .rs_bbox_init_done
+    movzx ecx, word [char_height]
+    mov eax, [place_dmg_y0]
+    xor edx, edx
+    div ecx
+    mov [place_row0], eax
+    mov eax, [place_dmg_y1]
+    add eax, ecx
+    dec eax
+    xor edx, edx
+    div ecx
+    mov [place_row1], eax
     mov edi, [place_dmg_x0]
     mov esi, [place_dmg_y0]
     mov edx, [place_dmg_x1]
@@ -14690,6 +14701,27 @@ render_screen:
 .rs_sel_dmap_loop_done:
     pop rcx
 .rs_sel_dmap_done:
+
+    ; The rows under a picture placed since the last frame repaint, so
+    ; it is blended once over fresh cells. Blended over what was there,
+    ; it doubled any picture already shown on those rows.
+    cmp byte [place_new], 0
+    je .rs_place_dmap_done
+    cmp qword [all_dirty], 0
+    jne .rs_place_dmap_done
+    push rcx
+    mov ecx, [place_row0]
+.rs_place_dmap_loop:
+    cmp ecx, [place_row1]
+    jge .rs_place_dmap_loop_done
+    cmp rcx, [grid_rows]
+    jge .rs_place_dmap_loop_done
+    mov byte [row_dirty_map + rcx], 1
+    inc ecx
+    jmp .rs_place_dmap_loop
+.rs_place_dmap_loop_done:
+    pop rcx
+.rs_place_dmap_done:
 
     ; In pseudo-transparency mode, ImageText16's bg fill is replaced
     ; with PolyText16 for default-bg cells, so previous frame's text
