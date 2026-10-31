@@ -992,6 +992,8 @@ cfg_fg_pixel:       resd 1
 cfg_cursor_pixel:   resd 1
 cfg_url_pixel:      resd 1          ; hover-URL underline color
 cfg_tint:           resd 1          ; tint = #RRGGBB: 0 = off, else 0xFFRRGGBB
+cfg_tint_conf:      resd 1          ; the tint .glassrc asked for (OSC 7701 resets to it)
+palette_base:       resd 256        ; the palette as configured, before any tint
 cfg_bg_set:         resb 1
 cfg_fg_set:         resb 1
 cfg_cursor_set:     resb 1
@@ -10084,7 +10086,7 @@ vt_process:
     cmp al, ';'
     je .vtp_osc_start_text
     ; Digit: build number, capped at 65535. The largest OSC code used
-    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/11/52/111, so
+    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/11/52/111/7701, so
     ; cap well above what any sane app emits while preventing 32-bit
     ; wrap into garbage that could match a real opcode.
     cmp al, '0'
@@ -10141,6 +10143,24 @@ vt_process:
     je .vtp_osc_11
     cmp rax, 111
     je .vtp_osc_111
+    cmp rax, 7701
+    je .vtp_osc_7701
+    jmp .vtp_loop
+
+.vtp_osc_7701:
+    ; OSC 7701 ; #rrggbb tints the terminal while an app wants its own
+    ; look (gluon's matrix look); OSC 7701 with no colour goes back to
+    ; the tint .glassrc asked for. glass's own code; others ignore it.
+    mov eax, [cfg_tint_conf]
+    cmp qword [osc_pos], 7
+    jb .vtp_osc_tint
+    cmp byte [osc_buf], '#'
+    jne .vtp_osc_tint
+    lea rsi, [osc_buf + 1]
+    call hex_to_pixel
+    or eax, 0xFF000000
+.vtp_osc_tint:
+    call tint_set
     jmp .vtp_loop
 
 .vtp_osc_11:
@@ -17500,22 +17520,47 @@ tint_pixel:
     pop rcx
     ret
 
-; Tint palette entries 16..255 once, after the config is read. The 16
-; ANSI colours belong to the theme (palette =, colorN) and stay as set.
+; After the config is read: keep the palette as configured, so OSC 7701
+; can change the tint later, and tint it if .glassrc asks.
 tint_palette:
-    cmp dword [cfg_tint], 0
-    je .tpl_done
+    push rsi
+    push rdi
+    lea rsi, [palette]
+    lea rdi, [palette_base]
+    mov ecx, 256
+    rep movsd
+    pop rdi
+    pop rsi
+    mov eax, [cfg_tint]
+    mov [cfg_tint_conf], eax
+    test eax, eax
+    jnz tint_set
+    ret
+
+; tint_set — eax = the tint (0xFFRRGGBB, or 0 for none). Palette entries
+; 1..255 are tinted afresh from the colours as configured, each keeping
+; its alpha; entry 7 is the default text, read as it is drawn. Entry 0,
+; the background, stays as bg =, GLASS_BG or OSC 11 set it. Cells drawn
+; in other colours keep them until redrawn.
+tint_set:
     push rbx
-    mov ebx, 16
-.tpl_loop:
-    mov eax, [palette + rbx*4]
+    mov [cfg_tint], eax
+    mov ebx, 1
+.ts_loop:
+    mov eax, [palette_base + rbx*4]
+    cmp dword [cfg_tint], 0
+    je .ts_alpha
     call tint_pixel
+.ts_alpha:
+    and eax, 0x00FFFFFF
+    mov ecx, [palette + rbx*4]
+    and ecx, 0xFF000000
+    or eax, ecx
     mov [palette + rbx*4], eax
     inc ebx
     cmp ebx, 256
-    jb .tpl_loop
+    jb .ts_loop
     pop rbx
-.tpl_done:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
