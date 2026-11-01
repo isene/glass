@@ -3,6 +3,8 @@
  *   xpix X Y [X Y..]  prints the colour at each point, one rrggbb per line
  *   xpix -s X Y ..    what the screen shows there: a see-through window
  *                     gives the mix with what is behind it
+ *   xpix -f X Y W H RRGGBB  fill a box of the window in a colour, behind
+ *                     glass's back: it stays until glass copies over it
  */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -24,6 +26,13 @@ int main(int argc, char **argv)
     if (!win) return 2;
     XGetWindowAttributes(d, win, &a);
     if (argc < 3) { printf("%d %d 0x%lx 0x%lx\n", a.width, a.height, win, DefaultRootWindow(d)); return 0; }
+    if (!strcmp(argv[1], "-f") && argc == 7) {
+        GC gc = XCreateGC(d, win, 0, NULL);
+        XSetForeground(d, gc, strtoul(argv[6], NULL, 16));
+        XFillRectangle(d, win, gc, atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+        XSync(d, False);
+        return 0;
+    }
     int screen = !strcmp(argv[1], "-s");
     for (i = 1 + screen; i + 1 < (unsigned)argc; i += 2) {
         int x = atoi(argv[i]), y = atoi(argv[i + 1]);

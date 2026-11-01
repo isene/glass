@@ -1113,6 +1113,15 @@ row_paint_end:         resq 1
 ; survived into the row below.
 row_dirty_map:         resb MAX_ROWS
 
+; First and last changed column of each row the pre-pass found changed,
+; or -1 in row_dirty_lo when the row was marked for another reason (a
+; selection, a picture). A row painted only because a neighbour changed
+; paints the columns the neighbour changed, not its whole width: drain's
+; power core changes 13 columns of 45 rows, and the full-width neighbour
+; rows made glass copy, and frame composite, 1920 px wide strips.
+row_dirty_lo:          resd MAX_ROWS
+row_dirty_hi:          resd MAX_ROWS
+
 ; row_painted[r] = 1 when the row loop painted row r this frame. The
 ; passes after the rows (link lines, hover lines, emoji, pictures) draw
 ; only on these rows: every other row of the back pixmap still shows
@@ -14666,6 +14675,7 @@ render_screen:
     cmp r12, MAX_ROWS
     jge .rs_dmap_zero_done
     mov byte [row_dirty_map + r12], 0
+    mov dword [row_dirty_lo + r12*4], -1
     inc r12
     jmp .rs_dmap_zero
 .rs_dmap_zero_done:
@@ -14694,12 +14704,32 @@ render_screen:
     imul rcx, CELL_SIZE
     shr rcx, 3
     repe cmpsq
+    je .rs_dmap_clean                  ; ZF=1 → identical
+    ; First changed cell: the qword that stopped the compare.
+    mov rax, [grid_cols]
+    add rax, rax                       ; qwords in a row (2 per cell)
+    sub rax, rcx                       ; qwords compared
+    lea rcx, [rax - 1]
+    shr rcx, 1
+    mov [row_dirty_lo + r12*4], ecx
+    ; Last changed cell: the same compare, backwards from the row's end.
+    shl rax, 3
+    sub rsi, rax                       ; back to the starts of both rows
+    sub rdi, rax
+    mov rcx, [grid_cols]
+    add rcx, rcx
+    lea rsi, [rsi + rcx*8 - 8]
+    lea rdi, [rdi + rcx*8 - 8]
+    std
+    repe cmpsq                         ; stops on a known difference
+    cld
+    shr rcx, 1                         ; rcx = index of that qword
+    mov [row_dirty_hi + r12*4], ecx
+    mov byte [row_dirty_map + r12], 1
+.rs_dmap_clean:
     pop rcx
     pop rsi
     pop rdi
-    je .rs_dmap_clean                  ; ZF=1 → identical
-    mov byte [row_dirty_map + r12], 1
-.rs_dmap_clean:
     inc r12
     jmp .rs_dmap_row
 .rs_dmap_done:
@@ -14730,6 +14760,7 @@ render_screen:
     cmp rcx, [grid_rows]
     jge .rs_sel_dmap_loop_done
     mov byte [row_dirty_map + rcx], 1
+    mov dword [row_dirty_lo + rcx*4], -1  ; columns unknown: paint the row
     inc rcx
     jmp .rs_sel_dmap_loop
 .rs_sel_dmap_loop_done:
@@ -14751,6 +14782,7 @@ render_screen:
     cmp rcx, [grid_rows]
     jge .rs_place_dmap_loop_done
     mov byte [row_dirty_map + rcx], 1
+    mov dword [row_dirty_lo + rcx*4], -1  ; columns unknown: paint the row
     inc ecx
     jmp .rs_place_dmap_loop
 .rs_place_dmap_loop_done:
@@ -15286,9 +15318,51 @@ rs_row_loop:
 .rs_row_diff_done:
     cmp r10, -1
     jne .rs_row_diff_have_range
-    ; This row's own cells didn't change — we're here only because a
-    ; neighbour was dirty. Repaint the whole row so we can be sure to
-    ; cover any bleed from the neighbour.
+    ; This row's own cells didn't change. Marked itself (a selection, a
+    ; picture): paint the whole row. Painted only because a neighbour
+    ; changed: paint the columns the neighbours changed, where their
+    ; glyphs can bleed into this row, padded below like any changed row.
+    cmp byte [row_dirty_map + r12], 0
+    jne .rs_row_full
+    mov r10, [grid_cols]               ; min first column so far
+    mov r11, -1                        ; max last column so far
+    test r12, r12
+    jz .rs_nb_below
+    lea rax, [r12 - 1]
+    cmp byte [row_dirty_map + rax], 0
+    je .rs_nb_below
+    movsxd rcx, dword [row_dirty_lo + rax*4]
+    test rcx, rcx
+    js .rs_row_full                    ; its columns are unknown
+    cmp rcx, r10
+    jge .rs_nb_above_lo
+    mov r10, rcx
+.rs_nb_above_lo:
+    mov ecx, [row_dirty_hi + rax*4]
+    cmp rcx, r11
+    jle .rs_nb_below
+    mov r11, rcx
+.rs_nb_below:
+    lea rax, [r12 + 1]
+    cmp rax, [grid_rows]
+    jge .rs_nb_done
+    cmp byte [row_dirty_map + rax], 0
+    je .rs_nb_done
+    movsxd rcx, dword [row_dirty_lo + rax*4]
+    test rcx, rcx
+    js .rs_row_full
+    cmp rcx, r10
+    jge .rs_nb_below_lo
+    mov r10, rcx
+.rs_nb_below_lo:
+    mov ecx, [row_dirty_hi + rax*4]
+    cmp rcx, r11
+    jle .rs_nb_done
+    mov r11, rcx
+.rs_nb_done:
+    cmp r11, -1
+    jne .rs_row_diff_have_range
+.rs_row_full:
     mov qword [row_paint_start], 0
     mov rax, [grid_cols]
     mov [row_paint_end], rax
