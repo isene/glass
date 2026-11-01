@@ -1174,6 +1174,14 @@ blt_x0:                resq 1
 blt_y0:                resq 1
 blt_x1:                resq 1
 blt_y1:                resq 1
+; The areas copied to the window, up to BLT_RECTS of them: x0, y0, x1,
+; y1 each, end-exclusive. A change at the top and one at the bottom copy
+; two strips, not the rectangle around both: drain's power core and its
+; once-a-second text sit far apart, and one rectangle copied most of the
+; window for them.
+%define BLT_RECTS 8
+blt_n:                 resq 1
+blt_rects:             resq 4 * BLT_RECTS
 
 ; Cursor
 cursor_row:         resq 1
@@ -6905,6 +6913,7 @@ handle_x11_events:
     movzx esi, word [x11_buf + rbx + 10]     ; y
     movzx edx, word [x11_buf + rbx + 12]     ; width
     movzx ecx, word [x11_buf + rbx + 14]     ; height
+    mov byte [blt_dirty], 0                  ; copy this area, not last frame's too
     call expand_bbox
     pop rcx
     pop rdx
@@ -14070,6 +14079,7 @@ ensure_back_buffer:
 expand_bbox:
     cmp byte [blt_dirty], 1
     je .eb_have
+    mov qword [blt_n], 0
     mov [blt_x0], rdi
     mov [blt_y0], rsi
     mov rax, rdi
@@ -14079,7 +14089,7 @@ expand_bbox:
     add rax, rcx
     mov [blt_y1], rax
     mov byte [blt_dirty], 1
-    ret
+    jmp .eb_list
 .eb_have:
     cmp rdi, [blt_x0]
     jge .eb_x0_ok
@@ -14101,6 +14111,134 @@ expand_bbox:
     jle .eb_y1_ok
     mov [blt_y1], rax
 .eb_y1_ok:
+.eb_list:
+    push rdx
+    push rcx
+    add rdx, rdi                        ; x1
+    add rcx, rsi                        ; y1
+    call blt_add
+    pop rcx
+    pop rdx
+    ret
+
+; blt_add — add the area rdi=x0, rsi=y0, rdx=x1, rcx=y1 (end-exclusive)
+; to the list blt_back_to_window copies. It joins the area that grows
+; least by it, when the growth beyond the two areas is no bigger than the
+; new one, or when the list is full; otherwise it starts its own. Rows
+; painted one under another with the same columns join into one band.
+; Preserves all registers.
+blt_add:
+    push rax
+    push rbx
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp rdx, rdi
+    jle .ba_done
+    cmp rcx, rsi
+    jle .ba_done
+    mov r14, rdx
+    sub r14, rdi
+    mov rax, rcx
+    sub rax, rsi
+    imul r14, rax                       ; r14 = the new area's size
+    mov r15, -1                         ; the best area to join so far
+    mov r13, 0x7FFFFFFFFFFFFFFF         ; and what joining it wastes
+    xor ebx, ebx
+.ba_scan:
+    cmp rbx, [blt_n]
+    jge .ba_pick
+    mov r12, rbx
+    shl r12, 5                          ; 32 bytes per area
+    lea r12, [blt_rects + r12]
+    mov r8, [r12]                       ; the union of both, r8..r11
+    cmp rdi, r8
+    jge .ba_u0
+    mov r8, rdi
+.ba_u0:
+    mov r9, [r12 + 8]
+    cmp rsi, r9
+    jge .ba_u1
+    mov r9, rsi
+.ba_u1:
+    mov r10, [r12 + 16]
+    cmp rdx, r10
+    jle .ba_u2
+    mov r10, rdx
+.ba_u2:
+    mov r11, [r12 + 24]
+    cmp rcx, r11
+    jle .ba_u3
+    mov r11, rcx
+.ba_u3:
+    sub r10, r8
+    sub r11, r9
+    imul r10, r11                       ; size of the union
+    sub r10, r14
+    mov rax, [r12 + 16]
+    sub rax, [r12]
+    mov r11, [r12 + 24]
+    sub r11, [r12 + 8]
+    imul rax, r11
+    sub r10, rax                        ; waste: union minus both areas
+    cmp r10, r13
+    jge .ba_next
+    mov r13, r10
+    mov r15, rbx
+.ba_next:
+    inc rbx
+    jmp .ba_scan
+.ba_pick:
+    test r15, r15
+    js .ba_append                       ; the list is empty
+    cmp r13, r14
+    jle .ba_join
+    cmp qword [blt_n], BLT_RECTS
+    jl .ba_append
+.ba_join:
+    shl r15, 5
+    lea r12, [blt_rects + r15]
+    cmp rdi, [r12]
+    jge .ba_j0
+    mov [r12], rdi
+.ba_j0:
+    cmp rsi, [r12 + 8]
+    jge .ba_j1
+    mov [r12 + 8], rsi
+.ba_j1:
+    cmp rdx, [r12 + 16]
+    jle .ba_j2
+    mov [r12 + 16], rdx
+.ba_j2:
+    cmp rcx, [r12 + 24]
+    jle .ba_done
+    mov [r12 + 24], rcx
+    jmp .ba_done
+.ba_append:
+    mov rax, [blt_n]
+    shl rax, 5
+    lea r12, [blt_rects + rax]
+    mov [r12], rdi
+    mov [r12 + 8], rsi
+    mov [r12 + 16], rdx
+    mov [r12 + 24], rcx
+    inc qword [blt_n]
+.ba_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbx
+    pop rax
     ret
 
 ; bbox_full_window — set the dirty bbox to the entire window. Called
@@ -14137,40 +14275,43 @@ blt_back_to_window:
     cmp rcx, [bell_flash_until]
     jl .blt_ret                        ; bell still active → skip CopyArea
 .blt_no_bell:
-    ; Clamp bbox to the window in case any caller over-reported.
-    mov rax, [blt_x0]
-    test rax, rax
+    ; One CopyArea per area in the list, each clamped to the window in
+    ; case a caller over-reported.
+    push rbx
+    push r10
+    push r11
+    push r12
+    xor ebx, ebx
+.blt_area:
+    cmp rbx, [blt_n]
+    jge .blt_areas_done
+    mov r12, rbx
+    shl r12, 5
+    lea r12, [blt_rects + r12]
+    mov r10, [r12]                     ; x0
+    test r10, r10
     jns .blt_x0_pos
-    xor eax, eax
-    mov [blt_x0], rax
+    xor r10d, r10d
 .blt_x0_pos:
-    mov rax, [blt_y0]
-    test rax, rax
+    mov r11, [r12 + 8]                 ; y0
+    test r11, r11
     jns .blt_y0_pos
-    xor eax, eax
-    mov [blt_y0], rax
+    xor r11d, r11d
 .blt_y0_pos:
-    mov rax, [blt_x1]
-    cmp rax, [win_width]
+    mov r8, [r12 + 16]                 ; x1
+    cmp r8, [win_width]
     jle .blt_x1_ok
-    mov rax, [win_width]
-    mov [blt_x1], rax
+    mov r8, [win_width]
 .blt_x1_ok:
-    mov rax, [blt_y1]
-    cmp rax, [win_height]
+    mov r9, [r12 + 24]                 ; y1
+    cmp r9, [win_height]
     jle .blt_y1_ok
-    mov rax, [win_height]
-    mov [blt_y1], rax
+    mov r9, [win_height]
 .blt_y1_ok:
-    ; Compute width/height; degenerate → no BLT.
-    mov rax, [blt_x1]
-    sub rax, [blt_x0]
-    jle .blt_ret
-    mov r8, rax                        ; r8 = width
-    mov rax, [blt_y1]
-    sub rax, [blt_y0]
-    jle .blt_ret
-    mov r9, rax                        ; r9 = height
+    sub r8, r10                        ; width; degenerate → no BLT
+    jle .blt_next
+    sub r9, r11                        ; height
+    jle .blt_next
 
     lea rdi, [tmp_buf]
     mov byte [rdi], 62                 ; CopyArea opcode
@@ -14182,18 +14323,24 @@ blt_back_to_window:
     mov [rdi+8], eax                   ; dst-drawable
     mov eax, [gc_id]
     mov [rdi+12], eax                  ; gc
-    mov rax, [blt_x0]
-    mov word [rdi+16], ax              ; src-x
-    mov word [rdi+20], ax              ; dst-x (mirror src)
-    mov rax, [blt_y0]
-    mov word [rdi+18], ax              ; src-y
-    mov word [rdi+22], ax              ; dst-y
+    mov word [rdi+16], r10w            ; src-x
+    mov word [rdi+20], r10w            ; dst-x (mirror src)
+    mov word [rdi+18], r11w            ; src-y
+    mov word [rdi+22], r11w            ; dst-y
     mov word [rdi+24], r8w             ; width
     mov word [rdi+26], r9w             ; height
     lea rsi, [tmp_buf]
     mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
+.blt_next:
+    inc rbx
+    jmp .blt_area
+.blt_areas_done:
+    pop r12
+    pop r11
+    pop r10
+    pop rbx
 .blt_ret:
     ret
 
