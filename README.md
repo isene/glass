@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.101-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.102-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -105,6 +105,11 @@ colours, truecolor text and pictures, so an app with its own colours
 turns the tint's colour too. Only the background stays as set, and
 strong reds stay red, so an error still reads as one. An app can switch
 it while it runs with OSC 7701 (`crust::style::tint_seq`).
+
+OSC 7702;1 dims the window to half brightness until a key is pressed
+in it, and OSC 7702;0 lifts the dim (`crust::style::dim_seq`). deck
+sends them when its Claude session goes idle and when it works again,
+so the sessions that wait for you stand out.
 
 Available font sizes: 10, 13, 15, 18, 20 (misc-fixed, always present),
 22, 24, 28, 32 (xos4-terminus, requires the `xfonts-terminus` package
@@ -297,8 +302,9 @@ serialisation each). This is a stylistic choice, not a defect.
 | Alt+t | Cycle through `opacity_cycle` percentages, or toggle 100↔50 if no cycle is set (compositor → see-through background in an ARGB window; otherwise wallpaper-blend pseudo-transparency). Under a compositor it needs an `opacity` line in `~/.glassrc` |
 | Alt+v | Paste from PRIMARY (same as Shift+Insert) |
 | Alt+c | Copy all the text in view to CLIPBOARD and PRIMARY |
+| Alt+d | Dim the window to half brightness, or lift the dim. Any other key lifts it too |
 
-The seven Alt-key shortcuts are rebindable via `~/.glassrc`:
+The eight Alt-key shortcuts are rebindable via `~/.glassrc`:
 
 ```
 key.font_inc    = alt+plus
@@ -308,6 +314,7 @@ key.bg_cycle    = alt+b
 key.opacity     = alt+t
 key.paste       = alt+v
 key.copy_screen = alt+c
+key.dim         = alt+d
 ```
 
 Modifiers: `alt`, `ctrl`, `shift`. Keys: any single ASCII character or

@@ -842,6 +842,7 @@ back_size_h:        resq 1          ; allocated height
 draw_drawable:      resd 1
 draw_picture:       resd 1
 needs_blt:          resb 1          ; 1 = render_screen must CopyArea after
+dim_on:             resb 1          ; 1 = Alt+d or OSC 7702 dimmed the window by half
 
 %define MAX_EMOJI 1024
 %define EMOJI_RASTER_MAX (64 * 64 * 4)   ; allow up to 64x64 ARGB
@@ -1043,7 +1044,8 @@ KB_BG_CYCLE      equ 3
 KB_OPACITY       equ 4
 KB_PASTE         equ 5
 KB_COPY_SCREEN   equ 6
-KB_COUNT         equ 7
+KB_DIM           equ 7
+KB_COUNT         equ 8
 keybind_mods:    resb KB_COUNT
 keybind_keysyms: resd KB_COUNT
 cfg_blink_ms:       resq 1          ; cursor blink interval in ms (0 = off)
@@ -6762,6 +6764,16 @@ handle_x11_events:
     jmp .hxe_loop
 
 .hxe_key_press:
+    cmp byte [dim_on], 0
+    je .hxe_key_lit
+    movzx edi, byte [x11_buf + rbx + 1]
+    movzx esi, word [x11_buf + rbx + 28]
+    push rbx
+    push r12
+    call dim_key_lift
+    pop r12
+    pop rbx
+.hxe_key_lit:
     movzx eax, byte [x11_buf + rbx + 1]
     movzx ecx, word [x11_buf + rbx + 28]
     cmp qword [kitty_kbd_flags], 0
@@ -8542,6 +8554,8 @@ handle_keypress:
     je .hkp_paste_primary
     cmp ecx, KB_COPY_SCREEN
     je .hkp_copy_screen
+    cmp ecx, KB_DIM
+    je .hkp_dim_toggle
 .hkp_kbd_next:
     inc ecx
     jmp .hkp_kbd_loop
@@ -9190,6 +9204,11 @@ handle_keypress:
     jmp .hkp_done
 .hkp_opacity_toggle:
     call opacity_toggle_apply
+    jmp .hkp_done
+.hkp_dim_toggle:
+    movzx edi, byte [dim_on]
+    xor edi, 1
+    call dim_set
     jmp .hkp_done
 
 .hkp_done:
@@ -10104,7 +10123,7 @@ vt_process:
     cmp al, ';'
     je .vtp_osc_start_text
     ; Digit: build number, capped at 65535. The largest OSC code used
-    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/11/52/111/7701, so
+    ; in practice is 1337 (iTerm) and we only dispatch on 0/2/8/11/52/111/7701/7702, so
     ; cap well above what any sane app emits while preventing 32-bit
     ; wrap into garbage that could match a real opcode.
     cmp al, '0'
@@ -10163,6 +10182,21 @@ vt_process:
     je .vtp_osc_111
     cmp rax, 7701
     je .vtp_osc_7701
+    cmp rax, 7702
+    je .vtp_osc_7702
+    jmp .vtp_loop
+
+.vtp_osc_7702:
+    ; OSC 7702 ; 1 dims the window by half until a key is pressed in it,
+    ; and OSC 7702 ; 0 lifts the dim. deck sends them when its Claude
+    ; session goes idle and when it works again. Others ignore it.
+    xor edi, edi
+    cmp qword [osc_pos], 0
+    je .vtp_osc_dim
+    cmp byte [osc_buf], '1'
+    sete dil
+.vtp_osc_dim:
+    call dim_set
     jmp .vtp_loop
 
 .vtp_osc_7701:
@@ -14329,8 +14363,29 @@ blt_back_to_window:
     mov word [rdi+22], r11w            ; dst-y
     mov word [rdi+24], r8w             ; width
     mov word [rdi+26], r9w             ; height
+    mov edx, 28
+    cmp byte [dim_on], 0
+    je .blt_send
+    cmp dword [render_major], 0
+    je .blt_send
+    ; Dimmed: half-black Over the area just copied (RenderFillRectangles).
+    mov al, [render_major]
+    mov [rdi+28], al
+    mov byte [rdi+29], RENDER_FILL_RECTANGLES
+    mov word [rdi+30], 7
+    mov dword [rdi+32], RENDER_OP_OVER ; op, then 3 pad bytes
+    mov eax, [render_window_picture]
+    mov [rdi+36], eax
+    mov dword [rdi+40], 0              ; red, green
+    mov dword [rdi+44], 0x80000000     ; blue 0, alpha half
+    mov eax, [rdi+20]                  ; x, y
+    mov [rdi+48], eax
+    mov eax, [rdi+24]                  ; width, height
+    mov [rdi+52], eax
+    inc dword [x11_seq]
+    mov edx, 56
+.blt_send:
     lea rsi, [tmp_buf]
-    mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
 .blt_next:
@@ -14342,6 +14397,56 @@ blt_back_to_window:
     pop r10
     pop rbx
 .blt_ret:
+    ret
+
+; dim_set — edi = 1 dims the window by half, 0 lifts the dim. Only the
+; window is dimmed: blt_back_to_window lays half-black over each area it
+; copies, and the back buffer keeps the true colours, so either change
+; is one copy of the whole window. Off, the dim costs one compare per copy.
+dim_set:
+    cmp [dim_on], dil
+    je .ds_ret
+    mov [dim_on], dil
+    cmp byte [pseudo_full], 1          ; no back buffer to copy from
+    je .ds_ret
+    cmp dword [back_pixmap], 0
+    je .ds_ret
+    xor edi, edi
+    xor esi, esi
+    mov rdx, [win_width]
+    mov rcx, [win_height]
+    mov byte [blt_dirty], 0
+    call expand_bbox
+    call blt_back_to_window
+    call x11_flush
+.ds_ret:
+    ret
+
+; dim_key_lift — edi = keycode, esi = state of a key pressed while the
+; window is dimmed. Any key glass takes lifts the dim. A modifier alone
+; does not, nor the dim key itself, so Alt+d still toggles it.
+dim_key_lift:
+    shl edi, 3
+    cmp edi, 2048
+    jae .dkl_lift
+    mov eax, [keysym_map + rdi*4]      ; the key without Shift
+    lea ecx, [rax - 0xFFE1]
+    cmp ecx, 0xFFEE - 0xFFE1
+    jbe .dkl_ret                       ; Shift, Ctrl, Alt or Super alone
+    cmp eax, 0xFE03
+    je .dkl_ret                        ; AltGr alone
+    cmp eax, [keybind_keysyms + KB_DIM*4]
+    jne .dkl_lift
+    movzx ecx, byte [keybind_mods + KB_DIM]
+    test ecx, ecx
+    jz .dkl_lift
+    and esi, 0x0D
+    cmp esi, ecx
+    je .dkl_ret
+.dkl_lift:
+    xor edi, edi
+    jmp dim_set
+.dkl_ret:
     ret
 
 ; Render entire screen to X11
@@ -18719,7 +18824,7 @@ load_config:
     jmp .lc_kb_call
 .lc_kb_try_copy:
     cmp dword [rsi], 'copy'
-    jne .lc_skip_line
+    jne .lc_kb_try_dim
     cmp dword [rsi+4], '_scr'
     jne .lc_skip_line
     cmp word [rsi+8], 'ee'
@@ -18728,6 +18833,14 @@ load_config:
     jne .lc_skip_line
     add rsi, 11
     mov edi, KB_COPY_SCREEN
+    jmp .lc_kb_call
+.lc_kb_try_dim:
+    cmp word [rsi], 'di'
+    jne .lc_skip_line
+    cmp byte [rsi+2], 'm'
+    jne .lc_skip_line
+    add rsi, 3
+    mov edi, KB_DIM
 .lc_kb_call:
     call lc_skip_to_value
     call parse_keybinding
@@ -22162,6 +22275,9 @@ init_keybindings:
     ; copy_screen: Alt + c — every row in view to PRIMARY and CLIPBOARD
     mov byte [keybind_mods + KB_COPY_SCREEN], 8
     mov dword [keybind_keysyms + KB_COPY_SCREEN*4], 0x63
+    ; dim: Alt + d — the window at half brightness until the next key
+    mov byte [keybind_mods + KB_DIM], 8
+    mov dword [keybind_keysyms + KB_DIM*4], 0x64
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
