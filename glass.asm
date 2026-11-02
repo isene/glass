@@ -842,7 +842,7 @@ back_size_h:        resq 1          ; allocated height
 draw_drawable:      resd 1
 draw_picture:       resd 1
 needs_blt:          resb 1          ; 1 = render_screen must CopyArea after
-dim_on:             resb 1          ; 1 = Alt+d or OSC 7702 dimmed the window by half
+dim_on:             resb 1          ; 1 = Alt+d or OSC 7702 dimmed the window to 20%
 
 %define MAX_EMOJI 1024
 %define EMOJI_RASTER_MAX (64 * 64 * 4)   ; allow up to 64x64 ARGB
@@ -10187,7 +10187,7 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_osc_7702:
-    ; OSC 7702 ; 1 dims the window by half until a key is pressed in it,
+    ; OSC 7702 ; 1 dims the window to 20% until a key is pressed in it,
     ; and OSC 7702 ; 0 lifts the dim. deck sends them when its Claude
     ; session goes idle and when it works again. Others ignore it.
     xor edi, edi
@@ -14368,7 +14368,7 @@ blt_back_to_window:
     je .blt_send
     cmp dword [render_major], 0
     je .blt_send
-    ; Dimmed: half-black Over the area just copied (RenderFillRectangles).
+    ; Dimmed: 80% black Over the area just copied (RenderFillRectangles).
     mov al, [render_major]
     mov [rdi+28], al
     mov byte [rdi+29], RENDER_FILL_RECTANGLES
@@ -14377,7 +14377,7 @@ blt_back_to_window:
     mov eax, [render_window_picture]
     mov [rdi+36], eax
     mov dword [rdi+40], 0              ; red, green
-    mov dword [rdi+44], 0x80000000     ; blue 0, alpha half
+    mov dword [rdi+44], 0xCCCC0000     ; blue 0, alpha 80%: 20% shows
     mov eax, [rdi+20]                  ; x, y
     mov [rdi+48], eax
     mov eax, [rdi+24]                  ; width, height
@@ -14399,8 +14399,8 @@ blt_back_to_window:
 .blt_ret:
     ret
 
-; dim_set — edi = 1 dims the window by half, 0 lifts the dim. Only the
-; window is dimmed: blt_back_to_window lays half-black over each area it
+; dim_set — edi = 1 dims the window to 20%, 0 lifts the dim. Only the
+; window is dimmed: blt_back_to_window lays 80% black over each area it
 ; copies, and the back buffer keeps the true colours, so either change
 ; is one copy of the whole window. Off, the dim costs one compare per copy.
 dim_set:
@@ -22275,7 +22275,7 @@ init_keybindings:
     ; copy_screen: Alt + c — every row in view to PRIMARY and CLIPBOARD
     mov byte [keybind_mods + KB_COPY_SCREEN], 8
     mov dword [keybind_keysyms + KB_COPY_SCREEN*4], 0x63
-    ; dim: Alt + d — the window at half brightness until the next key
+    ; dim: Alt + d — the window at 20% brightness until the next key
     mov byte [keybind_mods + KB_DIM], 8
     mov dword [keybind_keysyms + KB_DIM*4], 0x64
     ret
