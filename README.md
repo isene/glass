@@ -2,7 +2,7 @@
 
 <img src="img/glass.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.103-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.104-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~155KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal emulator written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Speaks X11 wire protocol directly via Unix socket. Single static binary, ~155KB.
 
@@ -72,6 +72,7 @@ cursor = #f7768e
 font_size = 13
 opacity = 80
 cursor_blink = 500
+dim_brightness = 30
 bg_cycle = #000000,#001a33,#002200,#200033,#330011,#332200,#003333
 opacity_cycle = 100,75,50,25,0
 font_weight = bold
@@ -106,8 +107,9 @@ turns the tint's colour too. Only the background stays as set, and
 strong reds stay red, so an error still reads as one. An app can switch
 it while it runs with OSC 7701 (`crust::style::tint_seq`).
 
-OSC 7702;1 dims the window to 20% brightness until a key is pressed
-in it, and OSC 7702;0 lifts the dim (`crust::style::dim_seq`). deck
+OSC 7702;1 dims the window to 30% brightness until a key is pressed
+in it (`dim_brightness = N` in `~/.glassrc` sets how much shows, 0 to
+100), and OSC 7702;0 lifts the dim (`crust::style::dim_seq`). deck
 sends them when its Claude session goes idle and when it works again,
 so the sessions that wait for you stand out.
 
@@ -302,7 +304,7 @@ serialisation each). This is a stylistic choice, not a defect.
 | Alt+t | Cycle through `opacity_cycle` percentages, or toggle 100↔50 if no cycle is set (compositor → see-through background in an ARGB window; otherwise wallpaper-blend pseudo-transparency). Under a compositor it needs an `opacity` line in `~/.glassrc` |
 | Alt+v | Paste from PRIMARY (same as Shift+Insert) |
 | Alt+c | Copy all the text in view to CLIPBOARD and PRIMARY |
-| Alt+d | Dim the window to 20% brightness, or lift the dim. Any other key lifts it too |
+| Alt+d | Dim the window to 30% brightness (`dim_brightness` in `~/.glassrc`), or lift the dim. Any other key lifts it too |
 
 The eight Alt-key shortcuts are rebindable via `~/.glassrc`:
 

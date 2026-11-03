@@ -13,3 +13,6 @@ opacity_cycle = 100,50
 # that is not installed is skipped.
 font_path = /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
 font_path_fallback2 = /usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf
+
+# Not the default 30, so case 32 proves the line is read.
+dim_brightness = 50

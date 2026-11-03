@@ -842,7 +842,9 @@ back_size_h:        resq 1          ; allocated height
 draw_drawable:      resd 1
 draw_picture:       resd 1
 needs_blt:          resb 1          ; 1 = render_screen must CopyArea after
-dim_on:             resb 1          ; 1 = Alt+d or OSC 7702 dimmed the window to 20%
+dim_on:             resb 1          ; 1 = Alt+d or OSC 7702 dimmed the window
+dim_pixel:          resd 1          ; blue and alpha of the dim's black layer,
+                                    ; set from dim_brightness in ~/.glassrc
 
 %define MAX_EMOJI 1024
 %define EMOJI_RASTER_MAX (64 * 64 * 4)   ; allow up to 64x64 ARGB
@@ -1542,6 +1544,7 @@ _start:
     mov byte [focus_report], 0
     mov byte [cfg_osc8_underline], 1   ; standard terminal default; ~/.glassrc can disable
     mov byte [cfg_unfocused_dim], 0    ; off by default (no XRender cost when 0)
+    mov dword [dim_pixel], 0xB3320000  ; dim_brightness = 30: 70% black, 30% shows
     mov qword [window_focused], 1      ; assume focused at startup until told otherwise
     mov qword [cursor_style], 0
     mov qword [cfg_font_size], 0
@@ -10187,7 +10190,7 @@ vt_process:
     jmp .vtp_loop
 
 .vtp_osc_7702:
-    ; OSC 7702 ; 1 dims the window to 20% until a key is pressed in it,
+    ; OSC 7702 ; 1 dims the window until a key is pressed in it,
     ; and OSC 7702 ; 0 lifts the dim. deck sends them when its Claude
     ; session goes idle and when it works again. Others ignore it.
     xor edi, edi
@@ -14368,7 +14371,8 @@ blt_back_to_window:
     je .blt_send
     cmp dword [render_major], 0
     je .blt_send
-    ; Dimmed: 80% black Over the area just copied (RenderFillRectangles).
+    ; Dimmed: black Over the area just copied (RenderFillRectangles), so
+    ; dim_brightness % of it shows.
     mov al, [render_major]
     mov [rdi+28], al
     mov byte [rdi+29], RENDER_FILL_RECTANGLES
@@ -14377,7 +14381,8 @@ blt_back_to_window:
     mov eax, [render_window_picture]
     mov [rdi+36], eax
     mov dword [rdi+40], 0              ; red, green
-    mov dword [rdi+44], 0xCCCC0000     ; blue 0, alpha 80%: 20% shows
+    mov eax, [dim_pixel]               ; blue 0, then the alpha
+    mov [rdi+44], eax
     mov eax, [rdi+20]                  ; x, y
     mov [rdi+48], eax
     mov eax, [rdi+24]                  ; width, height
@@ -14399,8 +14404,9 @@ blt_back_to_window:
 .blt_ret:
     ret
 
-; dim_set — edi = 1 dims the window to 20%, 0 lifts the dim. Only the
-; window is dimmed: blt_back_to_window lays 80% black over each area it
+; dim_set — edi = 1 dims the window to dim_brightness % (30 by default),
+; 0 lifts the dim. Only the window is dimmed: blt_back_to_window lays a
+; black layer over each area it
 ; copies, and the back buffer keeps the true colours, so either change
 ; is one copy of the whole window. Off, the dim costs one compare per copy.
 dim_set:
@@ -18540,7 +18546,7 @@ load_config:
     ; N % darkens the whole window via an XRender Over composite of
     ; rgba(0,0,0,N%) when the window is not focused.
     cmp dword [rsi], 'unfo'
-    jne .lc_try_palette
+    jne .lc_try_dim_brightness
     cmp dword [rsi+4], 'cuse'
     jne .lc_skip_line
     cmp dword [rsi+8], 'd_di'
@@ -18568,6 +18574,45 @@ load_config:
     mov eax, 100
 .lc_ud_store:
     mov [cfg_unfocused_dim], al
+    jmp .lc_skip_line
+
+.lc_try_dim_brightness:
+    ; Match "dim_brightness = N", N in 0..100: how much of the window
+    ; shows while Alt+d or OSC 7702 dims it. Default 30. Stored as the
+    ; blue+alpha dword of the black layer: alpha = (100-N) * 65535 / 100.
+    cmp dword [rsi], 'dim_'
+    jne .lc_try_palette
+    cmp dword [rsi+4], 'brig'
+    jne .lc_skip_line
+    cmp dword [rsi+8], 'htne'
+    jne .lc_skip_line
+    cmp word [rsi+12], 'ss'
+    jne .lc_skip_line
+    add rsi, 14
+    call lc_skip_to_value
+    xor eax, eax
+.lc_db_digit:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .lc_db_done
+    cmp cl, '9'
+    ja .lc_db_done
+    sub ecx, '0'
+    imul eax, eax, 10
+    add eax, ecx
+    inc rsi
+    cmp eax, 100
+    jbe .lc_db_digit
+    mov eax, 100                        ; clamp, and stop before it overflows
+.lc_db_done:
+    neg eax
+    add eax, 100                        ; the part to cover
+    imul eax, 65535
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    shl eax, 16                         ; alpha in the high word, blue 0
+    mov [dim_pixel], eax
     jmp .lc_skip_line
 
 .lc_try_palette:
@@ -22275,7 +22320,7 @@ init_keybindings:
     ; copy_screen: Alt + c — every row in view to PRIMARY and CLIPBOARD
     mov byte [keybind_mods + KB_COPY_SCREEN], 8
     mov dword [keybind_keysyms + KB_COPY_SCREEN*4], 0x63
-    ; dim: Alt + d — the window at 20% brightness until the next key
+    ; dim: Alt + d — the window at dim_brightness % until the next key
     mov byte [keybind_mods + KB_DIM], 8
     mov dword [keybind_keysyms + KB_DIM*4], 0x64
     ret
