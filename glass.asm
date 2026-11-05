@@ -960,6 +960,10 @@ url_count:          resq 1
 url_strings:        resb 8192       ; extracted URL text
 url_str_pos:        resq 1
 su_row_delta:       resq 1          ; view row base minus live row base
+su_str0:            resq 1          ; where the URL being scanned starts in url_strings
+su_pieces:          resq 1          ; rows glass wrapped it over before this one
+su_piece:           resw 3 * 3      ; row, first col, last col of each of those rows
+hu_i:               resq 1          ; url_list index the hover underline pass is at
 
 ; Hover state. Tracks which url_list[] entry the mouse pointer is
 ; currently over; -1 = none. Drives both the hover-underline render
@@ -16467,26 +16471,34 @@ rs_row_loop:
     ; repainting all rows fresh.
     ; url_list rows are VIEW rows (scan_urls follows the view), so the
     ; underline lands on the right cells in the scrollback too.
-    mov r12, [hover_url_idx]
-    test r12, r12
-    js .rs_hover_url_done                ; -1 → not hovering
-    imul r12, 24                          ; byte offset in url_list
-    movzx eax, word [url_list + r12]      ; start_row
-    movzx ecx, word [url_list + r12 + 2]  ; start_col
-    movzx edx, word [url_list + r12 + 6]  ; end_col (inclusive)
-    sub edx, ecx
-    inc edx                               ; span length in cells
-    test edx, edx
-    jle .rs_hover_url_done
-    cmp byte [row_painted + rax], 0       ; its row kept last frame's line
-    je .rs_hover_url_done
+    ; Every entry that holds the hovered URL gets the line: the rows of a
+    ; URL glass wrapped, or the runs of one OSC 8 link.
+    cmp qword [hover_url_idx], 0
+    jl .rs_hover_url_done                ; -1 → not hovering
     push rbx
     push r13
     push r14
     push r15
-    mov r13d, eax                         ; row
-    mov r14d, ecx                         ; start_col
-    mov r15d, edx                         ; span cells
+    mov qword [hu_i], 0
+.rs_hu_loop:
+    mov rsi, [hu_i]
+    cmp rsi, [url_count]
+    jge .rs_hu_unwind
+    mov rdi, [hover_url_idx]
+    call url_same_link
+    jne .rs_hu_next
+    mov rax, [hu_i]
+    imul rax, 24                          ; byte offset in url_list
+    movzx r13d, word [url_list + rax]     ; row
+    movzx r14d, word [url_list + rax + 2] ; start_col
+    movzx r15d, word [url_list + rax + 6] ; end_col (inclusive)
+    sub r15d, r14d
+    inc r15d                              ; span length in cells
+    jle .rs_hu_next
+    cmp r13d, MAX_ROWS
+    jae .rs_hu_next
+    cmp byte [row_painted + r13], 0       ; its row kept last frame's line
+    je .rs_hu_next
     ; Underline colour: cfg_url_pixel if user set `url_underline` in
     ; .glassrc, else a soft blue (#5599ff) that reads as a hyperlink
     ; without colliding with the default fg or with SGR-4/OSC 8
@@ -16552,6 +16564,10 @@ rs_row_loop:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
+.rs_hu_next:
+    inc qword [hu_i]
+    jmp .rs_hu_loop
+.rs_hu_unwind:
     pop r15
     pop r14
     pop r13
@@ -18999,14 +19015,7 @@ scan_urls:
     ;
     ; Every read below computes the LIVE offset; this delta turns it into the
     ; view one, so the ten read sites each need a single added line.
-    mov rdi, r12
-    call row_src_ptr                   ; rax = first cell of this view row
-    mov rcx, r12
-    imul rcx, MAX_COLS * CELL_SIZE
-    lea rdx, [grid]
-    add rcx, rdx                       ; where the live row would sit
-    sub rax, rcx
-    mov [su_row_delta], rax
+    call .su_delta
     xor r13d, r13d             ; current col
 
 .su_col_loop:
@@ -19115,12 +19124,15 @@ scan_urls:
     jne .su_next_col
 
     ; Found URL start at (r12, r13). Scan to find end.
+    mov rbx, [url_str_pos]
+    mov [su_str0], rbx
+    mov qword [su_pieces], 0
     mov r15, r14
     add r15, 3               ; position after "://"
 
 .su_url_scan:
     cmp r15, [grid_cols]
-    jge .su_url_found
+    jge .su_url_edge
     mov rax, r12
     imul rax, MAX_COLS
     add rax, r15
@@ -19143,6 +19155,35 @@ scan_urls:
     cmp dl, 0x27             ; single quote
     je .su_url_found
     inc r15
+    jmp .su_url_scan
+
+.su_url_edge:
+    ; The URL reaches the right edge. When glass wrapped this row into the
+    ; next, the URL goes on there: keep this row's part and scan on from
+    ; the next row's first column. Up to four rows.
+    mov rdi, r12
+    call row_is_wrapped
+    test eax, eax
+    jz .su_url_found
+    lea rax, [r12 + 1]
+    cmp rax, [grid_rows]
+    jge .su_url_found
+    mov rax, [su_pieces]
+    cmp rax, 3
+    jge .su_url_found
+    call .su_copy
+    mov rax, [su_pieces]
+    lea rax, [rax + rax*2]                 ; 3 words per row
+    mov [su_piece + rax*2], r12w
+    mov [su_piece + rax*2 + 2], r13w
+    lea rdx, [r15 - 1]
+    mov [su_piece + rax*2 + 4], dx
+    inc qword [su_pieces]
+    inc r12
+    call .su_delta
+    xor r13d, r13d
+    xor r15d, r15d
+    mov r14, -2                            ; trimming keeps this row's first letter
     jmp .su_url_scan
 
 .su_url_found:
@@ -19168,62 +19209,37 @@ scan_urls:
     dec r15
     jmp .su_url_found
 .su_trimmed:
-    ; URL spans from (r12, r13) to (r12, r15-1)
-    ; Store in url_list if room
+    ; The URL ends at (r12, r15-1). Store it if there is room: one url_list
+    ; entry per row it covers, each with the whole URL, so the pointer on
+    ; any row underlines all of them and a click opens all of it.
     mov rax, [url_count]
     cmp rax, 32
     jge .su_next_col
-
-    ; Extract URL text into url_strings
-    mov rbx, [url_str_pos]
-    mov rcx, r13             ; start col
-.su_extract:
-    cmp rcx, r15
-    jge .su_extract_done
-    mov rax, rbx
-    cmp rax, 8190
-    jge .su_extract_done
-    ; Read char from grid
-    push rcx
-    mov rax, r12
-    imul rax, MAX_COLS
-    add rax, rcx
-    imul rax, CELL_SIZE
-    add rax, [su_row_delta]
-    movzx edx, word [grid + rax]
-    pop rcx
-    cmp dl, 0x7F
-    jbe .su_ext_store
-    mov dl, '?'
-.su_ext_store:
-    mov [url_strings + rbx], dl
-    inc rbx
-    inc rcx
-    jmp .su_extract
-.su_extract_done:
+    call .su_copy
     mov byte [url_strings + rbx], 0  ; null-terminate
     mov rcx, rbx
-    sub rcx, [url_str_pos]  ; str_len
-
-    ; Store url_list entry (24 bytes)
-    ; start_row(2), start_col(2), end_row(2), end_col(2),
-    ; str_offset(4), str_len(4), pad(8)
-    mov rax, [url_count]
-    imul rax, 24
-    mov word [url_list + rax], r12w       ; start_row
-    mov word [url_list + rax + 2], r13w   ; start_col
-    mov word [url_list + rax + 4], r12w   ; end_row (same row)
-    mov rdx, r15
-    dec rdx
-    mov word [url_list + rax + 6], dx     ; end_col
-    mov edx, [url_str_pos]
-    mov [url_list + rax + 8], edx         ; str_offset
-    mov [url_list + rax + 12], ecx        ; str_len
-    mov qword [url_list + rax + 16], 0    ; pad
-
+    sub rcx, [su_str0]       ; str_len
+    xor edx, edx             ; row index
+.su_emit_rows:
+    cmp rdx, [su_pieces]
+    jge .su_emit_last
+    lea rax, [rdx + rdx*2]
+    movzx edi, word [su_piece + rax*2]
+    movzx esi, word [su_piece + rax*2 + 2]
+    movzx r8d, word [su_piece + rax*2 + 4]
+    call .su_entry
+    inc rdx
+    jmp .su_emit_rows
+.su_emit_last:
+    cmp r15, r13
+    jle .su_emitted          ; the last row has none of it
+    mov edi, r12d
+    mov esi, r13d
+    lea r8, [r15 - 1]
+    call .su_entry
+.su_emitted:
     inc rbx                  ; skip null terminator
     mov [url_str_pos], rbx
-    inc qword [url_count]
     ; Skip past URL in column scan
     mov r13, r15
     jmp .su_col_loop
@@ -19312,10 +19328,10 @@ scan_urls:
     mov rax, [url_count]
     cmp rax, 32
     jge .su_o8_emit_ret
-    ; Resolve URI: osc8_uri_offsets[r14] → offset into osc8_uris.
+    ; Resolve URI: osc8_uri_offsets[r14] → offset into osc8_uris. The
+    ; first URI in the pool sits at offset 0, so 0 is a real offset; a
+    ; cell only gets an id once its URI is stored.
     mov edx, [osc8_uri_offsets + r14*4]
-    test edx, edx
-    jz .su_o8_emit_ret                    ; id has no URI registered
     ; Copy NUL-terminated URI from osc8_uris[edx] into url_strings at
     ; the current url_str_pos. Bail if no room.
     mov rcx, [url_str_pos]
@@ -19352,12 +19368,91 @@ scan_urls:
 .su_o8_emit_ret:
     ret
 
+    ; su_row_delta for view row r12. Clobbers rax, rcx, rdx, rdi.
+.su_delta:
+    mov rdi, r12
+    call row_src_ptr                   ; rax = first cell of this view row
+    mov rcx, r12
+    imul rcx, MAX_COLS * CELL_SIZE
+    lea rdx, [grid]
+    add rcx, rdx                       ; where the live row would sit
+    sub rax, rcx
+    mov [su_row_delta], rax
+    ret
+
+    ; Copy row r12, cols r13 to r15-1, to url_strings at rbx (advanced).
+    ; Clobbers rax, rcx, rdx.
+.su_copy:
+    mov rcx, r13
+.su_copy_loop:
+    cmp rcx, r15
+    jge .su_copy_ret
+    cmp rbx, 8190
+    jge .su_copy_ret
+    mov rax, r12
+    imul rax, MAX_COLS
+    add rax, rcx
+    imul rax, CELL_SIZE
+    add rax, [su_row_delta]
+    movzx edx, word [grid + rax]
+    cmp dl, 0x7F
+    jbe .su_copy_store
+    mov dl, '?'
+.su_copy_store:
+    mov [url_strings + rbx], dl
+    inc rbx
+    inc rcx
+    jmp .su_copy_loop
+.su_copy_ret:
+    ret
+
+    ; One url_list entry (24 bytes: start row, start col, end row, end col,
+    ; str_offset, str_len, pad) for row edi, cols esi to r8d, holding the
+    ; string at su_str0, rcx bytes long. Keeps rcx and rdx.
+.su_entry:
+    mov rax, [url_count]
+    cmp rax, 32
+    jge .su_entry_ret
+    imul rax, 24
+    mov [url_list + rax], di
+    mov [url_list + rax + 2], si
+    mov [url_list + rax + 4], di
+    mov [url_list + rax + 6], r8w
+    mov r9, [su_str0]
+    mov [url_list + rax + 8], r9d
+    mov [url_list + rax + 12], ecx
+    mov qword [url_list + rax + 16], 0
+    inc qword [url_count]
+.su_entry_ret:
+    ret
+
 .su_done:
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
+    ret
+
+; url_same_link: rdi, rsi = url_list indexes → ZF=1 when both hold the same
+; URL text: the rows of one URL glass wrapped, or one OSC 8 link's runs.
+; Clobbers rax, rcx, rdx.
+url_same_link:
+    push rsi
+    push rdi
+    imul rdi, 24
+    imul rsi, 24
+    mov ecx, [url_list + rdi + 12]
+    cmp ecx, [url_list + rsi + 12]
+    jne .usl_ret
+    mov eax, [url_list + rdi + 8]
+    mov edx, [url_list + rsi + 8]
+    lea rdi, [url_strings + rax]
+    lea rsi, [url_strings + rdx]
+    repe cmpsb                            ; ecx 0: ZF stays set from the cmp
+.usl_ret:
+    pop rdi
+    pop rsi
     ret
 
 ; url_at_cell — returns the url_list[] index whose rect contains
