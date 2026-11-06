@@ -19460,16 +19460,22 @@ url_same_link:
 ; Returns matches for both scanned http(s):// substrings AND for
 ; OSC 8 hyperlink spans (the latter populated by scan_urls' OSC 8
 ; sweep). Hover + click paths now work uniformly for both.
+;
+; The list is read from its end, so an OSC 8 span (added after the http
+; walk) wins over the http text it covers. deck links a URL it wrapped
+; over two rows with OSC 8; the first row also shows "https://", and the
+; http walk's entry there held only that row's part, so the pointer on
+; the first row underlined that row alone.
 url_at_cell:
     push rbx
     push r12
     push r13
     mov r12, rdi
     mov r13, rsi
-    xor ebx, ebx
+    mov rbx, [url_count]
 .uac_loop:
-    cmp rbx, [url_count]
-    jge .uac_none
+    dec rbx
+    js .uac_none
     mov rax, rbx
     imul rax, 24
     movzx ecx, word [url_list + rax]
@@ -19490,7 +19496,6 @@ url_at_cell:
     pop rbx
     ret
 .uac_next:
-    inc rbx
     jmp .uac_loop
 .uac_none:
     mov rax, -1
