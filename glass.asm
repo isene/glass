@@ -12969,6 +12969,80 @@ is_cell_selected:
     xor al, al
     ret
 
+; ----------------------------------------------------------------------------
+; sel_drop_if_rewritten — a program rewrote a selected cell since the last
+; paint (deck rewrites its rows while Claude Code answers): drop the
+; highlight, or it marks text the user never chose. PRIMARY stays, as with
+; the scroll clears. Runs only while a selection shows: one compare per
+; selected row, and a walk over the cells only of a row that changed.
+; ----------------------------------------------------------------------------
+sel_drop_if_rewritten:
+    cmp qword [sel_active], 0
+    je .sdr_ret
+    cmp qword [sel_button_held], 0           ; a drag is still choosing
+    jne .sdr_ret
+    push rbx
+    push r12
+    push r13
+    mov r12, [sel_start_row]
+    mov r13, [sel_end_row]
+    cmp r12, r13
+    jle .sdr_ordered
+    xchg r12, r13
+.sdr_ordered:
+    test r12, r12
+    jns .sdr_row
+    xor r12d, r12d
+.sdr_row:
+    cmp r12, r13
+    jg .sdr_done
+    cmp r12, [grid_rows]
+    jge .sdr_done
+    mov rdi, r12
+    call row_src_ptr                         ; what the row shows now
+    mov rsi, rax
+    mov rax, r12
+    imul rax, MAX_COLS * CELL_SIZE
+    lea rdi, [prev_paint_grid + rax]         ; what was painted
+    mov rcx, [grid_cols]
+    add rcx, rcx                             ; two qwords a cell
+    push rsi
+    push rdi
+    repe cmpsq
+    pop rdi
+    pop rsi
+    je .sdr_next                             ; the row is as painted
+    xor ebx, ebx
+.sdr_cell:
+    cmp rbx, [grid_cols]
+    jge .sdr_next
+    mov rax, rbx
+    shl rax, 4
+    mov rcx, [rsi + rax]
+    cmp rcx, [rdi + rax]
+    jne .sdr_changed
+    mov rcx, [rsi + rax + 8]
+    cmp rcx, [rdi + rax + 8]
+    je .sdr_cell_next
+.sdr_changed:
+    call is_cell_selected                    ; r12 = row, rbx = col
+    test al, al
+    jz .sdr_cell_next
+    mov qword [sel_active], 0
+    jmp .sdr_done
+.sdr_cell_next:
+    inc rbx
+    jmp .sdr_cell
+.sdr_next:
+    inc r12
+    jmp .sdr_row
+.sdr_done:
+    pop r13
+    pop r12
+    pop rbx
+.sdr_ret:
+    ret
+
 ; Extract selected text from grid into sel_buf
 ; Walks from sel_start to sel_end, extracting characters
 selection_extract:
@@ -14778,6 +14852,7 @@ render_screen:
     mov esi, [hover_last_col]
     call hover_update
 .rs_hover_recheck_done:
+    call sel_drop_if_rewritten       ; before the selection diff below
 
     ; ─────────────────────────────────────────────────────────────────
     ; Per-row dirty-skip global invalidation: a number of state changes
