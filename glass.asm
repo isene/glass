@@ -957,7 +957,7 @@ utf8_remaining:     resd 1
 ; URL detection
 url_list:           resb 768        ; 32 URLs, each 24 bytes
 url_count:          resq 1
-url_strings:        resb 8192       ; extracted URL text
+url_strings:        resb 65536      ; extracted URL text (32 links, long ones too)
 url_str_pos:        resq 1
 su_row_delta:       resq 1          ; view row base minus live row base
 su_str0:            resq 1          ; where the URL being scanned starts in url_strings
@@ -1060,8 +1060,8 @@ cursor_blink_until: resq 1          ; CLOCK_MONOTONIC ms when next toggle is due
 cur_osc8_id:        resb 1          ; current OSC 8 link id (0 = none)
 row_wrapped:        resb MAX_ROWS    ; 1 = row N's last char wrapped to N+1
 osc8_uri_offsets:   resd 256        ; offset in osc8_uris per link id
-osc8_uris:          resb 131072     ; null-terminated URIs from OSC 8:
-                                    ; 255 ids x 512 bytes, so the pool
+osc8_uris:          resb 1048576    ; null-terminated URIs from OSC 8:
+                                    ; 255 ids x 4096 bytes, so the pool
                                     ; cannot fill before the ids wrap
                                     ; (untouched .bss pages cost nothing)
 osc8_uris_pos:      resq 1          ; next free byte in osc8_uris
@@ -10297,10 +10297,11 @@ vt_process:
     mov rdx, [osc_pos]
     sub rdx, rcx                ; URI length
     jz .vtp_osc8_close
-    ; Cap URI length at 511 to keep things sane.
-    cmp rdx, 511
+    ; Cap URI length at 4095. Mail tracking links run past 1000 bytes;
+    ; the old cap of 511 cut them, and the site said "Wrong Link".
+    cmp rdx, 4095
     jle .vtp_osc8_uri_len_ok
-    mov rdx, 511
+    mov rdx, 4095
 .vtp_osc8_uri_len_ok:
     ; Reuse the id of an identical URI already in the pool. A TUI
     ; re-sends every OSC 8 open on each repaint, so without this a
@@ -10344,7 +10345,7 @@ vt_process:
     mov r9, r8
     add r9, rdx
     inc r9
-    cmp r9, 131072
+    cmp r9, 1048576
     jle .vtp_osc8_uri_room
     mov byte [cur_osc8_id], 0    ; out of room, drop
     jmp .vtp_loop
@@ -19413,7 +19414,7 @@ scan_urls:
     mov rdi, rcx                          ; saved start offset for the entry
     mov r8, rcx                           ; copy cursor
 .su_o8_cp:
-    cmp r8, 8190
+    cmp r8, 65534
     jge .su_o8_emit_ret
     movzx r9d, byte [osc8_uris + rdx]
     test r9b, r9b
