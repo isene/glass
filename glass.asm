@@ -24638,7 +24638,7 @@ ttf_upload_glyph:
 
     ; Stash the full styled gid for AddGlyphs / cache-mark; mask rbx
     ; down to the codepoint (low 16 bits) so the existing braille,
-    ; substitution, underscore-pack and speckle-trim cp comparisons
+    ; substitution and underscore-pack cp comparisons
     ; below still work without per-site rewrites.
     mov [ttf_upload_styled_gid], rdi
 
@@ -25000,78 +25000,6 @@ ttf_upload_glyph:
     inc rdi
     jmp .ttf_us_inkrow
 .ttf_no_us_pack:
-
-    ; Trim trailing "speckle" rows from the bottom of the bitmap.
-    ; Two artifact patterns from unhinted rasterisation of `›` U+203A in
-    ; DejaVu Sans Mono show up as the persistent "comma" 1-2 px below
-    ; the chevron in every CC prompt the user has reported:
-    ;   (1) sizes 18..22 — one isolated low-alpha pixel.
-    ;   (2) sizes 23..32 — two pixels at the LEFT and RIGHT edges of
-    ;       the row (diagonal-stroke tails extending below the body),
-    ;       with a wide gap of zeros between them.
-    ; Heuristic: drop trailing rows where ink_count ≤ 1, OR where
-    ; ink_count == 2 AND the two inked columns are ≥3 apart. Real
-    ; descender tails and punctuation (g/j/p/q/y/, /. /' /") have ink
-    ; pixels clustered (spread ≤ 1) so this leaves them intact.
-.trim_speckle:
-    ; Skip the speckle trim entirely for braille (U+2800..U+28FF) and
-    ; the box-drawing / block-elements range (U+2500..U+259F) where
-    ; sparse-dot patterns are the actual glyph shape, not a hinting
-    ; artifact. Braille is the load-bearing case: the Rust `plot`
-    ; crate draws line graphs via braille chars in apps like the
-    ; trade TUI — without this bypass the trim chews the dot rows
-    ; and the graph renders as a blank pane.
-    cmp rbx, 0x2800
-    jb .trim_speckle_run
-    cmp rbx, 0x28FF
-    jbe .trim_done
-.trim_speckle_run:
-    cmp rbx, 0x2500
-    jb .trim_speckle_real
-    cmp rbx, 0x259F
-    jbe .trim_done
-.trim_speckle_real:
-    test r13, r13
-    jz .trim_done                       ; H=0, nothing to trim
-    mov rax, r13
-    dec rax
-    imul rax, [src_glyph_w]
-    lea rsi, [output_buf + rax]         ; rsi → first byte of last row
-    mov rdi, [src_glyph_w]              ; row width
-    test rdi, rdi
-    jz .trim_done
-    xor edx, edx                        ; ink count
-    mov r8, -1                          ; first inked column (-1 = none)
-    mov r9, -1                          ; last inked column
-    xor ecx, ecx                        ; column index
-.trim_scan:
-    cmp rcx, rdi
-    jge .trim_decide
-    movzx eax, byte [rsi + rcx]
-    test al, al
-    jz .trim_next
-    inc edx
-    cmp r8, -1
-    jne .trim_set_last
-    mov r8, rcx                         ; first ink col
-.trim_set_last:
-    mov r9, rcx                         ; last ink col (always update)
-.trim_next:
-    inc rcx
-    jmp .trim_scan
-.trim_decide:
-    cmp rdx, 1
-    jle .trim_drop                      ; 0 or 1 ink → drop
-    cmp rdx, 2
-    jne .trim_done                      ; 3+ ink pixels → legitimate row
-    mov rax, r9
-    sub rax, r8                         ; spread = last - first
-    cmp rax, 3
-    jl .trim_done                       ; spread ≤ 2 → clustered, keep
-.trim_drop:
-    dec r13
-    jmp .trim_speckle
-.trim_done:
 
     ; Clamp bearing_x to >= 0 so the glyph bitmap can't extend left of
     ; the cell origin into the previous cell. Some glyphs (italics,
